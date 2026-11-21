@@ -21,6 +21,17 @@ const REFUSAL_PATTERNS = [
     /\b(?:I(?:'m| am)\s+sorry|I\s+cannot|I\s+can't|unable\s+to\s+(?:fulfill|process|generate)|safety\s+guidelines)\b/i,
 ];
 
+/**
+ * Shared refusal/apology detector used by both the Story Archiver and the Director Outline generator.
+ * @param {string} rawText
+ * @returns {boolean}
+ */
+export function isModelRefusalText(rawText) {
+    const cleaned = cleanTagText(rawText);
+    if (!cleaned) return false;
+    return REFUSAL_PATTERNS.some(re => re.test(cleaned));
+}
+
 function cleanTagText(raw) {
     return stripNonStoryBlocks(raw)
         .replace(/<\/?game>/gi, '')
@@ -67,7 +78,7 @@ export function inspectBatchExtractionQuality(rawNotes) {
     const charsBody = extractInner(cleaned, 'batch_characters');
     const hasRichStructuredTags = eventsBody.length >= 40 || charsBody.length >= 40;
     const hasBasicStructuredTags = eventsBody.length >= 10 || charsBody.length >= 10;
-    const matchesRefusal = REFUSAL_PATTERNS.some(re => re.test(cleaned));
+    const matchesRefusal = isModelRefusalText(cleaned);
 
     if (matchesRefusal && !hasRichStructuredTags) {
         return {

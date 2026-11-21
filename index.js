@@ -728,6 +728,10 @@ function createPresetModelCaller() {
     const resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
     const apiMode = settings.bgApiMode === 'custom' ? 'custom' : 'tavern';
 
+    const substituteFn = typeof context?.substituteParams === 'function'
+        ? (text) => context.substituteParams(text)
+        : null;
+
     if (apiMode === 'custom') {
         const baseUrl = normalizeCustomApiBaseUrl(settings.bgCustomApiUrl);
         const apiKey = String(settings.bgCustomApiKey || '').trim();
@@ -740,7 +744,11 @@ function createPresetModelCaller() {
         }
         const callModel = async ({ prompt, systemPrompt }) => {
             const messages = resolvedPreset.presetObj
-                ? buildDistillationPresetMessages(resolvedPreset.presetObj, { systemPrompt, userPrompt: prompt })
+                ? buildDistillationPresetMessages(resolvedPreset.presetObj, {
+                    systemPrompt,
+                    userPrompt: prompt,
+                    substitute: substituteFn,
+                })
                 : [
                     ...(systemPrompt ? [{ role: 'system', content: String(systemPrompt).trim() }] : []),
                     { role: 'user', content: String(prompt || '').trim() },
@@ -771,6 +779,7 @@ function createPresetModelCaller() {
             const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
                 systemPrompt,
                 userPrompt: prompt,
+                substitute: substituteFn,
             });
             const reply = await context.generateRaw({ prompt: messages });
             return String(reply || '');

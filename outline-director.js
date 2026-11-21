@@ -7,10 +7,11 @@
  */
 
 import { stripNonStoryBlocks } from './parser.js';
+import { isModelRefusalText } from './story-archiver.js';
 import { cleanDistillProse } from './style-distiller.js';
 
 const PACE_LABELS = Object.freeze({
-    slow: '温水煮青蛙（稳步铺垫与日常/越界反差，放大信息差，暂不彻底摊牌）',
+    slow: '温水煮青蛙（稳步铺垫、日常推进与暗线反差，放大信息差，暂不彻底摊牌）',
     medium: '中速推进（制造清晰的小冲突或试探升级，推动主线往前走一大步）',
     climax: '高潮爆点（集中引爆积压矛盾，重点回收所选关键伏笔）',
 });
@@ -161,8 +162,8 @@ export function buildDirectorOutlinePrompt({
     const systemPrompt = [
         '你是原著级长篇小说总导演与卷纲/分镜策划，负责把作者给出的简略过程与结果扩写成可直接逐章交给续写模型执笔的【原味分镜导演大纲】。',
         '【绝对铁律】：',
-        '1. 严格继承原著的叙事结构与节奏骨相：每章采用多切镜、冷热交替结构（正经推进主线/日常工作 与 私下试探/心理博弈/张力穿插），严禁把整章死磕在同一个房间原地水字数！',
-        '2. 只写【时间地点、出场人物、客观事件节拍、对话试探焦点、关键信息差、微动作切入点】，严禁在大纲里塞入网文八股情绪形容词（严禁写“邪魅霸道、屈辱颤抖、气氛黏稠滚烫、声音沙哑、喉结滚动”等词，以免污染下游执笔模型的文风）！',
+        '1. 严格继承原著的叙事结构与节奏骨相：每章采用多切镜、冷热交替结构（主线推进/日常工作 与 伏笔埋设/对话博弈 穿插），严禁把整章死磕在同一个房间原地水字数！',
+        '2. 只写【时间地点、出场人物、客观事件节拍、对话试探焦点、关键信息差、微动作切入点】，严禁在大纲里塞入网文八股情绪形容词（严禁写“邪魅霸道、声音沙哑、喉结滚动、空气仿佛凝固、一丝不易察觉”等词，以免污染下游执笔模型的文风）！',
         '3. 每个登场人物的反应与说话方式必须 100% 遵循《核心人物防 OOC 档案》——寡言角色就安排极简短句或沉默动作，松弛算计角色绝不写成阴鸷霸总！',
         '4. 若一次规划多章，必须合理拆解节奏与递进层次（起承转合、章末留钩、下章紧接上章结尾，绝不把所有剧情和伏笔堆在第 1 章写完，也不得重复水戏）！',
         '5. 严格按要求的 `<chapter_outline index="章号" title="章节简短标题">...</chapter_outline>` 标签输出每一章，不要输出额外寒暄或解释。',
@@ -288,9 +289,18 @@ export async function generateDirectorOutline({
         prompt,
     });
 
+    const cleanedRaw = cleanDistillProse(raw);
+    const hasOutlineTags = /<(?:chapter_outline|director_outline)\b/i.test(cleanedRaw);
+    if (!hasOutlineTags && isModelRefusalText(cleanedRaw)) {
+        throw new Error(`模型返回了拒答/道歉内容（未保存为大纲）：${cleanedRaw.slice(0, 120)}`);
+    }
+
     const chapters = parseMultiChapterOutlines(raw, anchor.nextChapterIndex, anchor.chapterUnit);
     if (chapters.length === 0 || chapters.every(c => c.text.length < 25)) {
         throw new Error('生成的大纲内容过短或为空，请检查模型/预设后重试');
+    }
+    if (chapters.length === 1 && chapters[0].text.length < 300 && isModelRefusalText(chapters[0].text)) {
+        throw new Error(`模型返回了拒答/道歉内容（未保存为大纲）：${chapters[0].text.slice(0, 120)}`);
     }
 
     const combinedText = chapters.map(c => c.text).join('\n\n---\n\n');

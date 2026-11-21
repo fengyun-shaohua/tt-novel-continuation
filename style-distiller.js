@@ -389,20 +389,45 @@ const PRESET_SKIP_IDENTIFIERS = new Set([
 
 /**
  * Compiles a user-selected TauriTavern OpenAI/Chat Completion preset object (`prompts` + `prompt_order`)
- * into a clean `[{ role, content }, ...]` message array for `generateRaw`, placing the distillation
- * system + user task at the preset's `chatHistory` slot while stripping chat/card markers and CatGodML hooks.
+ * into a `[{ role, content }, ...]` message array that faithfully mirrors TauriTavern's `PromptManager`
+ * ordering:
+ * - `injection_position = 0` (`RELATIVE`): placed before or after `chatHistory` in exact `prompt_order`.
+ * - `injection_position = 1` (`ABSOLUTE`): injected in-chat at `injection_depth` (e.g. Depth 0 right after
+ *   the user task message) ordered by `injection_order` and role, matching `src/scripts/openai.js`.
+ * - `injection_position = 2` (`ATTACH_EXISTING`): attached to the start/end of the target role message.
+ * - Optional `substitute` callback expands Tavern `{{...}}` macros on preset entries for both Tavern and Custom APIs.
  *
  * @param {any} presetObj
- * @param {{ systemPrompt: string, userPrompt: string, customPrefix?: string }} task
+ * @param {{
+ *   systemPrompt: string,
+ *   userPrompt: string,
+ *   customPrefix?: string,
+ *   substitute?: ((text: string) => string) | null,
+ * }} task
  * @returns {Array<{ role: string, content: string }>}
  */
-export function buildDistillationPresetMessages(presetObj, { systemPrompt, userPrompt, customPrefix = '' }) {
-    const cleanPromptEntry = (raw) => String(raw ?? '')
-        .replace(/\{\{\/\/[\s\S]*?\}\}/g, '')
-        .replace(/<<<\|catgodml\|[\s\S]*?>>>/gi, '')
-        .replace(/<run_tool_replacement>/gi, '')
-        .replace(/<\|(?:sep|merge)\|>/gi, '')
-        .trim();
+export function buildDistillationPresetMessages(presetObj, { systemPrompt, userPrompt, customPrefix = '', substitute = null }) {
+    const parseOptInt = (val, fallback) => {
+        if (val === undefined || val === null || val === '') return fallback;
+        const n = Number(val);
+        return Number.isFinite(n) ? Math.floor(n) : fallback;
+    };
+
+    const preparePresetContent = (raw) => {
+        let cleaned = String(raw ?? '')
+            .replace(/\{\{\/\/[\s\S]*?\}\}/g, '')
+            .replace(/<<<\|catgodml\|[\s\S]*?>>>/gi, '')
+            .replace(/<run_tool_replacement>/gi, '')
+            .replace(/<\|(?:sep|merge)\|>/gi, '');
+        if (typeof substitute === 'function') {
+            try {
+                cleaned = String(substitute(cleaned) ?? '');
+            } catch {
+                // Keep raw cleaned text if host macro substitution throws
+            }
+        }
+        return cleaned.trim();
+    };
 
     const taskMessages = [];
     if (customPrefix && customPrefix.trim()) {
@@ -430,6 +455,8 @@ export function buildDistillationPresetMessages(presetObj, { systemPrompt, userP
 
     const beforeHistory = [];
     const afterHistory = [];
+    const absoluteEntries = [];
+    const attachedEntries = [];
     let passedChatHistory = false;
 
     for (const item of orderList) {
@@ -443,26 +470,100 @@ export function buildDistillationPresetMessages(presetObj, { systemPrompt, userP
         }
         const entry = promptMap.get(item.identifier);
         if (!entry || entry.marker) continue;
-        const text = cleanPromptEntry(entry.content);
+
+        // Skip generation-type-specific prompts that explicitly exclude normal runs (e.g. continue/impersonate only)
+        if (Array.isArray(entry.injection_trigger) && entry.injection_trigger.length > 0 && !entry.injection_trigger.includes('normal')) {
+            continue;
+        }
+
+        const text = preparePresetContent(entry.content);
         if (!text) continue;
         const role = ['system', 'user', 'assistant'].includes(entry.role) ? entry.role : 'system';
-        if (passedChatHistory) {
+        const pos = parseOptInt(entry.injection_position, 0);
+
+        if (pos === 1) {
+            absoluteEntries.push({
+                role,
+                content: text,
+                injection_depth: Math.max(0, parseOptInt(entry.injection_depth, 4)),
+                injection_order: parseOptInt(entry.injection_order, 100),
+            });
+        } else if (pos === 2) {
+            attachedEntries.push({
+                content: text,
+                attach_role: ['system', 'user', 'assistant'].includes(entry.attach_role) ? entry.attach_role : 'user',
+                attach_index: Math.max(1, parseOptInt(entry.attach_index, 1)),
+                attach_side: entry.attach_side === 'start' ? 'start' : 'end',
+            });
+        } else if (passedChatHistory) {
             afterHistory.push({ role, content: text });
         } else {
             beforeHistory.push({ role, content: text });
         }
     }
 
-    if (beforeHistory.length === 0 && afterHistory.length === 0) {
+    if (beforeHistory.length === 0 && afterHistory.length === 0 && absoluteEntries.length === 0 && attachedEntries.length === 0) {
         return taskMessages;
     }
 
-    const scopeGuard = {
-        role: 'system',
-        content: '【当前后台任务说明】本次请求正在执行《原著小说文风分析与对抗蒸馏》后台任务，而非互动角色扮演对话。请严格遵循下方任务指令与要求的标签结构输出，忽略任何角色扮演状态栏、互动选项或特定开场格式要求。',
-    };
+    // Work in latest-first order to mirror TauriTavern's `applyAttachedPromptsToMessages` & `populationInjectionPrompts`
+    const chatMessages = taskMessages.map(m => ({ ...m })).reverse();
 
-    return [...beforeHistory, scopeGuard, ...taskMessages, ...afterHistory];
+    for (const att of attachedEntries) {
+        let seen = 0;
+        for (const msg of chatMessages) {
+            if (msg.role !== att.attach_role) continue;
+            seen += 1;
+            if (seen === att.attach_index) {
+                msg.content = att.attach_side === 'start'
+                    ? `${att.content}\n\n${msg.content}`
+                    : `${msg.content}\n\n${att.content}`;
+                break;
+            }
+        }
+    }
+
+    if (absoluteEntries.length > 0) {
+        const maxDepth = Math.max(...absoluteEntries.map(e => e.injection_depth));
+        let totalInserted = 0;
+
+        for (let depth = 0; depth <= maxDepth; depth += 1) {
+            const depthPrompts = absoluteEntries.filter(p => p.injection_depth === depth);
+            if (depthPrompts.length === 0) continue;
+
+            const orderGroups = new Map();
+            for (const prompt of depthPrompts) {
+                const key = prompt.injection_order;
+                if (!orderGroups.has(key)) orderGroups.set(key, []);
+                orderGroups.get(key).push(prompt);
+            }
+
+            const sortedOrders = [...orderGroups.keys()].sort((a, b) => b - a);
+            const roleMessages = [];
+            for (const orderKey of sortedOrders) {
+                const group = orderGroups.get(orderKey);
+                for (const role of ['system', 'user', 'assistant']) {
+                    const joined = group
+                        .filter(p => p.role === role)
+                        .map(p => p.content)
+                        .join('\n')
+                        .trim();
+                    if (joined) {
+                        roleMessages.push({ role, content: joined });
+                    }
+                }
+            }
+
+            if (roleMessages.length > 0) {
+                const injectIdx = Math.min(chatMessages.length, depth + totalInserted);
+                chatMessages.splice(injectIdx, 0, ...roleMessages);
+                totalInserted += roleMessages.length;
+            }
+        }
+    }
+
+    chatMessages.reverse();
+    return [...beforeHistory, ...chatMessages, ...afterHistory];
 }
 
 /**

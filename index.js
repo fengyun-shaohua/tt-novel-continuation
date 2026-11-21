@@ -40,9 +40,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     foldUserOutlineFloors: true,
     enableAutoStateBlock: true,
     syncToWorldInfo: true,
-    mountAnchorChapters: 3,
-    maxOriginalHits: 3,
-    maxCanonHits: 4,
+    mountAnchorChapters: 1,
+    maxAnchorChars: 5500,
+    maxOriginalHits: 2,
+    maxCanonHits: 3,
     maxRecentSummaries: 6,
     remoteBridgeUrl: '',
 });
@@ -76,21 +77,44 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
     }
 
     try {
-        // If user unlocked >3 earlier original chapters on screen by scrolling up,
-        // keep only the latest `mountAnchorChapters` (default 3) original chapters in `coreChat`
-        // so direct LLM prompt tokens stay lean while all earlier chapters stay visible in `#chat`.
+        // Keep only the newest original chapters in `coreChat` within BOTH chapter-count and char budget
+        // (`maxAnchorChars`, default 5500) walking backwards from the cutoff chapter.
+        // This guarantees the cutoff chapter (e.g. 第 4 节) is NEVER pushed past an 8K API input cap
+        // by older chapters like 第 2 节, while all chapters remain visible in `#chat`.
         if (Array.isArray(chat)) {
-            const anchorLimit = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 3));
+            const anchorLimit = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 1));
+            const charBudget = Math.max(1800, Math.min(30000, Number(settings.maxAnchorChars) || 5500));
             const origPositions = [];
             chat.forEach((m, idx) => {
                 if (m?.extra?.novelContinuationOrigin === 'original') {
                     origPositions.push(idx);
                 }
             });
-            if (origPositions.length > anchorLimit) {
-                const toRemove = new Set(origPositions.slice(0, origPositions.length - anchorLimit));
+            if (origPositions.length > 0) {
+                const keepPositions = new Set();
+                let usedChars = 0;
+                for (let k = origPositions.length - 1; k >= 0; k -= 1) {
+                    const pos = origPositions[k];
+                    const msgLen = String(chat[pos]?.mes || '').length;
+                    const isLatestOrig = k === origPositions.length - 1;
+                    if (isLatestOrig) {
+                        keepPositions.add(pos);
+                        if (msgLen > charBudget) {
+                            const raw = String(chat[pos].mes || '');
+                            const firstLineEnd = raw.indexOf('\n');
+                            const heading = firstLineEnd > 0 ? raw.slice(0, firstLineEnd + 1) : '';
+                            chat[pos].mes = `${heading}…（本章前段已自动精简以防截断）…\n\n${raw.slice(-(charBudget - heading.length))}`;
+                        }
+                        usedChars += Math.min(msgLen, charBudget);
+                        continue;
+                    }
+                    if (keepPositions.size < anchorLimit && usedChars + msgLen <= charBudget) {
+                        keepPositions.add(pos);
+                        usedChars += msgLen;
+                    }
+                }
                 for (let i = chat.length - 1; i >= 0; i -= 1) {
-                    if (toRemove.has(i)) {
+                    if (chat[i]?.extra?.novelContinuationOrigin === 'original' && !keepPositions.has(i)) {
                         chat.splice(i, 1);
                     }
                 }

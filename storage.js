@@ -14,6 +14,9 @@ const KEY_NOVEL_DATA = 'novel_data_v1';
 const KEY_LEDGER = 'timeline_ledger_v1';
 const KEY_CANON_DB = 'canon_db_v1';
 
+// In-memory cache keyed by scopedKey to avoid redundant IPC calls during scroll/render
+const memoryStoreCache = new Map();
+
 export function createEmptyLedger() {
     return {
         summaries: [],
@@ -29,85 +32,89 @@ export function createEmptyCanonDb() {
     };
 }
 
+/**
+ * Computes a stable, filesystem-safe storage key prefix for the active chat.
+ * Never calls `handle.store.getJson` (which triggers Tauri safeInvoke red error toasts on missing files).
+ */
 function getStableChatKey() {
     const context = getContext();
-    const rawId = String(context?.getCurrentChatId?.() || context?.chatId || '').trim();
-    return rawId || null;
+    const rawId = String(
+        context?.getCurrentChatId?.()
+        || context?.chatId
+        || context?.chatMetadata?.integrity
+        || '',
+    ).trim();
+    if (!rawId) return null;
+    return rawId.replace(/[^a-zA-Z0-9._\-\u4e00-\u9fa5]/g, '_').slice(0, 96);
 }
 
 /**
- * Resolves the active chat's TauriTavern store adapter.
- * Uses `listKeys` before `getJson` / `deleteJson` so Tauri's `safeInvoke` never triggers
- * a red "后端错误: Chat store entry not found" toast when a chat has no novel data yet.
+ * Resolves the TauriTavern `api.extension.store` adapter scoped to the current chat.
+ * Uses `tryGetJson` (`open_extension_store_entry`), which returns `{ found: false }`
+ * cleanly in Rust without ever throwing a NotFound error or popping up a red toast.
  */
 function getActiveChatStore() {
-    const tt = globalThis.__TAURITAVERN__?.api;
-    try {
-        const handle = tt?.chat?.current?.handle?.();
-        if (handle?.store && typeof handle.store.listKeys === 'function') {
-            return {
-                async get(key) {
-                    try {
-                        const keys = await handle.store.listKeys({ namespace: EXTENSION_NAMESPACE });
-                        if (!Array.isArray(keys) || !keys.includes(key)) {
-                            return null;
-                        }
-                        return await handle.store.getJson({ namespace: EXTENSION_NAMESPACE, key });
-                    } catch {
-                        return null;
-                    }
-                },
-                async set(key, value) {
-                    await handle.store.setJson({ namespace: EXTENSION_NAMESPACE, key, value });
-                },
-                async remove(key) {
-                    try {
-                        const keys = await handle.store.listKeys({ namespace: EXTENSION_NAMESPACE });
-                        if (Array.isArray(keys) && keys.includes(key)) {
-                            await handle.store.deleteJson({ namespace: EXTENSION_NAMESPACE, key });
-                        }
-                    } catch {
-                        // Ignore
-                    }
-                },
-            };
-        }
-    } catch {
-        // Fall through to extension.store
+    const extStore = globalThis.__TAURITAVERN__?.api?.extension?.store;
+    const chatId = getStableChatKey();
+    if (!extStore || !chatId) {
+        return null;
     }
 
-    const extStore = tt?.extension?.store;
-    const chatId = getStableChatKey();
-    if (extStore && chatId) {
-        const scopedKey = (key) => `${chatId}__${key}`;
-        return {
-            async get(key) {
+    const toSafeKey = (key) => {
+        // Ensure key only uses safe ASCII/hash characters required by extension.store
+        let hash = 2166136261;
+        for (let i = 0; i < chatId.length; i += 1) {
+            hash ^= chatId.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        const hex = (hash >>> 0).toString(16).padStart(8, '0');
+        const asciiPrefix = chatId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'chat';
+        return `${asciiPrefix}_${hex}_${key}`;
+    };
+
+    return {
+        async get(key) {
+            const safeKey = toSafeKey(key);
+            if (memoryStoreCache.has(safeKey)) {
+                return memoryStoreCache.get(safeKey);
+            }
+            try {
                 const res = await extStore.tryGetJson({
                     namespace: EXTENSION_NAMESPACE,
                     table: 'chat_scoped',
-                    key: scopedKey(key),
+                    key: safeKey,
                 });
-                return res?.found ? res.value : null;
-            },
-            async set(key, value) {
-                await extStore.setJson({
-                    namespace: EXTENSION_NAMESPACE,
-                    table: 'chat_scoped',
-                    key: scopedKey(key),
-                    value,
-                });
-            },
-            async remove(key) {
+                const val = res?.found ? res.value : null;
+                memoryStoreCache.set(safeKey, val);
+                return val;
+            } catch {
+                return null;
+            }
+        },
+        async set(key, value) {
+            const safeKey = toSafeKey(key);
+            memoryStoreCache.set(safeKey, value);
+            await extStore.setJson({
+                namespace: EXTENSION_NAMESPACE,
+                table: 'chat_scoped',
+                key: safeKey,
+                value,
+            });
+        },
+        async remove(key) {
+            const safeKey = toSafeKey(key);
+            memoryStoreCache.set(safeKey, null);
+            try {
                 await extStore.deleteJson({
                     namespace: EXTENSION_NAMESPACE,
                     table: 'chat_scoped',
-                    key: scopedKey(key),
+                    key: safeKey,
                 });
-            },
-        };
-    }
-
-    return null;
+            } catch {
+                // Ignore
+            }
+        },
+    };
 }
 
 /**
@@ -176,9 +183,6 @@ export async function saveCanonDb(canonDb) {
 
 /**
  * Rolls back all ledger records (summaries, character states, hooks) generated after `maxChapterIndex`.
- * Used when truncating/rewriting from an earlier chapter or deleting floors.
- *
- * @param {number} maxChapterIndex
  */
 export async function pruneLedgerAfterChapter(maxChapterIndex) {
     const ledger = await loadLedger();
@@ -204,7 +208,6 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
     const ledger = await loadLedger();
     const now = Date.now();
 
-    // 1. Roll back previous records belonging to this same chapterIndex or floorIndex
     ledger.summaries = ledger.summaries.filter(
         s => s.chapterIndex !== chapterIndex && (floorIndex === null || s.floorIndex !== floorIndex),
     );
@@ -221,7 +224,6 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
         }
     }
 
-    // 2. Insert new summary
     if (extracted.summary) {
         ledger.summaries.push({
             chapterIndex,
@@ -233,7 +235,6 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
         ledger.summaries.sort((a, b) => a.chapterIndex - b.chapterIndex);
     }
 
-    // 3. Insert new world states for this chapter
     for (const item of extracted.worldUpdates || []) {
         if (!item.name || !item.state) continue;
         ledger.worldStates.push({
@@ -247,7 +248,6 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
         });
     }
 
-    // 4. Apply hook additions and resolutions
     for (const hook of extracted.hooks || []) {
         if (!hook.content) continue;
         if (hook.action === 'resolve') {

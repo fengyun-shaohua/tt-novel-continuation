@@ -569,6 +569,16 @@ export async function init() {
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
 
+    if (settings.remoteBridgeUrl) {
+        const updateBridgeUi = ({ state, detail }) => {
+            const statusEl = document.getElementById('tt-novel-bridge-status');
+            if (!statusEl) return;
+            const icon = state === 'connected' ? '🟢' : (state === 'connecting' ? '🟡' : (state === 'error' ? '🔴' : '⚪'));
+            statusEl.textContent = `${icon} ${detail || state}`;
+        };
+        connectRemoteBridge(settings.remoteBridgeUrl, { getSettings, saveExtensionSettings }, updateBridgeUi);
+    }
+
     const { eventSource, eventTypes } = context;
     if (eventSource && eventTypes) {
         eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageReceived);

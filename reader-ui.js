@@ -1,26 +1,34 @@
 import { escapeHtml, debounce } from '/scripts/utils.js';
 import { getContext } from '/scripts/extensions.js';
 import { isBoundedChatSurfaceView, jumpBoundedChatSurfaceToMessage, resetChatSurfaceView } from '/script.js';
+import { DEFAULT_CLICHE_TERMS } from './cliche-guard.js';
 import { isContinuedNovelFloor } from './context-assembler.js';
-import { loadLedger, loadNovelData, saveLedger } from './storage.js';
+import { loadCanonDb, loadLedger, loadNovelData, saveLedger } from './storage.js';
 
 const PROGRESS_META_KEY = 'novel_continuation_progress';
 const TOC_PAGE_LIMIT = 100;
 
-let drawerOpen = false;
+let workbenchOpen = false;
+let activeTab = 'memory';
+let memoryFilter = 'all';
 let showAllOriginalChapters = false;
-let previewChapterIndex = null;
+let editingCharacterId = null;
+let editingEventId = null;
+
 let cachedNovelData = null;
 let cachedLedger = null;
-let onCutoffCallback = null;
-let onViewChapterCallback = null;
-let onSettingChangeCallback = null;
+let cachedCanonDb = null;
+let handlers = {};
+
+const liveTaskState = {
+    memory: { running: false, text: '', error: false, logs: [] },
+    style: { running: false, text: '', error: false, logs: [] },
+    cliche: { running: false, text: '', error: false },
+};
+let lastBridgeUi = { state: 'disconnected', detail: '未连接外部 Agent' };
 
 /**
  * Applies or removes the body CSS classes for Immersive Novel Mode, Hide User Floors, and Hide Reasoning.
- * When master switch `settings.enabled` is false, all classes and the quickbar are cleanly withdrawn.
- *
- * @param {{ enabled?: boolean, immersiveMode?: boolean, hideUserFloors?: boolean, hideReasoning?: boolean }} settings
  */
 export function applyReaderBodyClasses(settings) {
     const active = settings?.enabled !== false;
@@ -32,32 +40,24 @@ export function applyReaderBodyClasses(settings) {
     if (bar) {
         bar.classList.toggle('displayNone', !active);
     }
-    if (!active && drawerOpen) {
-        toggleTocDrawer(false);
+    if (!active && workbenchOpen) {
+        closeWorkbench();
     }
     syncQuickBarState(settings);
 }
 
 /**
- * Mounts the above-input quick bar and right-edge floating TOC drawer.
+ * Mounts the ultra-slim single-row mini bar above `#send_form` and the LittleWhiteBox-style Workbench modal.
  */
-export function mountReaderUi({
-    settings,
-    onToggleSetting,
-    onCutoffFromChapter,
-    onViewChapter,
-}) {
-    onCutoffCallback = onCutoffFromChapter;
-    onViewChapterCallback = onViewChapter;
-    onSettingChangeCallback = onToggleSetting;
-
-    mountQuickBar(settings);
-    mountFloatingTocDrawer();
+export function mountReaderUi(uiHandlers) {
+    handlers = uiHandlers || {};
+    mountMiniQuickBar();
+    mountWorkbenchModal();
     installScrollProgressTracker();
-    applyReaderBodyClasses(settings);
+    applyReaderBodyClasses(handlers.getSettings?.() || {});
 }
 
-function mountQuickBar(settings) {
+function mountMiniQuickBar() {
     if (document.getElementById('tt-novel-quickbar')) return;
     const sendForm = document.getElementById('send_form') || document.getElementById('form_sheld');
     if (!sendForm) return;
@@ -66,246 +66,796 @@ function mountQuickBar(settings) {
     bar.id = 'tt-novel-quickbar';
     bar.className = 'tt-novel-quickbar';
     bar.innerHTML = `
-        <div class="tt-novel-quickbar-left">
-            <button type="button" id="tt-novel-btn-immersive" class="tt-novel-pill" title="切换起点/微信读书式无头像连续书页排版">
-                <i class="fa-solid fa-book-open"></i> <span>沉浸小说</span>
-            </button>
-            <button type="button" id="tt-novel-btn-hide-user" class="tt-novel-pill" title="隐藏所有用户指令楼层，让原著与续写正文无缝相连">
-                <i class="fa-solid fa-eye-slash"></i> <span>隐藏指令</span>
-            </button>
-            <button type="button" id="tt-novel-btn-hide-cot" class="tt-novel-pill" title="隐藏 AI 思考批注与预设思维链折叠框">
-                <i class="fa-solid fa-brain"></i> <span>隐藏思维链</span>
-            </button>
-            <button type="button" id="tt-novel-btn-author-mode" class="tt-novel-pill" title="开启作者境界：屏蔽酒馆玩家 {{user}} 人设与 RP 规则，将输入自动转为导演大纲">
-                <i class="fa-solid fa-feather-pointed"></i> <span>作者境界</span>
-            </button>
-            <button type="button" id="tt-novel-btn-prev-ch" class="tt-novel-pill" title="观看上一章">
-                <i class="fa-solid fa-chevron-left"></i> <span>上一章</span>
-            </button>
-            <button type="button" id="tt-novel-btn-next-ch" class="tt-novel-pill" title="观看下一章">
-                <span>下一章</span> <i class="fa-solid fa-chevron-right"></i>
-            </button>
-            <button type="button" id="tt-novel-btn-toc" class="tt-novel-pill tt-novel-pill-accent" title="打开章节目录、进度跳转与截断重续抽屉">
-                <i class="fa-solid fa-list-ul"></i> <span id="tt-novel-toc-badge">章节目录</span>
-            </button>
-        </div>
-        <div class="tt-novel-quickbar-hooks" id="tt-novel-quickbar-hooks"></div>
+        <button type="button" id="tt-novel-btn-immersive" class="tt-novel-pill" title="切换沉浸小说阅读排版">
+            <i class="fa-solid fa-book-open"></i> <span>沉浸</span>
+        </button>
+        <button type="button" id="tt-novel-btn-prev-ch" class="tt-novel-pill tt-novel-pill-icon" title="观看上一章">
+            <i class="fa-solid fa-chevron-left"></i>
+        </button>
+        <button type="button" id="tt-novel-btn-next-ch" class="tt-novel-pill tt-novel-pill-icon" title="观看下一章">
+            <i class="fa-solid fa-chevron-right"></i>
+        </button>
+        <button type="button" id="tt-novel-btn-toc" class="tt-novel-pill" title="打开章节目录与夺舍截断">
+            <i class="fa-solid fa-list-ul"></i> <span id="tt-novel-toc-badge">目录</span>
+        </button>
+        <button type="button" id="tt-novel-btn-workbench" class="tt-novel-pill tt-novel-pill-accent" title="打开小说续写工作台（剧情/人物/文风蒸馏/反八股/设置）">
+            <i class="fa-solid fa-wand-magic-sparkles"></i> <span>工作台</span>
+            <span id="tt-novel-wb-badge" class="tt-novel-mini-badge displayNone"></span>
+        </button>
     `;
 
     sendForm.parentElement?.insertBefore(bar, sendForm);
 
     bar.querySelector('#tt-novel-btn-immersive')?.addEventListener('click', () => {
-        onSettingChangeCallback?.('immersiveMode');
-    });
-    bar.querySelector('#tt-novel-btn-hide-user')?.addEventListener('click', () => {
-        onSettingChangeCallback?.('hideUserFloors');
-    });
-    bar.querySelector('#tt-novel-btn-hide-cot')?.addEventListener('click', () => {
-        onSettingChangeCallback?.('hideReasoning');
-    });
-    bar.querySelector('#tt-novel-btn-author-mode')?.addEventListener('click', () => {
-        onSettingChangeCallback?.('authorMode');
+        handlers.onToggleSetting?.('immersiveMode');
     });
     bar.querySelector('#tt-novel-btn-prev-ch')?.addEventListener('click', async () => {
         if (!cachedNovelData?.totalChapters) return;
         const curr = getCurrentVisibleOriginalChapterIndex()
             || Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
-        const target = Math.max(1, curr - 1);
-        await onViewChapterCallback?.(target);
+        await handlers.onViewChapter?.(Math.max(1, curr - 1));
     });
     bar.querySelector('#tt-novel-btn-next-ch')?.addEventListener('click', async () => {
         if (!cachedNovelData?.totalChapters) return;
         const curr = getCurrentVisibleOriginalChapterIndex()
             || Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
-        const target = Math.min(cachedNovelData.totalChapters, curr + 1);
-        await onViewChapterCallback?.(target);
+        await handlers.onViewChapter?.(Math.min(cachedNovelData.totalChapters, curr + 1));
     });
     bar.querySelector('#tt-novel-btn-toc')?.addEventListener('click', () => {
-        toggleTocDrawer();
+        void openWorkbench('toc');
+    });
+    bar.querySelector('#tt-novel-btn-workbench')?.addEventListener('click', () => {
+        const clicheInfo = handlers.getLatestClicheStatus?.();
+        const targetTab = (clicheInfo?.report?.totalHits > 0 && activeTab === 'memory') ? 'memory' : activeTab;
+        void openWorkbench(targetTab || 'memory');
     });
 
-    syncQuickBarState(settings);
+    syncQuickBarState(handlers.getSettings?.() || {});
 }
 
 export function syncQuickBarState(settings) {
     const btnImmersive = document.getElementById('tt-novel-btn-immersive');
-    const btnHideUser = document.getElementById('tt-novel-btn-hide-user');
-    const btnHideCot = document.getElementById('tt-novel-btn-hide-cot');
-    const btnAuthorMode = document.getElementById('tt-novel-btn-author-mode');
     if (btnImmersive) {
         btnImmersive.classList.toggle('active', Boolean(settings?.immersiveMode));
     }
-    if (btnHideUser) {
-        btnHideUser.classList.toggle('active', Boolean(settings?.hideUserFloors));
+}
+
+function mountWorkbenchModal() {
+    if (document.getElementById('tt-novel-wb-overlay')) return;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tt-novel-wb-overlay';
+    overlay.className = 'tt-novel-wb-overlay displayNone';
+    overlay.innerHTML = `
+        <div class="tt-novel-wb-modal" role="dialog" aria-modal="true" aria-label="小说续写工作台">
+            <header class="tt-novel-wb-header">
+                <div class="tt-novel-wb-title-wrap">
+                    <div id="tt-novel-wb-title" class="tt-novel-wb-title">📖 小说续写工作台</div>
+                    <div id="tt-novel-wb-subtitle" class="tt-novel-wb-subtitle"></div>
+                </div>
+                <button type="button" id="tt-novel-wb-close" class="tt-novel-icon-btn" title="关闭工作台">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </header>
+            <nav class="tt-novel-wb-tabs" id="tt-novel-wb-tabs">
+                <button type="button" class="tt-novel-wb-tab" data-tab="memory">📚 剧情与人物</button>
+                <button type="button" class="tt-novel-wb-tab" data-tab="style">🎨 文风蒸馏</button>
+                <button type="button" class="tt-novel-wb-tab" data-tab="cliche">🧹 反八股<span id="tt-novel-tab-cliche-dot" class="tt-novel-tab-dot displayNone"></span></button>
+                <button type="button" class="tt-novel-wb-tab" data-tab="toc">📑 目录</button>
+                <button type="button" class="tt-novel-wb-tab" data-tab="settings">⚙️ 设置</button>
+            </nav>
+            <main id="tt-novel-wb-body" class="tt-novel-wb-body"></main>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) closeWorkbench();
+    });
+    overlay.querySelector('#tt-novel-wb-close')?.addEventListener('click', () => closeWorkbench());
+    overlay.querySelectorAll('.tt-novel-wb-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            activeTab = btn.getAttribute('data-tab') || 'memory';
+            renderWorkbench();
+        });
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && workbenchOpen) {
+            closeWorkbench();
+        }
+    });
+}
+
+export async function openWorkbench(tabName) {
+    if (tabName) activeTab = tabName;
+    workbenchOpen = true;
+    const overlay = document.getElementById('tt-novel-wb-overlay');
+    if (overlay) {
+        overlay.classList.remove('displayNone');
     }
-    if (btnHideCot) {
-        btnHideCot.classList.toggle('active', settings?.hideReasoning !== false);
-    }
-    if (btnAuthorMode) {
-        btnAuthorMode.classList.toggle('active', settings?.authorMode !== false);
+    await refreshReaderWidgets();
+}
+
+export function closeWorkbench() {
+    workbenchOpen = false;
+    editingCharacterId = null;
+    editingEventId = null;
+    const overlay = document.getElementById('tt-novel-wb-overlay');
+    if (overlay) {
+        overlay.classList.add('displayNone');
     }
 }
 
 /**
- * Refreshes the Foreshadowing Hook pills in the quickbar and the TOC drawer data.
+ * Updates live task progress and appends streaming step/round cards directly inside the Workbench.
  */
-export async function refreshReaderWidgets() {
-    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
-    cachedNovelData = novelData;
-    cachedLedger = ledger;
-
-    const badge = document.getElementById('tt-novel-toc-badge');
-    if (badge) {
-        if (novelData?.totalChapters) {
-            badge.textContent = `目录 (${novelData.cutoffChapterIndex}/${novelData.totalChapters}章)`;
-        } else {
-            badge.textContent = '章节目录';
-        }
+export function updateLiveProgress(tabName, { text = '', isRunning = false, isError = false, logEntry = null, resetLogs = false } = {}) {
+    const bucket = liveTaskState[tabName];
+    if (!bucket) return;
+    bucket.running = isRunning;
+    bucket.text = text;
+    bucket.error = isError;
+    if (resetLogs && Array.isArray(bucket.logs)) {
+        bucket.logs = [];
     }
-
-    renderQuickBarHooks(ledger);
-    if (drawerOpen) {
-        renderTocDrawerBody();
+    if (logEntry && Array.isArray(bucket.logs)) {
+        const idx = bucket.logs.findIndex(item => item.id && item.id === logEntry.id);
+        if (idx >= 0) bucket.logs[idx] = logEntry;
+        else bucket.logs.push(logEntry);
+    }
+    if (workbenchOpen && activeTab === tabName) {
+        renderWorkbench();
     }
 }
 
-function renderQuickBarHooks(ledger) {
-    const container = document.getElementById('tt-novel-quickbar-hooks');
-    if (!container) return;
+export function updateBridgeStatusUi({ state, detail }) {
+    lastBridgeUi = { state: state || 'disconnected', detail: detail || state || '' };
+    const statusEl = document.getElementById('tt-novel-bridge-status');
+    if (statusEl) {
+        const icon = state === 'connected' ? '🟢' : (state === 'connecting' ? '🟡' : (state === 'error' ? '🔴' : '⚪'));
+        statusEl.textContent = `${icon} ${lastBridgeUi.detail}`;
+    }
+}
 
-    const openHooks = (ledger?.hooks || []).filter(h => h.status !== 'resolved');
-    const htmlParts = openHooks.slice(-6).map(hook => {
-        const isPinned = hook.status === 'pinned';
-        const label = hook.content.length > 18 ? `${hook.content.slice(0, 18)}…` : hook.content;
-        return `
-            <button type="button"
-                class="tt-novel-hook-chip ${isPinned ? 'pinned' : ''}"
-                data-hook-id="${escapeHtml(hook.id)}"
-                title="${escapeHtml(hook.content)}\n（点击切换：${isPinned ? '已设为本章重点推进' : '普通暗线，点击指派到本章推进'}）">
-                ${isPinned ? '🎯' : '🔮'} ${escapeHtml(label)}
-            </button>
-        `;
+/**
+ * Refreshes cached book/ledger/canon data, updates the mini bar badge, and re-renders Workbench if open.
+ */
+export async function refreshReaderWidgets() {
+    const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
+    cachedNovelData = novelData;
+    cachedLedger = ledger;
+    cachedCanonDb = canonDb;
+
+    const badge = document.getElementById('tt-novel-toc-badge');
+    if (badge) {
+        badge.textContent = novelData?.totalChapters
+            ? `目录 ${novelData.cutoffChapterIndex}/${novelData.totalChapters}`
+            : '目录';
+    }
+
+    const wbBadge = document.getElementById('tt-novel-wb-badge');
+    const clicheDot = document.getElementById('tt-novel-tab-cliche-dot');
+    const clicheInfo = handlers.getLatestClicheStatus?.();
+    const clicheHits = Number(clicheInfo?.report?.totalHits || 0);
+    const openHooksCount = (ledger?.hooks || []).filter(h => h.status !== 'resolved').length;
+
+    if (wbBadge) {
+        if (clicheHits > 0) {
+            wbBadge.textContent = `⚠${clicheHits}`;
+            wbBadge.className = 'tt-novel-mini-badge is-warn';
+        } else if (openHooksCount > 0) {
+            wbBadge.textContent = `${openHooksCount}`;
+            wbBadge.className = 'tt-novel-mini-badge';
+        } else {
+            wbBadge.className = 'tt-novel-mini-badge displayNone';
+        }
+    }
+    if (clicheDot) {
+        if (clicheHits > 0) {
+            clicheDot.textContent = `${clicheHits}`;
+            clicheDot.classList.remove('displayNone');
+        } else {
+            clicheDot.classList.add('displayNone');
+        }
+    }
+
+    if (workbenchOpen) {
+        renderWorkbench();
+    }
+}
+
+function renderWorkbench() {
+    const titleEl = document.getElementById('tt-novel-wb-title');
+    const subEl = document.getElementById('tt-novel-wb-subtitle');
+    const bodyEl = document.getElementById('tt-novel-wb-body');
+    if (!bodyEl) return;
+
+    const meta = handlers.getRuntimeMeta?.() || {};
+    if (titleEl) {
+        titleEl.textContent = cachedNovelData?.title
+            ? `📖 《${cachedNovelData.title}》`
+            : '📖 小说续写工作台';
+    }
+    if (subEl) {
+        const chPart = cachedNovelData?.totalChapters
+            ? `锚点 #${cachedNovelData.cutoffChapterIndex}/${cachedNovelData.totalChapters} · `
+            : '';
+        subEl.textContent = `${chPart}模型：${meta.activeModel || '当前酒馆模型'} · 预设：${meta.presetLabel || '当前酒馆预设'}`;
+    }
+
+    document.querySelectorAll('#tt-novel-wb-tabs .tt-novel-wb-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-tab') === activeTab);
     });
 
-    htmlParts.push(`
-        <button type="button" id="tt-novel-add-hook-btn" class="tt-novel-hook-add" title="手动添加一条伏笔或本章剧情线索">
-            + 伏笔
-        </button>
-    `);
+    if (activeTab === 'memory') renderMemoryTab(bodyEl);
+    else if (activeTab === 'style') renderStyleTab(bodyEl);
+    else if (activeTab === 'cliche') renderClicheTab(bodyEl);
+    else if (activeTab === 'toc') renderTocTab(bodyEl);
+    else if (activeTab === 'settings') renderSettingsTab(bodyEl);
+}
 
-    container.innerHTML = htmlParts.join('');
+/* ==========================================================================
+   TAB 1: 📚 剧情与人物 (LittleWhiteBox-Style Structured Memory Dashboard)
+   ========================================================================== */
+function renderMemoryTab(bodyEl) {
+    const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], worldStates: [], summaries: [] };
+    const chars = ledger.characters || [];
+    const chronicle = ledger.chronicle || [];
+    const hooks = ledger.hooks || [];
+    const worldStates = ledger.worldStates || [];
+    const summaries = ledger.summaries || [];
+    const openHooks = hooks.filter(h => h.status !== 'resolved');
+    const resolvedHooks = hooks.filter(h => h.status === 'resolved');
+    const task = liveTaskState.memory;
+    const processLogs = task.running && task.logs.length > 0 ? task.logs : (ledger.archiveProcessLog || []);
 
-    container.querySelectorAll('.tt-novel-hook-chip').forEach(btn => {
+    const progressHtml = task.text
+        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
+        : '';
+
+    const logHtml = processLogs.length > 0
+        ? `
+        <details class="tt-novel-fold-card" ${task.running ? 'open' : ''}>
+            <summary>🔬 查看全本通读与归档过程日志（${processLogs.length} 条记录）</summary>
+            <div class="tt-novel-log-list">
+                ${processLogs.map(item => `
+                    <details class="tt-novel-step-item">
+                        <summary><strong>${escapeHtml(item.title || '')}</strong> <span class="tt-novel-muted">${escapeHtml(item.summary || '')}</span></summary>
+                        <pre class="tt-novel-pre">${escapeHtml(item.detail || '')}</pre>
+                    </details>
+                `).join('')}
+            </div>
+        </details>`
+        : '';
+
+    const charCardsHtml = chars.length === 0
+        ? '<div class="tt-novel-empty">尚未生成核心人物档案。点击上方「📚 全本通读归档」自动按原著提取 4 维灵魂与防 OOC 红线（全程套用所选预设，不拒答）。</div>'
+        : chars.map(ch => {
+            if (editingCharacterId === ch.id) {
+                return `
+                    <div class="tt-novel-card tt-novel-char-card is-editing" data-char-id="${escapeHtml(ch.id)}">
+                        <div class="tt-novel-edit-grid">
+                            <input type="text" class="text_pole" data-field="name" value="${escapeHtml(ch.name)}" placeholder="人物姓名" />
+                            <input type="text" class="text_pole" data-field="role" value="${escapeHtml(ch.role || '')}" placeholder="身份定位" />
+                            <label>🎮 原作/游戏设定底骨与能力：<textarea class="text_pole" rows="2" data-field="canonFoundation">${escapeHtml(ch.canonFoundation || '')}</textarea></label>
+                            <label>🎭 同人当前处境与关系：<textarea class="text_pole" rows="2" data-field="currentSituation">${escapeHtml(ch.currentSituation || '')}</textarea></label>
+                            <label>🗣️ 原著真实言行与原话锚点：<textarea class="text_pole" rows="2" data-field="voiceAndQuotes">${escapeHtml(ch.voiceAndQuotes || '')}</textarea></label>
+                            <label>🚫 绝对 OOC 红线：<textarea class="text_pole" rows="2" data-field="oocRedLines">${escapeHtml(ch.oocRedLines || '')}</textarea></label>
+                        </div>
+                        <div class="tt-novel-card-actions">
+                            <button type="button" class="menu_button tt-novel-btn-sm" data-action="save-char" data-id="${escapeHtml(ch.id)}">💾 保存</button>
+                            <button type="button" class="menu_button tt-novel-btn-sm" data-action="cancel-char">取消</button>
+                        </div>
+                    </div>
+                `;
+            }
+            return `
+                <div class="tt-novel-card tt-novel-char-card">
+                    <div class="tt-novel-card-head">
+                        <div>
+                            <strong class="tt-novel-char-name">${escapeHtml(ch.name)}</strong>
+                            ${ch.role ? `<span class="tt-novel-chip">${escapeHtml(ch.role)}</span>` : ''}
+                        </div>
+                        <div class="tt-novel-card-actions">
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-char" data-id="${escapeHtml(ch.id)}" title="编辑人物档案">✏️</button>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="del-char" data-id="${escapeHtml(ch.id)}" title="删除">🗑️</button>
+                        </div>
+                    </div>
+                    ${ch.canonFoundation ? `<div class="tt-novel-char-row is-canon"><span>🎮 原作底骨</span><p>${escapeHtml(ch.canonFoundation)}</p></div>` : ''}
+                    ${ch.currentSituation ? `<div class="tt-novel-char-row is-sit"><span>🎭 当前处境</span><p>${escapeHtml(ch.currentSituation)}</p></div>` : ''}
+                    ${ch.voiceAndQuotes ? `<div class="tt-novel-char-row is-voice"><span>🗣️ 言行原话</span><p>${escapeHtml(ch.voiceAndQuotes)}</p></div>` : ''}
+                    ${ch.oocRedLines ? `<div class="tt-novel-char-row is-ooc"><span>🚫 OOC红线</span><p>${escapeHtml(ch.oocRedLines)}</p></div>` : ''}
+                </div>
+            `;
+        }).join('');
+
+    const chronicleHtml = chronicle.length === 0
+        ? '<div class="tt-novel-empty">暂无全本剧情编年史。点击「📚 全本通读归档」后，会按时间顺序生成客观、无 RPG 标签污染的剧情时间轴。</div>'
+        : chronicle.map(evt => {
+            if (editingEventId === evt.id) {
+                return `
+                    <div class="tt-novel-card is-editing" data-evt-id="${escapeHtml(evt.id)}">
+                        <div class="tt-novel-edit-grid">
+                            <div class="tt-novel-row-2">
+                                <input type="text" class="text_pole" data-field="chapterRange" value="${escapeHtml(evt.chapterRange || '')}" placeholder="章号如 #1-#7" />
+                                <input type="text" class="text_pole" data-field="timeLabel" value="${escapeHtml(evt.timeLabel || '')}" placeholder="时间阶段" />
+                            </div>
+                            <input type="text" class="text_pole" data-field="title" value="${escapeHtml(evt.title || '')}" placeholder="事件标题" />
+                            <input type="text" class="text_pole" data-field="participants" value="${escapeHtml((evt.participants || []).join('、'))}" placeholder="出场人物（顿号分隔）" />
+                            <textarea class="text_pole" rows="3" data-field="summary" placeholder="客观剧情经过与结果">${escapeHtml(evt.summary || '')}</textarea>
+                            <input type="text" class="text_pole" data-field="infoGap" value="${escapeHtml(evt.infoGap || '')}" placeholder="信息差（谁还不知道什么）" />
+                        </div>
+                        <div class="tt-novel-card-actions">
+                            <button type="button" class="menu_button tt-novel-btn-sm" data-action="save-evt" data-id="${escapeHtml(evt.id)}">💾 保存</button>
+                            <button type="button" class="menu_button tt-novel-btn-sm" data-action="cancel-evt">取消</button>
+                        </div>
+                    </div>
+                `;
+            }
+            return `
+                <div class="tt-novel-card tt-novel-timeline-card">
+                    <div class="tt-novel-card-head">
+                        <div class="tt-novel-timeline-meta">
+                            <span class="tt-novel-chip is-gold">${escapeHtml(evt.chapterRange || `#${evt.startChapter || 1}`)}</span>
+                            <strong>${escapeHtml(evt.title)}</strong>
+                            ${evt.timeLabel ? `<span class="tt-novel-muted">${escapeHtml(evt.timeLabel)}</span>` : ''}
+                        </div>
+                        <div class="tt-novel-card-actions">
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-evt" data-id="${escapeHtml(evt.id)}">✏️</button>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="del-evt" data-id="${escapeHtml(evt.id)}">🗑️</button>
+                        </div>
+                    </div>
+                    ${(evt.participants || []).length > 0 ? `<div class="tt-novel-chip-row">${evt.participants.map(p => `<span class="tt-novel-chip">${escapeHtml(p)}</span>`).join('')}</div>` : ''}
+                    <div class="tt-novel-card-text">${escapeHtml(evt.summary)}</div>
+                    ${evt.infoGap ? `<div class="tt-novel-infogap">🔍 信息差：${escapeHtml(evt.infoGap)}</div>` : ''}
+                </div>
+            `;
+        }).join('');
+
+    const renderHookItem = (h) => `
+        <div class="tt-novel-hook-row ${h.status === 'pinned' ? 'is-pinned' : ''} ${h.status === 'resolved' ? 'is-resolved' : ''}">
+            <div class="tt-novel-hook-text">
+                <span class="tt-novel-chip">#${Number(h.plantedChapter || 1)}</span>
+                <span>${escapeHtml(h.content)}</span>
+                ${h.resolvedChapter ? `<span class="tt-novel-muted">（已于第${h.resolvedChapter}章回收）</span>` : ''}
+            </div>
+            <div class="tt-novel-card-actions">
+                ${h.status !== 'resolved' ? `<button type="button" class="tt-novel-mini-icon-btn" data-action="pin-hook" data-id="${escapeHtml(h.id)}" title="切换是否本章重点推进">${h.status === 'pinned' ? '🎯' : '📌'}</button>` : ''}
+                <button type="button" class="tt-novel-mini-icon-btn" data-action="resolve-hook" data-id="${escapeHtml(h.id)}" title="${h.status === 'resolved' ? '重新打开伏笔' : '标记已填坑'}">${h.status === 'resolved' ? '↩️' : '✅'}</button>
+                <button type="button" class="tt-novel-mini-icon-btn" data-action="del-hook" data-id="${escapeHtml(h.id)}" title="删除伏笔">🗑️</button>
+            </div>
+        </div>
+    `;
+
+    const hooksHtml = hooks.length === 0
+        ? '<div class="tt-novel-empty">暂无伏笔记录。续写时会自动通过末段指令提取新伏笔与已填坑，也可以点击上方「+ 伏笔」手动埋线。</div>'
+        : `
+            ${openHooks.map(renderHookItem).join('')}
+            ${resolvedHooks.length > 0 ? `<details class="tt-novel-fold-card"><summary>已回收伏笔（${resolvedHooks.length}）</summary>${resolvedHooks.map(renderHookItem).join('')}</details>` : ''}
+        `;
+
+    const worldAndSumsHtml = (worldStates.length === 0 && summaries.length === 0)
+        ? '<div class="tt-novel-empty">暂无势力/物品状态或单章续写摘要。</div>'
+        : `
+            ${worldStates.length > 0 ? `<div class="tt-novel-chip-list">${worldStates.map(w => `<div class="tt-novel-state-row"><span class="tt-novel-chip">[${escapeHtml(w.category || '状态')}] ${escapeHtml(w.name)}</span><span>${escapeHtml(w.state)}</span></div>`).join('')}</div>` : ''}
+            ${summaries.length > 0 ? `<div class="tt-novel-subhead">📝 近期续写单章摘要（${summaries.length}）</div>${summaries.slice(-10).map(s => `<div class="tt-novel-state-row"><span class="tt-novel-chip is-gold">第${s.chapterIndex}章</span><span>${escapeHtml(s.summary)}</span></div>`).join('')}` : ''}
+        `;
+
+    const showChars = memoryFilter === 'all' || memoryFilter === 'chars';
+    const showChronicle = memoryFilter === 'all' || memoryFilter === 'chronicle';
+    const showHooks = memoryFilter === 'all' || memoryFilter === 'hooks';
+    const showWorld = memoryFilter === 'all' || memoryFilter === 'world';
+
+    bodyEl.innerHTML = `
+        <div class="tt-novel-action-bar">
+            <button type="button" id="tt-novel-run-archive-full" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
+                📚 全本通读归档 (并发≤2 · 套预设)
+            </button>
+            <button type="button" id="tt-novel-run-archive-inc" class="menu_button" ${task.running ? 'disabled' : ''}>
+                ⚡ 增量补总结新章
+            </button>
+            <button type="button" id="tt-novel-add-char" class="menu_button">+ 人物</button>
+            <button type="button" id="tt-novel-add-hook" class="menu_button">+ 伏笔</button>
+        </div>
+        <div class="tt-novel-subfilter">
+            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'all' ? 'active' : ''}" data-filter="all">全部总览</button>
+            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'chars' ? 'active' : ''}" data-filter="chars">👤 人物 (${chars.length})</button>
+            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'chronicle' ? 'active' : ''}" data-filter="chronicle">📜 编年史 (${chronicle.length})</button>
+            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'hooks' ? 'active' : ''}" data-filter="hooks">🎯 伏笔 (${openHooks.length})</button>
+            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'world' ? 'active' : ''}" data-filter="world">🌍 状态 (${worldStates.length + summaries.length})</button>
+        </div>
+        ${progressHtml}
+        ${logHtml}
+        ${showChars ? `<section class="tt-novel-section"><div class="tt-novel-section-title">👤 核心人物 4 维灵魂与防 OOC 档案（已归档至第 ${ledger.lastArchivedChapter || 0} 章）</div><div class="tt-novel-card-grid">${charCardsHtml}</div></section>` : ''}
+        ${showChronicle ? `<section class="tt-novel-section"><div class="tt-novel-section-title">📜 全本剧情编年史（无 RP 标签 · 保留信息差）</div><div class="tt-novel-card-stack">${chronicleHtml}</div></section>` : ''}
+        ${showHooks ? `<section class="tt-novel-section"><div class="tt-novel-section-title">🎯 伏笔与暗线追踪（点 🎯 设为本章重点推进）</div><div class="tt-novel-card-stack">${hooksHtml}</div></section>` : ''}
+        ${showWorld ? `<section class="tt-novel-section"><div class="tt-novel-section-title">🌍 势力 / 物品 / 单章状态记录</div><div class="tt-novel-card-stack">${worldAndSumsHtml}</div></section>` : ''}
+    `;
+
+    bodyEl.querySelector('#tt-novel-run-archive-full')?.addEventListener('click', () => handlers.onRunArchive?.('full'));
+    bodyEl.querySelector('#tt-novel-run-archive-inc')?.addEventListener('click', () => handlers.onRunArchive?.('incremental'));
+    bodyEl.querySelectorAll('.tt-novel-filter-pill').forEach(btn => {
+        btn.addEventListener('click', () => {
+            memoryFilter = btn.getAttribute('data-filter') || 'all';
+            renderWorkbench();
+        });
+    });
+
+    bodyEl.querySelector('#tt-novel-add-char')?.addEventListener('click', async () => {
+        const name = window.prompt('请输入人物姓名：');
+        if (!name || !name.trim()) return;
+        const cur = await loadLedger();
+        const newChar = {
+            id: `char_manual_${Date.now()}`,
+            name: name.trim(),
+            role: '',
+            canonFoundation: '',
+            currentSituation: '',
+            voiceAndQuotes: '',
+            oocRedLines: '',
+            updatedChapter: Number(cachedNovelData?.cutoffChapterIndex || 1),
+        };
+        cur.characters.push(newChar);
+        await saveLedger(cur);
+        editingCharacterId = newChar.id;
+        await refreshReaderWidgets();
+    });
+
+    bodyEl.querySelector('#tt-novel-add-hook')?.addEventListener('click', async () => {
+        const text = window.prompt('请输入要埋下或本章要推进的伏笔线索：');
+        if (!text || !text.trim()) return;
+        const cur = await loadLedger();
+        cur.hooks.push({
+            id: `hook_${Date.now()}`,
+            content: text.trim(),
+            plantedChapter: Number(cachedNovelData?.cutoffChapterIndex || 1),
+            status: 'pinned',
+        });
+        await saveLedger(cur);
+        await refreshReaderWidgets();
+    });
+
+    // Character CRUD bindings
+    bodyEl.querySelectorAll('[data-action="edit-char"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingCharacterId = btn.getAttribute('data-id');
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="cancel-char"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingCharacterId = null;
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="save-char"]').forEach(btn => {
         btn.addEventListener('click', async () => {
-            const hookId = btn.getAttribute('data-hook-id');
-            const currentLedger = await loadLedger();
-            const target = currentLedger.hooks.find(h => h.id === hookId);
+            const id = btn.getAttribute('data-id');
+            const card = bodyEl.querySelector(`.tt-novel-char-card[data-char-id="${CSS.escape(id)}"]`);
+            if (!card) return;
+            const cur = await loadLedger();
+            const target = cur.characters.find(c => c.id === id);
+            if (target) {
+                const val = (f) => String(card.querySelector(`[data-field="${f}"]`)?.value || '').trim();
+                target.name = val('name') || target.name;
+                target.role = val('role');
+                target.canonFoundation = val('canonFoundation');
+                target.currentSituation = val('currentSituation');
+                target.voiceAndQuotes = val('voiceAndQuotes');
+                target.oocRedLines = val('oocRedLines');
+                await saveLedger(cur);
+            }
+            editingCharacterId = null;
+            await refreshReaderWidgets();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="del-char"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const cur = await loadLedger();
+            cur.characters = cur.characters.filter(c => c.id !== id);
+            await saveLedger(cur);
+            await refreshReaderWidgets();
+        });
+    });
+
+    // Event CRUD bindings
+    bodyEl.querySelectorAll('[data-action="edit-evt"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingEventId = btn.getAttribute('data-id');
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="cancel-evt"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingEventId = null;
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="save-evt"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const card = bodyEl.querySelector(`.tt-novel-card[data-evt-id="${CSS.escape(id)}"]`);
+            if (!card) return;
+            const cur = await loadLedger();
+            const target = cur.chronicle.find(e => e.id === id);
+            if (target) {
+                const val = (f) => String(card.querySelector(`[data-field="${f}"]`)?.value || '').trim();
+                target.chapterRange = val('chapterRange') || target.chapterRange;
+                target.timeLabel = val('timeLabel');
+                target.title = val('title') || target.title;
+                target.participants = val('participants').split(/[、,，\s]+/).filter(Boolean);
+                target.summary = val('summary') || target.summary;
+                target.infoGap = val('infoGap');
+                await saveLedger(cur);
+            }
+            editingEventId = null;
+            await refreshReaderWidgets();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="del-evt"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const cur = await loadLedger();
+            cur.chronicle = cur.chronicle.filter(e => e.id !== id);
+            await saveLedger(cur);
+            await refreshReaderWidgets();
+        });
+    });
+
+    // Hook bindings
+    bodyEl.querySelectorAll('[data-action="pin-hook"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const cur = await loadLedger();
+            const target = cur.hooks.find(h => h.id === id);
             if (target) {
                 target.status = target.status === 'pinned' ? 'open' : 'pinned';
-                await saveLedger(currentLedger);
+                await saveLedger(cur);
                 await refreshReaderWidgets();
             }
         });
     });
-
-    container.querySelector('#tt-novel-add-hook-btn')?.addEventListener('click', async () => {
-        const input = window.prompt('请输入要埋下或本章要推进的伏笔线索：');
-        if (!input || !input.trim()) return;
-        const currentLedger = await loadLedger();
-        currentLedger.hooks.push({
-            id: `hook_${Date.now()}`,
-            content: input.trim(),
-            plantedChapter: Number(cachedNovelData?.cutoffChapterIndex || 1),
-            status: 'pinned',
+    bodyEl.querySelectorAll('[data-action="resolve-hook"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const cur = await loadLedger();
+            const target = cur.hooks.find(h => h.id === id);
+            if (target) {
+                if (target.status === 'resolved') {
+                    target.status = 'open';
+                    delete target.resolvedChapter;
+                } else {
+                    target.status = 'resolved';
+                    target.resolvedChapter = Number(cachedNovelData?.cutoffChapterIndex || 1);
+                }
+                await saveLedger(cur);
+                await refreshReaderWidgets();
+            }
         });
-        await saveLedger(currentLedger);
-        await refreshReaderWidgets();
+    });
+    bodyEl.querySelectorAll('[data-action="del-hook"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const cur = await loadLedger();
+            cur.hooks = cur.hooks.filter(h => h.id !== id);
+            await saveLedger(cur);
+            await refreshReaderWidgets();
+        });
     });
 }
 
-function mountFloatingTocDrawer() {
-    if (document.getElementById('tt-novel-toc-drawer')) return;
+/* ==========================================================================
+   TAB 2: 🎨 文风蒸馏工坊 (Full Transparent Process Viewer)
+   ========================================================================== */
+function renderStyleTab(bodyEl) {
+    const settings = handlers.getSettings?.() || {};
+    const sp = cachedLedger?.styleProfile || null;
+    const task = liveTaskState.style;
+    const logs = task.running && task.logs.length > 0 ? task.logs : (sp?.processLog || []);
 
-    const drawer = document.createElement('aside');
-    drawer.id = 'tt-novel-toc-drawer';
-    drawer.className = 'tt-novel-toc-drawer';
-    drawer.innerHTML = `
-        <div class="tt-novel-toc-header">
-            <div class="tt-novel-toc-title-row">
-                <h4 id="tt-novel-toc-book-title">📑 章节目录与进度</h4>
-                <button type="button" id="tt-novel-toc-close" class="tt-novel-icon-btn" title="关闭目录">
-                    <i class="fa-solid fa-xmark"></i>
-                </button>
-            </div>
-            <div class="tt-novel-toc-jumps">
-                <button type="button" id="tt-novel-jump-cutoff" class="tt-novel-jump-btn" title="定位到原著断更末章与 AI 续写第一章的交界处">
-                    📍 跳至断更处
-                </button>
-                <button type="button" id="tt-novel-jump-latest" class="tt-novel-jump-btn" title="跳转到最新的续写章节底部">
-                    🔥 跳至最新章
-                </button>
-                <button type="button" id="tt-novel-jump-saved" class="tt-novel-jump-btn" title="回到上次自动记录的阅读楼层">
-                    🔖 上次阅读
-                </button>
-            </div>
-            <div class="tt-novel-toc-search-row">
-                <input type="search" id="tt-novel-toc-search" class="text_pole" placeholder="搜索章节标题或原著关键词..." />
-            </div>
+    const scoreBadgeClass = (score) => {
+        if (score === null || score === undefined) return '';
+        if (score >= 88) return 'is-high';
+        if (score >= 80) return 'is-mid';
+        return 'is-low';
+    };
+
+    const processTimelineHtml = logs.length === 0
+        ? '<div class="tt-novel-empty">尚未执行文风蒸馏。点击上方按钮开始后，这里会实时展示【阶段 0 本地指纹 → 1A/1B 深度解剖 → 2A 初版圣经 → 每轮盲测大纲/仿写稿/原著真迹对比/5 维评分与揪出的破绽】全过程。</div>'
+        : logs.map(item => {
+            if (item.type === 'round') {
+                return `
+                    <details class="tt-novel-round-card" open>
+                        <summary class="tt-novel-round-head">
+                            <span><strong>${escapeHtml(item.title || `第 ${item.round} 轮盲测`)}</strong></span>
+                            <span class="tt-novel-score-pill ${scoreBadgeClass(item.score)}">
+                                ${item.score !== null && item.score !== undefined ? `${item.score} / 100 分` : '已评估'}
+                            </span>
+                        </summary>
+                        <div class="tt-novel-round-body">
+                            <div class="tt-novel-diff-box">
+                                <div class="tt-novel-mini-label">⚖️ 5 维纯文风评分与本轮揪出的破绽（圣经更新至 ${item.styleCardLength || '?'} 字）</div>
+                                <div class="tt-novel-pre-wrap">${escapeHtml(item.diffNotes || '')}</div>
+                            </div>
+                            <details class="tt-novel-subfold">
+                                <summary>📋 盲测考题（剥离文风后的干瘪节拍大纲）</summary>
+                                <div class="tt-novel-pre-wrap">${escapeHtml(item.dryOutline || '')}</div>
+                            </details>
+                            <details class="tt-novel-subfold">
+                                <summary>🔍 原著真迹 vs AI 盲测仿写稿（展开左右对照）</summary>
+                                <div class="tt-novel-compare-grid">
+                                    <div class="tt-novel-compare-col">
+                                        <div class="tt-novel-mini-label">📜 原作者真迹（${escapeHtml(item.holdoutLabel || '')}）</div>
+                                        <div class="tt-novel-compare-text">${escapeHtml(item.holdoutTruth || '')}</div>
+                                    </div>
+                                    <div class="tt-novel-compare-col">
+                                        <div class="tt-novel-mini-label">🤖 AI 本轮蒙眼仿写稿</div>
+                                        <div class="tt-novel-compare-text">${escapeHtml(item.blindRewrite || '')}</div>
+                                    </div>
+                                </div>
+                            </details>
+                        </div>
+                    </details>
+                `;
+            }
+            return `
+                <details class="tt-novel-step-item">
+                    <summary><strong>${escapeHtml(item.title || '')}</strong> <span class="tt-novel-muted">${escapeHtml(item.summary || '')}</span></summary>
+                    <pre class="tt-novel-pre">${escapeHtml(item.detail || '')}</pre>
+                </details>
+            `;
+        }).join('');
+
+    const progressHtml = task.text
+        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
+        : '';
+
+    bodyEl.innerHTML = `
+        <div class="tt-novel-action-bar">
+            <select id="tt-novel-wb-distill-rounds" class="text_pole" style="width: 108px;">
+                <option value="1" ${Number(settings.distillRounds) === 1 ? 'selected' : ''}>1 轮盲测</option>
+                <option value="2" ${Number(settings.distillRounds || 2) === 2 ? 'selected' : ''}>2 轮 (推荐)</option>
+                <option value="3" ${Number(settings.distillRounds) === 3 ? 'selected' : ''}>3 轮 (深度)</option>
+            </select>
+            <button type="button" id="tt-novel-wb-distill-start" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
+                🎨 开始全流程对抗蒸馏 (并发≤2 · 套预设)
+            </button>
+            <button type="button" id="tt-novel-wb-distill-refine" class="menu_button" ${task.running || !sp?.styleCard ? 'disabled' : ''}>
+                🔄 追加 1 轮盲测精炼
+            </button>
         </div>
-        <div id="tt-novel-toc-preview" class="tt-novel-toc-preview displayNone"></div>
-        <div id="tt-novel-toc-list" class="tt-novel-toc-list"></div>
+        ${progressHtml}
+        <section class="tt-novel-section">
+            <div class="tt-novel-section-title">🔬 蒸馏全过程透明视图（每一步产出与真迹/仿写对照均可展开核验）</div>
+            <div class="tt-novel-card-stack">${processTimelineHtml}</div>
+        </section>
+        <section class="tt-novel-section">
+            <div class="tt-novel-section-title">🧬 终版《原著文风骨相 DNA 圣经》（${sp?.styleCard ? `${String(sp.styleCard).length} 字` : '未生成'} · 支持直接手动微调）</div>
+            <textarea id="tt-novel-wb-style-editor" class="text_pole tt-novel-style-editor" rows="9" placeholder="蒸馏完成后的《原著文风骨相 DNA 圣经》会显示在这里...">${escapeHtml(sp?.styleCard || '')}</textarea>
+            <details class="tt-novel-fold-card">
+                <summary>📜 查看 / 编辑原著灵魂原文范例（Few-Shot 活样本）</summary>
+                <textarea id="tt-novel-wb-excerpts-editor" class="text_pole tt-novel-style-editor" rows="6" placeholder="原著灵魂范例片段...">${escapeHtml(sp?.goldenExcerpts || '')}</textarea>
+            </details>
+            <div class="tt-novel-action-bar">
+                <button type="button" id="tt-novel-wb-save-style" class="menu_button">💾 保存文风与范例修改</button>
+                <button type="button" id="tt-novel-wb-clear-style" class="menu_button">🗑️ 清空文风卡</button>
+            </div>
+        </section>
     `;
 
-    document.body.appendChild(drawer);
-
-    drawer.querySelector('#tt-novel-toc-close')?.addEventListener('click', () => toggleTocDrawer(false));
-    drawer.querySelector('#tt-novel-jump-cutoff')?.addEventListener('click', async () => {
-        await toggleTocDrawer(false);
-        if (cachedNovelData && onViewChapterCallback) {
-            await onViewChapterCallback(cachedNovelData.cutoffChapterIndex || cachedNovelData.totalChapters);
+    bodyEl.querySelector('#tt-novel-wb-distill-rounds')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('distillRounds', Math.max(1, Math.min(3, Number(e.target.value) || 2)));
+    });
+    bodyEl.querySelector('#tt-novel-wb-distill-start')?.addEventListener('click', () => {
+        handlers.onRunStyleDistill?.({ incremental: false });
+    });
+    bodyEl.querySelector('#tt-novel-wb-distill-refine')?.addEventListener('click', () => {
+        handlers.onRunStyleDistill?.({ incremental: true });
+    });
+    bodyEl.querySelector('#tt-novel-wb-save-style')?.addEventListener('click', async () => {
+        const cardText = String(bodyEl.querySelector('#tt-novel-wb-style-editor')?.value || '').trim();
+        const excerptsText = String(bodyEl.querySelector('#tt-novel-wb-excerpts-editor')?.value || '').trim();
+        const cur = await loadLedger();
+        if (!cardText) {
+            cur.styleProfile = null;
         } else {
-            await jumpToCutoffBoundary();
+            cur.styleProfile = {
+                ...(cur.styleProfile || { version: 3, fingerprintText: '', diffFindings: '', roundHistory: [], processLog: [] }),
+                styleCard: cardText,
+                goldenExcerpts: excerptsText,
+                distilledAt: Date.now(),
+            };
         }
-    });
-    drawer.querySelector('#tt-novel-jump-latest')?.addEventListener('click', async () => {
-        await toggleTocDrawer(false);
-        await jumpToLatestFloor();
-    });
-    drawer.querySelector('#tt-novel-jump-saved')?.addEventListener('click', async () => {
-        await toggleTocDrawer(false);
-        await jumpToSavedProgress();
-    });
-    drawer.querySelector('#tt-novel-toc-search')?.addEventListener(
-        'input',
-        debounce(() => renderTocDrawerBody(), 250),
-    );
-}
-
-export async function toggleTocDrawer(forceState) {
-    drawerOpen = typeof forceState === 'boolean' ? forceState : !drawerOpen;
-    const drawer = document.getElementById('tt-novel-toc-drawer');
-    if (!drawer) return;
-    drawer.classList.toggle('open', drawerOpen);
-    if (drawerOpen) {
+        await saveLedger(cur);
         await refreshReaderWidgets();
-    }
+        globalThis.toastr?.success?.(cardText ? '已保存修改后的文风骨相圣经！' : '已清空文风卡', '小说续写阅读器');
+    });
+    bodyEl.querySelector('#tt-novel-wb-clear-style')?.addEventListener('click', async () => {
+        const cur = await loadLedger();
+        cur.styleProfile = null;
+        await saveLedger(cur);
+        await refreshReaderWidgets();
+        globalThis.toastr?.info?.('已清空当前对话的原著文风 DNA 卡', '小说续写阅读器');
+    });
 }
 
-function renderTocDrawerBody() {
-    const listEl = document.getElementById('tt-novel-toc-list');
-    const titleEl = document.getElementById('tt-novel-toc-book-title');
-    const searchEl = /** @type {HTMLInputElement | null} */ (document.getElementById('tt-novel-toc-search'));
-    if (!listEl) return;
+/* ==========================================================================
+   TAB 3: 🧹 反八股体检 (Zero-API Cliché Scanner + Surgical De-Cliché)
+   ========================================================================== */
+function renderClicheTab(bodyEl) {
+    const settings = handlers.getSettings?.() || {};
+    const status = handlers.getLatestClicheStatus?.() || { hasContinuedFloor: false, report: null };
+    const task = liveTaskState.cliche;
+    const report = status.report;
 
-    const filterText = String(searchEl?.value || '').trim().toLowerCase();
+    const progressHtml = task.text
+        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
+        : '';
+
+    let summaryHtml = '<div class="tt-novel-empty">当前尚未生成 AI 续写章节。续写完成后，插件会在本地 0 API 自动扫描高频八股词。</div>';
+    if (status.hasContinuedFloor && report) {
+        if (report.totalHits === 0) {
+            summaryHtml = `<div class="tt-novel-banner is-ok">✅ 最新续写章节（第 ${status.chapterIndex} 章 / 楼层 #${status.floorIndex}）体检通过：未检出任何高频网文八股！</div>`;
+        } else {
+            summaryHtml = `
+                <div class="tt-novel-banner is-warn">
+                    ⚠️ 最新续写章节（第 ${status.chapterIndex} 章 / 楼层 #${status.floorIndex}）检出 <b>${report.totalHits}</b> 处高频八股（涉及：${escapeHtml(report.uniqueTerms.join('、'))}）
+                </div>
+                <div class="tt-novel-card-stack">
+                    ${report.hits.map((h, i) => `
+                        <div class="tt-novel-cliche-hit">
+                            <span class="tt-novel-chip is-danger">#${i + 1} ${escapeHtml(h.matchedText)}</span>
+                            <span class="tt-novel-cliche-snippet">${escapeHtml(h.snippet)}</span>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+    }
+
+    bodyEl.innerHTML = `
+        <div class="tt-novel-action-bar">
+            <button type="button" id="tt-novel-cliche-rescan" class="menu_button">🔍 重新扫描最新章 (0 API)</button>
+            <button type="button" id="tt-novel-cliche-fix" class="menu_button tt-novel-btn-primary" ${task.running || !status.hasContinuedFloor ? 'disabled' : ''}>
+                🧹 一键局部去八股精修 (1次API · 套预设 · 不改剧情)
+            </button>
+        </div>
+        ${progressHtml}
+        <section class="tt-novel-section">
+            <div class="tt-novel-section-title">📋 最新续写章节八股体检报告</div>
+            ${summaryHtml}
+        </section>
+        <section class="tt-novel-section">
+            <div class="tt-novel-section-title">🚫 自定义补充严禁八股词表（每行或逗号分隔，续写与体检同步生效）</div>
+            <textarea id="tt-novel-cliche-custom" class="text_pole" rows="3" placeholder="例如：瞳孔地震、如遭雷击、勾唇冷笑...">${escapeHtml(settings.clicheBlacklist || '')}</textarea>
+            <details class="tt-novel-fold-card">
+                <summary>查看内置高危八股监控词表（共 ${DEFAULT_CLICHE_TERMS.length} 项）</summary>
+                <div class="tt-novel-chip-row">${DEFAULT_CLICHE_TERMS.map(t => `<span class="tt-novel-chip">${escapeHtml(t)}</span>`).join('')}</div>
+            </details>
+        </section>
+    `;
+
+    bodyEl.querySelector('#tt-novel-cliche-rescan')?.addEventListener('click', () => {
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-cliche-fix')?.addEventListener('click', () => {
+        handlers.onRunDeclicheLatest?.();
+    });
+    bodyEl.querySelector('#tt-novel-cliche-custom')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('clicheBlacklist', String(e.target.value || ''));
+        renderWorkbench();
+    });
+}
+
+/* ==========================================================================
+   TAB 4: 📑 章节目录 (Unified TOC & Cutoff Manager)
+   ========================================================================== */
+function renderTocTab(bodyEl) {
     const chat = getContext()?.chat || [];
     const novel = cachedNovelData;
-
-    if (titleEl) {
-        titleEl.textContent = novel?.title
-            ? `📑 《${novel.title}》 (${novel.cutoffChapterIndex}/${novel.totalChapters}章)`
-            : '📑 章节目录与进度';
-    }
 
     const originalFloorByChapter = new Map();
     let lastOrigFloorIdx = -1;
@@ -322,174 +872,258 @@ function renderTocDrawerBody() {
         if (!isContinuedNovelFloor(msg, floorIdx, lastOrigFloorIdx)) return;
         const firstLine = String(msg.mes || '').split('\n').map(l => l.trim()).find(Boolean) || '续写章节';
         const cleanHeading = firstLine.replace(/^#+\s*/, '').slice(0, 38);
-        const swipeCount = Array.isArray(msg.swipes) ? msg.swipes.length : 1;
         aiFloors.push({
             floorIdx,
             title: cleanHeading,
-            swipeCount,
+            swipeCount: Array.isArray(msg.swipes) ? msg.swipes.length : 1,
             wordCount: String(msg.mes || '').replace(/\s+/g, '').length,
         });
     });
 
-    const rows = [];
-
-    if (novel?.chapters?.length) {
-        const cutoff = novel.cutoffChapterIndex || novel.totalChapters;
-        rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（共 ${novel.totalChapters} 章 · 已导入第 1~${cutoff} 章，酒馆自动隐藏高楼层）</div>`);
-
-        let visibleChapters = novel.chapters;
-        if (filterText) {
-            // Fast title match first; only scan body if < 30 matches and query >= 2 chars
-            const titleHits = novel.chapters.filter(ch => ch.title.toLowerCase().includes(filterText));
-            if (titleHits.length >= 20 || filterText.length < 2) {
-                visibleChapters = titleHits;
-            } else {
-                const bodyHits = [];
-                for (const ch of novel.chapters) {
-                    if (ch.title.toLowerCase().includes(filterText) || ch.content.toLowerCase().includes(filterText)) {
-                        bodyHits.push(ch);
-                        if (bodyHits.length >= 80) break;
-                    }
-                }
-                visibleChapters = bodyHits;
-            }
-        } else if (!showAllOriginalChapters && novel.chapters.length > TOC_PAGE_LIMIT) {
-            const half = Math.floor(TOC_PAGE_LIMIT / 2);
-            const start = Math.max(0, Math.min(novel.chapters.length - TOC_PAGE_LIMIT, cutoff - half));
-            visibleChapters = novel.chapters.slice(start, start + TOC_PAGE_LIMIT);
-            rows.push(`
-                <button type="button" id="tt-novel-toc-show-all" class="tt-novel-jump-btn">
-                    展开全部 ${novel.chapters.length} 章（当前展示第 ${visibleChapters[0].index}~${visibleChapters[visibleChapters.length - 1].index} 章）
-                </button>
-            `);
-        }
-
-        for (const ch of visibleChapters) {
-            const mountedFloor = originalFloorByChapter.get(ch.index);
-            const isMounted = mountedFloor !== undefined;
-            const isCutoff = ch.index === cutoff;
-            const isAfterCutoff = ch.index > cutoff;
-            const tagClass = isAfterCutoff ? 'masked' : (isCutoff ? 'cutoff' : 'orig');
-            const tagText = isAfterCutoff ? '已屏蔽' : (isCutoff ? '夺舍点' : '原著');
-            rows.push(`
-                <div class="tt-novel-toc-item ${isCutoff ? 'is-cutoff' : ''} ${isAfterCutoff ? 'is-masked' : ''}" data-orig-index="${ch.index}">
-                    <div class="tt-novel-toc-item-main" data-action="view-orig" data-orig-index="${ch.index}" title="点击直接在主屏幕阅读第 ${ch.index} 章">
-                        <span class="tt-novel-toc-tag ${tagClass}">${tagText}</span>
-                        <span class="tt-novel-toc-name">${escapeHtml(ch.title)}</span>
-                        <span class="tt-novel-toc-meta">${isMounted ? `#${mountedFloor}` : `${ch.wordCount}字`}</span>
-                    </div>
-                    <div class="tt-novel-toc-actions">
-                        <button type="button" class="tt-novel-view-btn" data-action="view-orig" data-orig-index="${ch.index}" title="在主阅读界面观看第 ${ch.index} 章">
-                            👁️ 阅读本章
-                        </button>
-                        <button type="button" class="tt-novel-cutoff-btn" data-action="cutoff-here" data-orig-index="${ch.index}" title="从此章夺舍重续：导入第 1~${ch.index} 章，并自动屏蔽第 ${ch.index + 1} 章及之后的原著剧情">
-                            ✂️ 从此夺舍
-                        </button>
-                    </div>
-                </div>
-            `);
-        }
-    }
-
-    rows.push(`<div class="tt-novel-toc-divider">✦ AI 续写章节（${aiFloors.length} 章）</div>`);
-    if (aiFloors.length === 0) {
-        rows.push('<div class="tt-novel-toc-empty">暂无续写章节，在底部输入框发送指令即可单次调用生成下一章。</div>');
-    } else {
-        aiFloors.forEach((item, idx) => {
-            if (filterText && !item.title.toLowerCase().includes(filterText)) return;
-            rows.push(`
-                <div class="tt-novel-toc-item is-ai" data-action="jump-floor" data-floor="${item.floorIdx}">
-                    <div class="tt-novel-toc-item-main">
-                        <span class="tt-novel-toc-tag ai">续写 ${idx + 1}</span>
-                        <span class="tt-novel-toc-name">${escapeHtml(item.title)}</span>
-                        <span class="tt-novel-toc-meta">${item.swipeCount > 1 ? `[${item.swipeCount}分支] ` : ''}${item.wordCount}字 · #${item.floorIdx}</span>
-                    </div>
-                </div>
-            `);
-        });
-    }
-
-    listEl.innerHTML = rows.join('');
-
-    listEl.querySelector('#tt-novel-toc-show-all')?.addEventListener('click', () => {
-        showAllOriginalChapters = true;
-        renderTocDrawerBody();
-    });
-
-    listEl.querySelectorAll('[data-action="jump-floor"]').forEach(el => {
-        el.addEventListener('click', async () => {
-            const floor = Number(el.getAttribute('data-floor'));
-            await toggleTocDrawer(false);
-            await scrollToChatFloor(floor);
-        });
-    });
-
-    listEl.querySelectorAll('[data-action="view-orig"]').forEach(el => {
-        el.addEventListener('click', async () => {
-            const idx = Number(el.getAttribute('data-orig-index'));
-            await toggleTocDrawer(false);
-            const mountedFloor = originalFloorByChapter.get(idx);
-            if (mountedFloor !== undefined) {
-                if (cachedNovelData) {
-                    cachedNovelData.viewingChapterIndex = idx;
-                }
-                await scrollToChatFloor(mountedFloor);
-            } else if (onViewChapterCallback) {
-                await onViewChapterCallback(idx);
-            } else {
-                openOriginalChapterPreview(idx);
-            }
-        });
-    });
-
-    listEl.querySelectorAll('[data-action="cutoff-here"]').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const idx = Number(btn.getAttribute('data-orig-index'));
-            await toggleTocDrawer(false);
-            if (onCutoffCallback) {
-                await onCutoffCallback(idx);
-                await refreshReaderWidgets();
-            }
-        });
-    });
-}
-
-function openOriginalChapterPreview(chapterIndex) {
-    const previewEl = document.getElementById('tt-novel-toc-preview');
-    if (!previewEl || !cachedNovelData) return;
-    const ch = cachedNovelData.chapters.find(c => c.index === chapterIndex);
-    if (!ch) return;
-    previewChapterIndex = chapterIndex;
-
-    previewEl.classList.remove('displayNone');
-    previewEl.innerHTML = `
-        <div class="tt-novel-preview-header">
-            <strong>${escapeHtml(ch.title)}（${ch.wordCount}字）</strong>
-            <div>
-                <button type="button" id="tt-novel-preview-cutoff" class="tt-novel-cutoff-btn">✂️ 从此章截断重续</button>
-                <button type="button" id="tt-novel-preview-close" class="tt-novel-icon-btn"><i class="fa-solid fa-xmark"></i></button>
-            </div>
+    bodyEl.innerHTML = `
+        <div class="tt-novel-toc-jumps">
+            <button type="button" id="tt-novel-jump-cutoff" class="tt-novel-jump-btn">📍 跳至断更处</button>
+            <button type="button" id="tt-novel-jump-latest" class="tt-novel-jump-btn">🔥 跳至最新章</button>
+            <button type="button" id="tt-novel-jump-saved" class="tt-novel-jump-btn">🔖 上次阅读</button>
         </div>
-        <div class="tt-novel-preview-body">${escapeHtml(ch.content).replace(/\n+/g, '<br><br>')}</div>
+        <input type="search" id="tt-novel-toc-search" class="text_pole" placeholder="搜索章节标题或原著关键词..." />
+        <div id="tt-novel-toc-list" class="tt-novel-toc-list-inline"></div>
     `;
 
-    previewEl.querySelector('#tt-novel-preview-close')?.addEventListener('click', () => {
-        previewEl.classList.add('displayNone');
-    });
-    previewEl.querySelector('#tt-novel-preview-cutoff')?.addEventListener('click', async () => {
-        if (onCutoffCallback && previewChapterIndex) {
-            await onCutoffCallback(previewChapterIndex);
-            previewEl.classList.add('displayNone');
-            await refreshReaderWidgets();
+    const paintList = (filterText = '') => {
+        const listEl = bodyEl.querySelector('#tt-novel-toc-list');
+        if (!listEl) return;
+        const q = filterText.trim().toLowerCase();
+        const rows = [];
+
+        if (novel?.chapters?.length) {
+            const cutoff = novel.cutoffChapterIndex || novel.totalChapters;
+            rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（共 ${novel.totalChapters} 章 · 当前锚点 #${cutoff}）</div>`);
+            let visible = novel.chapters;
+            if (q) {
+                const titleHits = novel.chapters.filter(ch => ch.title.toLowerCase().includes(q));
+                visible = (titleHits.length >= 20 || q.length < 2)
+                    ? titleHits
+                    : novel.chapters.filter(ch => ch.title.toLowerCase().includes(q) || ch.content.toLowerCase().includes(q)).slice(0, 80);
+            } else if (!showAllOriginalChapters && novel.chapters.length > TOC_PAGE_LIMIT) {
+                const half = Math.floor(TOC_PAGE_LIMIT / 2);
+                const start = Math.max(0, Math.min(novel.chapters.length - TOC_PAGE_LIMIT, cutoff - half));
+                visible = novel.chapters.slice(start, start + TOC_PAGE_LIMIT);
+                rows.push(`<button type="button" id="tt-novel-toc-show-all" class="tt-novel-jump-btn">展开全部 ${novel.chapters.length} 章</button>`);
+            }
+            for (const ch of visible) {
+                const mountedFloor = originalFloorByChapter.get(ch.index);
+                const isCutoff = ch.index === cutoff;
+                const isAfter = ch.index > cutoff;
+                const tagClass = isAfter ? 'masked' : (isCutoff ? 'cutoff' : 'orig');
+                const tagText = isAfter ? '屏蔽' : (isCutoff ? '夺舍点' : '原著');
+                rows.push(`
+                    <div class="tt-novel-toc-item ${isCutoff ? 'is-cutoff' : ''} ${isAfter ? 'is-masked' : ''}">
+                        <div class="tt-novel-toc-item-main" data-action="view-orig" data-orig-index="${ch.index}">
+                            <span class="tt-novel-toc-tag ${tagClass}">${tagText}</span>
+                            <span class="tt-novel-toc-name">${escapeHtml(ch.title)}</span>
+                            <span class="tt-novel-toc-meta">${mountedFloor !== undefined ? `#${mountedFloor}` : `${ch.wordCount}字`}</span>
+                        </div>
+                        <div class="tt-novel-toc-actions">
+                            <button type="button" class="tt-novel-view-btn" data-action="view-orig" data-orig-index="${ch.index}">阅读</button>
+                            <button type="button" class="tt-novel-cutoff-btn" data-action="cutoff-here" data-orig-index="${ch.index}">夺舍</button>
+                        </div>
+                    </div>
+                `);
+            }
         }
+
+        rows.push(`<div class="tt-novel-toc-divider">✦ AI 续写章节（${aiFloors.length} 章）</div>`);
+        if (aiFloors.length === 0) {
+            rows.push('<div class="tt-novel-empty">暂无续写章节，在底部发送大纲即可开始续写。</div>');
+        } else {
+            aiFloors.forEach((item, idx) => {
+                if (q && !item.title.toLowerCase().includes(q)) return;
+                rows.push(`
+                    <div class="tt-novel-toc-item is-ai" data-action="jump-floor" data-floor="${item.floorIdx}">
+                        <div class="tt-novel-toc-item-main">
+                            <span class="tt-novel-toc-tag ai">续写 ${idx + 1}</span>
+                            <span class="tt-novel-toc-name">${escapeHtml(item.title)}</span>
+                            <span class="tt-novel-toc-meta">${item.wordCount}字 · #${item.floorIdx}</span>
+                        </div>
+                    </div>
+                `);
+            });
+        }
+
+        listEl.innerHTML = rows.join('');
+
+        listEl.querySelector('#tt-novel-toc-show-all')?.addEventListener('click', () => {
+            showAllOriginalChapters = true;
+            paintList(q);
+        });
+        listEl.querySelectorAll('[data-action="jump-floor"]').forEach(el => {
+            el.addEventListener('click', async () => {
+                const floor = Number(el.getAttribute('data-floor'));
+                closeWorkbench();
+                await scrollToChatFloor(floor);
+            });
+        });
+        listEl.querySelectorAll('[data-action="view-orig"]').forEach(el => {
+            el.addEventListener('click', async () => {
+                const idx = Number(el.getAttribute('data-orig-index'));
+                closeWorkbench();
+                const mounted = originalFloorByChapter.get(idx);
+                if (mounted !== undefined) {
+                    if (cachedNovelData) cachedNovelData.viewingChapterIndex = idx;
+                    await scrollToChatFloor(mounted);
+                } else {
+                    await handlers.onViewChapter?.(idx);
+                }
+            });
+        });
+        listEl.querySelectorAll('[data-action="cutoff-here"]').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const idx = Number(btn.getAttribute('data-orig-index'));
+                closeWorkbench();
+                await handlers.onCutoffFromChapter?.(idx);
+                await refreshReaderWidgets();
+            });
+        });
+    };
+
+    paintList('');
+
+    bodyEl.querySelector('#tt-novel-toc-search')?.addEventListener('input', debounce((e) => {
+        paintList(String(e.target.value || ''));
+    }, 220));
+    bodyEl.querySelector('#tt-novel-jump-cutoff')?.addEventListener('click', async () => {
+        closeWorkbench();
+        if (cachedNovelData) await handlers.onViewChapter?.(cachedNovelData.cutoffChapterIndex || cachedNovelData.totalChapters);
+        else await jumpToCutoffBoundary();
+    });
+    bodyEl.querySelector('#tt-novel-jump-latest')?.addEventListener('click', async () => {
+        closeWorkbench();
+        await jumpToLatestFloor();
+    });
+    bodyEl.querySelector('#tt-novel-jump-saved')?.addEventListener('click', async () => {
+        closeWorkbench();
+        await jumpToSavedProgress();
     });
 }
 
-/**
- * Returns the original chapter index currently visible near the top of `#chat`, or null if none.
- * @returns {number | null}
- */
+/* ==========================================================================
+   TAB 5: ⚙️ 导入与设置 (Clean Grouped Settings & Shared Preset Hub)
+   ========================================================================== */
+function renderSettingsTab(bodyEl) {
+    const settings = handlers.getSettings?.() || {};
+    const meta = handlers.getRuntimeMeta?.() || {};
+    const canonCount = cachedCanonDb?.items?.length || 0;
+    const canonSources = cachedCanonDb?.sources?.join(', ') || '';
+    const presetNames = Array.isArray(meta.presetNames) ? meta.presetNames : [];
+    const savedPreset = String(settings.distillPresetName ?? '__current__');
+    const icon = lastBridgeUi.state === 'connected' ? '🟢' : (lastBridgeUi.state === 'connecting' ? '🟡' : (lastBridgeUi.state === 'error' ? '🔴' : '⚪'));
+
+    const presetOptions = [
+        `<option value="__current__" ${savedPreset === '__current__' ? 'selected' : ''}>使用当前酒馆预设${meta.activePresetName ? `（${escapeHtml(meta.activePresetName)}）` : ''}</option>`,
+        `<option value="" ${savedPreset === '' ? 'selected' : ''}>不使用预设（纯净直连）</option>`,
+        ...presetNames.map(n => `<option value="${escapeHtml(n)}" ${savedPreset === n ? 'selected' : ''}>${escapeHtml(n)}</option>`),
+    ];
+    if (savedPreset && savedPreset !== '__current__' && !presetNames.includes(savedPreset)) {
+        presetOptions.push(`<option value="${escapeHtml(savedPreset)}" selected>${escapeHtml(savedPreset)}（未找到）</option>`);
+    }
+
+    bodyEl.innerHTML = `
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">📚 导入原著与游戏设定库（对话级独立隔离）</div>
+            <div class="tt-novel-action-bar">
+                <label class="menu_button tt-novel-file-label tt-novel-btn-primary">
+                    <i class="fa-solid fa-file-import"></i> 导入原著 (.txt/.md)
+                    <input type="file" id="tt-novel-wb-import-txt" accept=".txt,.md,text/plain,text/markdown,*/*" hidden />
+                </label>
+                <label class="menu_button tt-novel-file-label">
+                    <i class="fa-solid fa-database"></i> 挂载原作/游戏设定库 (.json/.md)
+                    <input type="file" id="tt-novel-wb-import-canon" accept=".json,.jsonl,.md,.txt,application/json,text/plain,*/*" multiple hidden />
+                </label>
+            </div>
+            <div class="tt-novel-muted">当前已挂载补充设定词条：${canonCount} 条${canonSources ? `（${escapeHtml(canonSources)}）` : ''}（自带蝴蝶效应保护）</div>
+            <div class="tt-novel-action-bar">
+                <button type="button" id="tt-novel-wb-clear-canon" class="menu_button tt-novel-btn-sm">清空补充设定库</button>
+                <button type="button" id="tt-novel-wb-clear-all" class="menu_button tt-novel-btn-sm">重置当前对话小说数据</button>
+            </div>
+        </section>
+
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">🎛️ 模型与防拒答预设配置</div>
+            <div class="tt-novel-muted">当前酒馆模型：<code>${escapeHtml(meta.activeModel || '当前酒馆已连接模型')}</code></div>
+            <div class="tt-novel-inline-field">
+                <span>蒸馏 / 剧情人物总结 / 去八股精修 共用酒馆预设：</span>
+                <select id="tt-novel-wb-preset-select" class="text_pole" style="max-width: 240px;">${presetOptions.join('')}</select>
+            </div>
+            <div class="tt-novel-inline-field">
+                <span>续写时直接发给 AI 的末尾原著章数 (1~20)：</span>
+                <input type="number" id="tt-novel-wb-anchor-count" class="text_pole" min="1" max="20" value="${Number(settings.mountAnchorChapters || 3)}" style="width: 72px;" />
+            </div>
+        </section>
+
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">📖 阅读与续写行为开关</div>
+            <label class="checkbox_label"><input type="checkbox" data-setting="enabled" ${settings.enabled ? 'checked' : ''} /><span>启用小说续写插件</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="immersiveMode" ${settings.immersiveMode ? 'checked' : ''} /><span>沉浸小说阅读模式（隐藏头像气泡，连续书页排版）</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="hideUserFloors" ${settings.hideUserFloors ? 'checked' : ''} /><span>隐藏所有「用户指令楼层」</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="hideReasoning" ${settings.hideReasoning !== false ? 'checked' : ''} /><span>隐藏「AI 思维链与思考批注框」</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="authorMode" ${settings.authorMode !== false ? 'checked' : ''} /><span>开启「✍️ 作者境界」（屏蔽玩家 {{user}} 人设，将输入转为导演大纲）</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="foldUserOutlineFloors" ${settings.foldUserOutlineFloors !== false ? 'checked' : ''} /><span>续写完成后自动折叠用户大纲楼层（楼层与章节 1:1 严格对齐）</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="enableAutoStateBlock" ${settings.enableAutoStateBlock ? 'checked' : ''} /><span>单次生成末尾自动产出总结、状态与伏笔更新（depth=0 强化 · 0 额外 API）</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="syncToWorldInfo" ${settings.syncToWorldInfo ? 'checked' : ''} /><span>自动将提取的状态同步写入酒馆原生世界书</span></label>
+        </section>
+
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">🔌 外部 Agent 远程介入桥 (WebSocket / MCP)</div>
+            <div class="tt-novel-bridge-row">
+                <input type="text" id="tt-novel-wb-bridge-url" class="text_pole" placeholder="ws://电脑局域网IP:17890/ws" value="${escapeHtml(settings.remoteBridgeUrl || '')}" />
+                <button type="button" id="tt-novel-wb-bridge-conn" class="menu_button tt-novel-btn-sm">🔗 连接</button>
+                <button type="button" id="tt-novel-wb-bridge-disc" class="menu_button tt-novel-btn-sm">⏹ 断开</button>
+            </div>
+            <small id="tt-novel-bridge-status" class="tt-novel-bridge-status">${icon} ${escapeHtml(lastBridgeUi.detail)}</small>
+        </section>
+    `;
+
+    bodyEl.querySelector('#tt-novel-wb-import-txt')?.addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (file) await handlers.onImportNovelFile?.(file);
+        e.target.value = '';
+    });
+    bodyEl.querySelector('#tt-novel-wb-import-canon')?.addEventListener('change', async (e) => {
+        const files = [...(e.target.files || [])];
+        if (files.length > 0) await handlers.onImportCanonFiles?.(files);
+        e.target.value = '';
+    });
+    bodyEl.querySelector('#tt-novel-wb-clear-canon')?.addEventListener('click', () => handlers.onClearCanon?.());
+    bodyEl.querySelector('#tt-novel-wb-clear-all')?.addEventListener('click', () => handlers.onClearAll?.());
+
+    bodyEl.querySelector('#tt-novel-wb-preset-select')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('distillPresetName', String(e.target.value ?? ''));
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-wb-anchor-count')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('mountAnchorChapters', Math.max(1, Math.min(20, Number(e.target.value) || 3)));
+    });
+    bodyEl.querySelectorAll('input[data-setting]').forEach(chk => {
+        chk.addEventListener('change', (e) => {
+            const key = chk.getAttribute('data-setting');
+            handlers.onUpdateSetting?.(key, Boolean(e.target.checked));
+        });
+    });
+
+    bodyEl.querySelector('#tt-novel-wb-bridge-conn')?.addEventListener('click', () => {
+        const url = String(bodyEl.querySelector('#tt-novel-wb-bridge-url')?.value || '').trim();
+        handlers.onConnectBridge?.(url);
+    });
+    bodyEl.querySelector('#tt-novel-wb-bridge-disc')?.addEventListener('click', () => {
+        handlers.onDisconnectBridge?.();
+    });
+}
+
+/* ==========================================================================
+   Scroll, Floor Jump & Reading Progress Helpers
+   ========================================================================== */
 function getCurrentVisibleOriginalChapterIndex() {
     const chatEl = document.getElementById('chat');
     const chat = getContext()?.chat;
@@ -509,17 +1143,10 @@ function getCurrentVisibleOriginalChapterIndex() {
     return null;
 }
 
-/**
- * Scrolls `#chat` to the specified message floor index, using TauriTavern's native
- * `jumpBoundedChatSurfaceToMessage` when BoundedChatSurface virtualization is active,
- * and self-healing if classic mode missed mounting newly added floors.
- * @param {number} floorIndex
- */
 export async function scrollToChatFloor(floorIndex) {
     const chatEl = document.getElementById('chat');
     if (!chatEl || !Number.isFinite(floorIndex) || floorIndex < 0) return;
 
-    // Wait 2 animation frames so TauriTavern's printMessages() requestAnimationFrame scrollChatToBottom finishes first
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
     let targetMes = chatEl.querySelector(`.mes[mesid="${floorIndex}"]`);
@@ -540,7 +1167,6 @@ export async function scrollToChatFloor(floorIndex) {
         await new Promise(resolve => setTimeout(resolve, 20));
     }
 
-    // Self-heal if floor exists in context.chat but wasn't mounted in DOM (e.g. stale mountedIds cache)
     const context = getContext();
     if (!chatEl.querySelector(`.mes[mesid="${floorIndex}"]`) && Array.isArray(context?.chat) && floorIndex < context.chat.length) {
         try {
@@ -565,7 +1191,6 @@ export async function scrollToChatFloor(floorIndex) {
     };
 
     alignFloor();
-    // Re-assert after TauriTavern's 200ms scrollOnMediaLoad delay
     setTimeout(() => alignFloor(), 240);
 }
 
@@ -577,11 +1202,8 @@ async function jumpToCutoffBoundary() {
             lastOrigFloor = idx;
         }
     });
-    if (lastOrigFloor >= 0) {
-        await scrollToChatFloor(lastOrigFloor);
-    } else if (chat.length > 0) {
-        await scrollToChatFloor(0);
-    }
+    if (lastOrigFloor >= 0) await scrollToChatFloor(lastOrigFloor);
+    else if (chat.length > 0) await scrollToChatFloor(0);
 }
 
 async function jumpToLatestFloor() {

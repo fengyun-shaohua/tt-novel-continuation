@@ -9,7 +9,9 @@ const CHAPTER_LINE_REGEX = /^[\t \u3000]*(?:#{1,6}[\t \u3000]+)?(?:(?:正文|第
 const FALLBACK_CHUNK_SIZE = 4200;
 const MEGA_CHAPTER_THRESHOLD = 8000;
 const MEGA_CHAPTER_TARGET = 4500;
-const NOVEL_STATE_BLOCK_REGEX = /<novel_state>([\s\S]*?)<\/novel_state>/gi;
+const NOVEL_STATE_BLOCK_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]*?)<\/novel_state>(?:\s*\n?```)?/gi;
+const UNCLOSED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]+)$/i;
+const ESCAPED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?&lt;novel_state&gt;([\s\S]*?)&lt;\/novel_state&gt;(?:\s*\n?```)?/gi;
 const NOISE_BLOCKS_REGEX = /<(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)\b[^>]*>[\s\S]*?<\/(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)>/gi;
 
 const CJK_STOPWORDS = new Set([
@@ -363,14 +365,45 @@ function stripListPrefix(line) {
         .trim();
 }
 
+function isEmptyPlaceholder(text) {
+    const t = String(text ?? '').trim();
+    if (!t) return true;
+    return /^(?:无|暂无|无变动|无新增|无更新|无回收|没有|略|无伏笔|none|n\/a|-|—+)$/i.test(t);
+}
+
 /**
  * Extracts and strips the trailing `<novel_state>...</novel_state>` XML block.
+ * Tolerates markdown code fences, HTML-escaped tags, and truncated unclosed trailing blocks.
  */
 export function extractNovelStateBlock(rawMessageText) {
     const raw = String(rawMessageText ?? '');
     NOVEL_STATE_BLOCK_REGEX.lastIndex = 0;
-    const matches = [...raw.matchAll(NOVEL_STATE_BLOCK_REGEX)];
-    if (matches.length === 0) {
+    ESCAPED_NOVEL_STATE_REGEX.lastIndex = 0;
+
+    let innerBlocks = [];
+    let cleanText = raw;
+
+    const standardMatches = [...raw.matchAll(NOVEL_STATE_BLOCK_REGEX)];
+    if (standardMatches.length > 0) {
+        innerBlocks = standardMatches.map(m => m[1] || '');
+        cleanText = raw.replace(NOVEL_STATE_BLOCK_REGEX, '').trimEnd();
+    } else {
+        const escapedMatches = [...raw.matchAll(ESCAPED_NOVEL_STATE_REGEX)];
+        if (escapedMatches.length > 0) {
+            innerBlocks = escapedMatches.map(m =>
+                String(m[1] || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>'),
+            );
+            cleanText = raw.replace(ESCAPED_NOVEL_STATE_REGEX, '').trimEnd();
+        } else {
+            const unclosedMatch = raw.match(UNCLOSED_NOVEL_STATE_REGEX);
+            if (unclosedMatch && /<(?:summary|worldbook|hooks)\b/i.test(unclosedMatch[1])) {
+                innerBlocks = [unclosedMatch[1]];
+                cleanText = raw.replace(UNCLOSED_NOVEL_STATE_REGEX, '').trimEnd();
+            }
+        }
+    }
+
+    if (innerBlocks.length === 0) {
         return {
             hasState: false,
             cleanText: raw,
@@ -384,39 +417,41 @@ export function extractNovelStateBlock(rawMessageText) {
     const worldUpdates = [];
     const hooks = [];
 
-    for (const match of matches) {
-        const inner = match[1] || '';
-
-        const summaryMatch = inner.match(/<summary>([\s\S]*?)<\/summary>/i);
-        if (summaryMatch && summaryMatch[1].trim()) {
+    for (const inner of innerBlocks) {
+        const summaryMatch = inner.match(/<summary>([\s\S]*?)(?:<\/summary>|$)/i);
+        if (summaryMatch && !isEmptyPlaceholder(summaryMatch[1])) {
             summary = summaryMatch[1].trim();
         }
 
-        const worldMatch = inner.match(/<worldbook>([\s\S]*?)<\/worldbook>/i);
+        const worldMatch = inner.match(/<worldbook>([\s\S]*?)(?:<\/worldbook>|<hooks>|$)/i);
         if (worldMatch && worldMatch[1].trim()) {
             const lines = worldMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
             for (const line of lines) {
+                if (isEmptyPlaceholder(line)) continue;
                 const parsed = parseWorldUpdateLine(line);
-                if (parsed) worldUpdates.push(parsed);
+                if (parsed && !isEmptyPlaceholder(parsed.state)) worldUpdates.push(parsed);
             }
         }
 
-        const hooksMatch = inner.match(/<hooks>([\s\S]*?)<\/hooks>/i);
+        const hooksMatch = inner.match(/<hooks>([\s\S]*?)(?:<\/hooks>|$)/i);
         if (hooksMatch && hooksMatch[1].trim()) {
             const lines = hooksMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
             for (const line of lines) {
-                if (/^\[?(?:已填坑|已回收|完成|resolved)\]?/i.test(line)) {
-                    const content = line.replace(/^\[?(?:已填坑|已回收|完成|resolved)\]?[:：\s]*/i, '').trim();
-                    if (content) hooks.push({ action: 'resolve', content });
+                if (isEmptyPlaceholder(line)) continue;
+                if (/^[\[【]?(?:已填坑|已回收|回收伏笔|回收|完成|解决|resolved)[\]】]?/i.test(line)) {
+                    const content = line
+                        .replace(/^[\[【]?(?:已填坑|已回收|回收伏笔|回收|完成|解决|resolved)[\]】]?[:：\s\-—]*/i, '')
+                        .trim();
+                    if (!isEmptyPlaceholder(content)) hooks.push({ action: 'resolve', content });
                 } else {
-                    const content = line.replace(/^\[?(?:新伏笔|新增伏笔|待填|伏笔|open|add)\]?[:：\s]*/i, '').trim();
-                    if (content) hooks.push({ action: 'add', content });
+                    const content = line
+                        .replace(/^[\[【]?(?:新伏笔|新增伏笔|新增|新线索|埋下|待填|伏笔|open|add)[\]】]?[:：\s\-—]*/i, '')
+                        .trim();
+                    if (!isEmptyPlaceholder(content)) hooks.push({ action: 'add', content });
                 }
             }
         }
     }
-
-    const cleanText = raw.replace(NOVEL_STATE_BLOCK_REGEX, '').trimEnd();
 
     return {
         hasState: true,

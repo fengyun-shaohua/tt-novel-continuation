@@ -4,15 +4,23 @@ import { oai_settings } from '/scripts/openai.js';
 import { getPresetManager } from '/scripts/preset-manager.js';
 import { deleteMessage, resetChatSurfaceView } from '/script.js';
 import { escapeHtml } from '/scripts/utils.js';
-import { buildSingleCallContinuationContext, resolveCurrentTargetChapterIndex } from './context-assembler.js';
-import { extractNovelStateBlock, parseNovelTxt, parseSupplementaryDatabase } from './parser.js';
+import { buildSurgicalDeclichePrompt, scanStoryCliches } from './cliche-guard.js';
+import {
+    buildNovelStateTrailerPrompt,
+    buildSingleCallContinuationContext,
+    isContinuedNovelFloor,
+    resolveCurrentTargetChapterIndex,
+} from './context-assembler.js';
+import { extractNovelStateBlock, parseNovelTxt, parseSupplementaryDatabase, stripNonStoryBlocks } from './parser.js';
 import {
     applyReaderBodyClasses,
     clearReadingProgress,
     mountReaderUi,
+    openWorkbench,
     refreshReaderWidgets,
     scrollToChatFloor,
-    toggleTocDrawer,
+    updateBridgeStatusUi,
+    updateLiveProgress,
 } from './reader-ui.js';
 import { connectRemoteBridge, disconnectRemoteBridge } from './remote-bridge.js';
 import {
@@ -23,16 +31,19 @@ import {
     loadCanonDb,
     loadLedger,
     loadNovelData,
+    mergeArchivedDataIntoLedger,
     pruneLedgerAfterChapter,
     saveCanonDb,
     saveLedger,
     saveNovelData,
     syncWorldUpdatesToTavernLorebook,
 } from './storage.js';
+import { runStoryAndCharacterArchivePipeline } from './story-archiver.js';
 import { buildDistillationPresetMessages, runStyleDistillationPipeline } from './style-distiller.js';
 
 const SETTINGS_KEY = 'novel_continuation';
 const EXTENSION_PROMPT_TAG = 'novel_continuation_golden_context';
+const EXTENSION_PROMPT_TRAILER_TAG = 'novel_continuation_state_trailer';
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
@@ -46,6 +57,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     mountAnchorChapters: 3,
     distillRounds: 2,
     distillPresetName: '__current__',
+    clicheBlacklist: '',
     maxOriginalHits: 3,
     maxCanonHits: 4,
     maxRecentSummaries: 6,
@@ -70,21 +82,22 @@ function saveExtensionSettings() {
 
 /**
  * Global generation interceptor registered in `manifest.json`.
- * Assembles the Pagekin-style Single-Call Golden Context in local memory (<5ms, 0 extra API calls).
+ * Assembles the Single-Call Golden Context (`depth = 1`) and the dedicated `<novel_state>` / `<hooks>`
+ * trailer (`depth = 0`) in local memory (<5ms, 0 extra API calls).
  */
 globalThis.novelContinuation_interceptGeneration = async function (chat, _contextSize, _abort, type) {
     const settings = getSettings();
     const context = getContext();
     if (!settings.enabled || type === 'quiet' || type === 'impersonate') {
         context?.setExtensionPrompt?.(EXTENSION_PROMPT_TAG, '', extension_prompt_types.NONE, 0);
+        context?.setExtensionPrompt?.(EXTENSION_PROMPT_TRAILER_TAG, '', extension_prompt_types.NONE, 0);
         return;
     }
 
     try {
         // Keep the latest `mountAnchorChapters` (default 3, up to 20) original chapters in `coreChat`
-        // AND merge consecutive original chapter floors into ONE continuous assistant message.
-        // Merging prevents RP preset processors (like Meowssiah/SPreset `foreignArchivedBlocks.slice(0, 180)`)
-        // from mistaking multiple consecutive assistant floors for foreign archive turns and truncating the cutoff chapter!
+        // AND merge consecutive original chapter floors into ONE continuous assistant message so
+        // preset processors (e.g. Meowssiah/SPreset) never truncate earlier chapters as foreign archives.
         if (Array.isArray(chat)) {
             const anchorLimit = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 3));
             const origPositions = [];
@@ -110,7 +123,6 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
                         novelMergedChapterCount: keptPositions.length,
                     },
                 };
-                // Replace firstKeptPos with the merged message and remove all other original positions
                 const removeSet = new Set(origPositions.filter(pos => pos !== firstKeptPos));
                 chat[firstKeptPos] = mergedOrigMsg;
                 for (let i = chat.length - 1; i >= 0; i -= 1) {
@@ -122,6 +134,10 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
         }
 
         const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
+        const hasExternalLwbSummary = Boolean(
+            context?.extensionPrompts?.LittleWhiteBox_StorySummary?.value
+            && String(context.extensionPrompts.LittleWhiteBox_StorySummary.value).trim(),
+        );
         const promptBlock = buildSingleCallContinuationContext({
             chat,
             novelData,
@@ -129,15 +145,20 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
             canonDb,
             settings,
             generationType: type || 'normal',
+            hasExternalLwbSummary,
+        });
+        const trailerBlock = buildNovelStateTrailerPrompt({
+            chat,
+            novelData,
+            ledger,
+            settings,
+            generationType: type || 'normal',
         });
 
         if (promptBlock) {
             if (settings.authorMode !== false) {
-                // Suppress Tavern Persona Description injection during novel generation
                 context?.setExtensionPrompt?.('PERSONA_DESCRIPTION', '', extension_prompt_types.NONE, 0);
 
-                // If swiping/regenerating a chapter whose preceding user outline floor was folded,
-                // restore its archived `novelAuthorOutline` into the temporary `coreChat` prompt copy!
                 if (Array.isArray(chat) && (type === 'swipe' || type === 'regenerate')) {
                     const lastInLiveChat = Array.isArray(context?.chat) ? context.chat[context.chat.length - 1] : null;
                     const archivedOutline = String(lastInLiveChat?.extra?.novelAuthorOutline || '').trim();
@@ -152,7 +173,6 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
                     }
                 }
 
-                // Wrap user outline inputs in the temporary `coreChat` copy as Author/Director instructions
                 if (Array.isArray(chat)) {
                     for (const msg of chat) {
                         if (msg?.is_user && typeof msg.mes === 'string' && msg.mes.trim() && !msg.mes.startsWith('【作者/总编')) {
@@ -172,22 +192,27 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
                 false,
                 extension_prompt_roles.SYSTEM,
             );
+            if (trailerBlock) {
+                context?.setExtensionPrompt?.(
+                    EXTENSION_PROMPT_TRAILER_TAG,
+                    trailerBlock,
+                    extension_prompt_types.IN_CHAT,
+                    0,
+                    false,
+                    extension_prompt_roles.SYSTEM,
+                );
+            } else {
+                context?.setExtensionPrompt?.(EXTENSION_PROMPT_TRAILER_TAG, '', extension_prompt_types.NONE, 0);
+            }
         } else {
             context?.setExtensionPrompt?.(EXTENSION_PROMPT_TAG, '', extension_prompt_types.NONE, 0);
+            context?.setExtensionPrompt?.(EXTENSION_PROMPT_TRAILER_TAG, '', extension_prompt_types.NONE, 0);
         }
     } catch (error) {
         console.warn('[小说续写阅读器] 组装单次上下文时出错：', error);
     }
 };
 
-/**
- * After TauriTavern finishes finalizing/saving a newly generated AI chapter floor,
- * archives the immediately preceding user outline message into `msgRef.extra.novelAuthorOutline`
- * and removes that temporary user floor via `deleteMessage()` so Floor `#N` remains strictly
- * 1-to-1 aligned with Chapter `N` even across unlimited AI continuations.
- *
- * @param {any} msgRef
- */
 function scheduleFoldPrecedingUserOutlineFloor(msgRef) {
     setTimeout(async () => {
         const settings = getSettings();
@@ -221,10 +246,6 @@ function scheduleFoldPrecedingUserOutlineFloor(msgRef) {
     }, 260);
 }
 
-/**
- * Strips `<novel_state>...</novel_state>` after a single-call chapter generation completes,
- * keeping the visible novel text pure and updating the local timeline ledger + World Info.
- */
 async function onMessageReceived(messageId, type) {
     const settings = getSettings();
     if (!settings.enabled || type === 'first_message' || type === 'impersonate' || type === 'quiet') return;
@@ -254,49 +275,53 @@ async function onMessageReceived(messageId, type) {
     );
 
     const extracted = extractNovelStateBlock(msg.mes);
-    if (!extracted.hasState) {
-        await context.saveChat?.();
-        await refreshReaderWidgets();
-        if (shouldFoldUserOutline) {
-            scheduleFoldPrecedingUserOutlineFloor(msg);
+    if (extracted.hasState) {
+        msg.mes = extracted.cleanText;
+        const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
+        if (Array.isArray(msg.swipes) && msg.swipes[swipeId] !== undefined) {
+            msg.swipes[swipeId] = extracted.cleanText;
         }
-        return;
+
+        const stateRecord = {
+            chapterIndex,
+            summary: extracted.summary,
+            worldUpdates: extracted.worldUpdates,
+            hooks: extracted.hooks,
+        };
+        msg.extra.novelContinuationState = stateRecord;
+        msg.extra.novelContinuationStateBySwipe = msg.extra.novelContinuationStateBySwipe || {};
+        msg.extra.novelContinuationStateBySwipe[swipeId] = stateRecord;
+
+        context.updateMessageBlock?.(messageId, msg);
+
+        const firstLine = extracted.cleanText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
+        const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
+
+        await applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle, messageId);
+
+        if (settings.syncToWorldInfo && extracted.worldUpdates.length > 0) {
+            try {
+                await syncWorldUpdatesToTavernLorebook(novelData?.title, extracted.worldUpdates, chapterIndex);
+            } catch (err) {
+                console.warn('[小说续写阅读器] 同步至酒馆世界书失败：', err);
+            }
+        }
     }
 
-    msg.mes = extracted.cleanText;
-    const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
-    if (Array.isArray(msg.swipes) && msg.swipes[swipeId] !== undefined) {
-        msg.swipes[swipeId] = extracted.cleanText;
-    }
+    // 0-API local cliché scan right after generation completes
+    const clicheScan = scanStoryCliches(msg.mes, settings.clicheBlacklist);
+    msg.extra.novelClicheHits = clicheScan.totalHits;
 
-    const stateRecord = {
-        chapterIndex,
-        summary: extracted.summary,
-        worldUpdates: extracted.worldUpdates,
-        hooks: extracted.hooks,
-    };
-    msg.extra.novelContinuationState = stateRecord;
-    msg.extra.novelContinuationStateBySwipe = msg.extra.novelContinuationStateBySwipe || {};
-    msg.extra.novelContinuationStateBySwipe[swipeId] = stateRecord;
-
-    context.updateMessageBlock?.(messageId, msg);
     await context.saveChat?.();
-
-    const firstLine = extracted.cleanText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
-    const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
-
-    await applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle, messageId);
-
-    if (settings.syncToWorldInfo && extracted.worldUpdates.length > 0) {
-        try {
-            await syncWorldUpdatesToTavernLorebook(novelData?.title, extracted.worldUpdates, chapterIndex);
-        } catch (err) {
-            console.warn('[小说续写阅读器] 同步至酒馆世界书失败：', err);
-        }
-    }
-
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
+
+    if (clicheScan.totalHits > 0) {
+        globalThis.toastr?.info?.(
+            `第 ${chapterIndex} 章检测到 ${clicheScan.totalHits} 处八股词（${clicheScan.uniqueTerms.slice(0, 3).join('、')}），可在「工作台 → 反八股」一键精修`,
+            '小说续写阅读器',
+        );
+    }
 
     if (shouldFoldUserOutline) {
         scheduleFoldPrecedingUserOutlineFloor(msg);
@@ -322,9 +347,9 @@ async function onMessageSwiped(messageId) {
             const novelData = await loadNovelData();
             await syncWorldUpdatesToTavernLorebook(novelData?.title, swipeState.worldUpdates, chapterIndex);
         }
-        await refreshReaderWidgets();
-        await refreshSettingsStatusCard();
     }
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
 }
 
 function createOriginalChapterFloor(ch, charName) {
@@ -364,11 +389,6 @@ function createBookCoverFloor(novelData, maxChapter, charName) {
     };
 }
 
-/**
- * Mounts `#0` book cover (`is_system: true`, 0 LLM tokens) + all original chapters `1 .. upToChapterIndex`
- * into `context.chat[1 .. upToChapterIndex]` so Floor `#N` strictly equals Chapter `N`,
- * relying on TauriTavern's native `BoundedChatSurface` virtualization to manage high floor counts.
- */
 async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { focusChapterIndex = null } = {}) {
     const context = getContext();
     if (!context || !Array.isArray(context.chat) || !novelData?.chapters?.length) return;
@@ -400,14 +420,12 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
         await context.saveMetadata?.();
         await context.saveChat?.();
     } catch {
-        // Ignore save errors on temporary welcome screen
+        // Ignore save errors on welcome screen
     }
-    // Reset TauriTavern's mounted floor ID cache before printMessages() so newly added chapters
-    // beyond the previous chat's floor count (e.g. floors #9..#17 after an 8-floor chat) are all rendered!
     try {
         resetChatSurfaceView?.({ includeAuxiliary: true });
     } catch {
-        // Ignore if surface is not yet initialized
+        // Ignore if surface not initialized
     }
     await context.printMessages?.();
     applyReaderBodyClasses(settings);
@@ -422,9 +440,6 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
     }
 }
 
-/**
- * Jumps directly to any user-selected chapter `targetChapterIndex` in the main `#chat` reader.
- */
 async function handleViewOriginalChapter(targetChapterIndex) {
     const novelData = await loadNovelData();
     if (!novelData) return;
@@ -451,10 +466,6 @@ async function handleViewOriginalChapter(targetChapterIndex) {
     await refreshSettingsStatusCard();
 }
 
-/**
- * Automatically restores the imported novel chapters into `#chat` when re-entering a blank character card
- * or reopening the app if `#chat` was reset to empty/greeting-only.
- */
 async function restoreNovelFloorsIfNeeded() {
     const settings = getSettings();
     if (!settings.enabled) return;
@@ -464,7 +475,6 @@ async function restoreNovelFloorsIfNeeded() {
     const hasOriginalFloors = context.chat.some(m => m?.extra?.novelContinuationOrigin === 'original');
     if (hasOriginalFloors) return;
 
-    // Only auto-mount into blank or greeting-only chats (<= 1 message and no user messages yet)
     const hasUserMessages = context.chat.some(m => m?.is_user);
     if (context.chat.length > 1 || hasUserMessages) return;
 
@@ -505,79 +515,14 @@ async function handleCutoffFromChapter(targetChapterIndex) {
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
     globalThis.toastr?.success?.(
-        `已截断至第 ${targetChapterIndex} 章（第 1~${targetChapterIndex} 章已全部导入聊天，由酒馆自动管理高楼层），现在可直接往下续写！`,
+        `已截断至第 ${targetChapterIndex} 章，现在可直接往下续写！`,
         '小说续写阅读器',
     );
 }
 
-async function extractCutoffSnapshotSingleCall(btnEl) {
-    const novelData = await loadNovelData();
-    if (!novelData?.chapters?.length) {
-        globalThis.toastr?.warning?.('请先导入小说 TXT/MD 文件', '小说续写阅读器');
-        return;
-    }
-
-    const context = getContext();
-    if (typeof context?.generateRaw !== 'function') {
-        globalThis.toastr?.error?.('当前环境不支持 generateRaw 单次调用', '小说续写阅读器');
-        return;
-    }
-
-    const cutoff = novelData.cutoffChapterIndex || novelData.totalChapters;
-    const sampleChapters = novelData.chapters
-        .filter(c => c.index >= Math.max(1, cutoff - 1) && c.index <= cutoff)
-        .map(c => `【${c.title}】\n${c.content.slice(-3500)}`)
-        .join('\n\n');
-
-    const prompt = [
-        `你是一位严谨的长篇小说总编。以下是《${novelData.title}》截止到第 ${cutoff} 章（断更处）的末尾原文。`,
-        '请只用这一次回复，盘点断更现场的状态，严格只输出一个 `<novel_state>` XML 块：',
-        '<novel_state>',
-        `<summary>截止第${cutoff}章的当前所处场景、冲突焦点与前情核心梗概（150字内）</summary>`,
-        '<worldbook>',
-        '- 人物|主角及当前登场核心角色：身份、当前境界/能力、持有关键物品、人际关系与位置',
-        '- 设定|当前地图或势力：当前剧情所处势力或危机局势',
-        '</worldbook>',
-        '<hooks>',
-        '- [新伏笔] 当前尚未解决的悬念或即将爆发的冲突1',
-        '- [新伏笔] 当前尚未解决的悬念或暗线2',
-        '</hooks>',
-        '</novel_state>',
-        '',
-        '【断更处原文】：',
-        sampleChapters,
-    ].join('\n');
-
-    const origText = btnEl ? btnEl.textContent : '';
-    if (btnEl) {
-        btnEl.disabled = true;
-        btnEl.textContent = '⏳ 正在单次提炼断更现场...';
-    }
-
-    try {
-        const response = await context.generateRaw({
-            prompt,
-            systemPrompt: '请严格输出 <novel_state>...</novel_state> 标签块。',
-        });
-        const extracted = extractNovelStateBlock(String(response || ''));
-        if (!extracted.hasState) throw new Error('模型未按 <novel_state> 格式返回，请重试');
-        await applyExtractedStateToLedger(extracted, cutoff, `第 ${cutoff} 章断更现场`);
-        if (getSettings().syncToWorldInfo && extracted.worldUpdates.length > 0) {
-            await syncWorldUpdatesToTavernLorebook(novelData.title, extracted.worldUpdates, cutoff);
-        }
-        await refreshReaderWidgets();
-        await refreshSettingsStatusCard();
-        globalThis.toastr?.success?.('断更现场的人物状态、总结与待填伏笔已提取完毕！', '小说续写阅读器');
-    } catch (error) {
-        globalThis.toastr?.error?.(`提炼失败：${error?.message || error}`, '小说续写阅读器');
-    } finally {
-        if (btnEl) {
-            btnEl.disabled = false;
-            btnEl.textContent = origText;
-        }
-    }
-}
-
+/* ==========================================================================
+   Shared Model, Preset Resolution & Background LLM Caller (Single Path!)
+   ========================================================================== */
 function getActiveApiModelLabel() {
     try {
         const src = String(oai_settings?.chat_completion_source || '').trim();
@@ -613,12 +558,6 @@ function getAvailableOpenAiPresetNames() {
     }
 }
 
-/**
- * Resolves the user-chosen Chat Completion preset for style distillation.
- * - `''`: pure direct `generateRaw` without preset wrapping
- * - `'__current__'`: live `oai_settings` (active Tavern preset including live toggles)
- * - `<presetName>`: named saved preset from `getPresetManager('openai')` (fails fast if missing)
- */
 function resolveSelectedDistillationPreset(presetSelection) {
     const selected = String(presetSelection ?? '').trim();
     if (!selected) {
@@ -646,89 +585,206 @@ function resolveSelectedDistillationPreset(presetSelection) {
         }
     }
     if (!rawPreset || !Array.isArray(rawPreset.prompts)) {
-        throw new Error(`未找到所选蒸馏预设「${selected}」，请重新选择一个已保存的酒馆对话补全预设`);
+        throw new Error(`未找到所选预设「${selected}」，请在「工作台 → 设置」中重新选择`);
     }
     return { presetObj: rawPreset, label: selected };
 }
 
-function populateDistillPresetSelect(selectEl, selectedValue) {
-    if (!selectEl) return;
-    const saved = String(selectedValue ?? '__current__');
-    const names = getAvailableOpenAiPresetNames();
-    const activeName = String(getPresetManager('openai')?.getSelectedPresetName?.() || oai_settings?.preset_settings_openai || '').trim();
-
-    selectEl.innerHTML = '';
-    const optCurrent = document.createElement('option');
-    optCurrent.value = '__current__';
-    optCurrent.textContent = activeName
-        ? `使用当前酒馆预设（${activeName}）`
-        : '使用当前酒馆预设（自动跟随顶部预设）';
-    selectEl.appendChild(optCurrent);
-
-    const optNone = document.createElement('option');
-    optNone.value = '';
-    optNone.textContent = '不使用预设（纯净直连）';
-    selectEl.appendChild(optNone);
-
-    for (const name of names) {
-        const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
-        selectEl.appendChild(opt);
+/**
+ * Unified preset-wrapped LLM caller shared by:
+ * 1) Story & Character Archiver (`story-archiver.js`)
+ * 2) Multi-round Style Distiller (`style-distiller.js`)
+ * 3) Surgical De-Cliché Refiner (`cliche-guard.js`)
+ */
+function createPresetModelCaller() {
+    const context = getContext();
+    if (typeof context?.generateRaw !== 'function') {
+        throw new Error('当前环境不支持 generateRaw 模型调用');
     }
+    const settings = getSettings();
+    const resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
+    const modelLabel = getActiveApiModelLabel();
 
-    if (saved && saved !== '__current__' && !names.includes(saved)) {
-        const optMissing = document.createElement('option');
-        optMissing.value = saved;
-        optMissing.textContent = `${saved}（未找到）`;
-        selectEl.appendChild(optMissing);
-    }
-    selectEl.value = saved;
+    const callModel = async ({ prompt, systemPrompt }) => {
+        if (resolvedPreset.presetObj) {
+            const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
+                systemPrompt,
+                userPrompt: prompt,
+            });
+            const reply = await context.generateRaw({ prompt: messages });
+            return String(reply || '');
+        }
+        const reply = await context.generateRaw({ prompt, systemPrompt });
+        return String(reply || '');
+    };
+
+    return {
+        callModel,
+        modelLabel,
+        presetLabel: resolvedPreset.label,
+    };
 }
 
-async function distillNovelStyleAdversarial(btnEl, { incremental = false } = {}) {
+function getRuntimeMeta() {
+    const settings = getSettings();
+    let presetLabel = '不使用预设（纯净直连）';
+    try {
+        presetLabel = resolveSelectedDistillationPreset(settings.distillPresetName).label;
+    } catch {
+        presetLabel = `${settings.distillPresetName}（未找到）`;
+    }
+    const activePresetName = String(
+        getPresetManager('openai')?.getSelectedPresetName?.() || oai_settings?.preset_settings_openai || '',
+    ).trim();
+    return {
+        activeModel: getActiveApiModelLabel(),
+        presetLabel,
+        activePresetName,
+        presetNames: getAvailableOpenAiPresetNames(),
+    };
+}
+
+function collectContinuedChaptersFromChat(novelData) {
+    const chat = getContext()?.chat || [];
+    let lastOrigIdx = -1;
+    chat.forEach((m, idx) => {
+        if (m?.extra?.novelContinuationOrigin === 'original') lastOrigIdx = idx;
+    });
+    const cutoff = Number(novelData?.cutoffChapterIndex || 0);
+    const list = [];
+    let seq = 0;
+    chat.forEach((m, idx) => {
+        if (!isContinuedNovelFloor(m, idx, lastOrigIdx)) return;
+        seq += 1;
+        const chIdx = Number(m.extra?.novelChapterIndex) || (cutoff + seq);
+        const cleanBody = stripNonStoryBlocks(m.mes || '').replace(/<\/?game>/gi, '').trim();
+        if (!cleanBody) return;
+        const firstLine = cleanBody.split('\n').map(l => l.trim()).find(Boolean) || `续写第 ${chIdx} 章`;
+        list.push({
+            index: chIdx,
+            title: firstLine.replace(/^#+\s*/, '').slice(0, 40),
+            content: cleanBody,
+        });
+    });
+    return list;
+}
+
+function getLatestClicheStatus() {
+    const chat = getContext()?.chat || [];
+    let lastOrigIdx = -1;
+    chat.forEach((m, idx) => {
+        if (m?.extra?.novelContinuationOrigin === 'original') lastOrigIdx = idx;
+    });
+    for (let i = chat.length - 1; i >= 0; i -= 1) {
+        if (isContinuedNovelFloor(chat[i], i, lastOrigIdx)) {
+            const msg = chat[i];
+            const report = scanStoryCliches(msg.mes || '', getSettings().clicheBlacklist);
+            return {
+                hasContinuedFloor: true,
+                floorIndex: i,
+                chapterIndex: Number(msg.extra?.novelChapterIndex) || i,
+                report,
+            };
+        }
+    }
+    return { hasContinuedFloor: false, floorIndex: -1, chapterIndex: 0, report: null };
+}
+
+/* ==========================================================================
+   Background Tasks: Archive / Style Distillation / Surgical De-Cliché
+   ========================================================================== */
+async function runStoryArchiveTask(mode = 'full') {
+    const novelData = await loadNovelData();
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    if (!novelData?.chapters?.length && continuedChapters.length === 0) {
+        globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件', '小说续写阅读器');
+        return;
+    }
+
+    let caller;
+    try {
+        caller = createPresetModelCaller();
+    } catch (err) {
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const existingLedger = await loadLedger();
+    updateLiveProgress('memory', {
+        isRunning: true,
+        isError: false,
+        resetLogs: true,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动${mode === 'incremental' ? '增量' : '全本'}剧情与 4 维人物归档（并发上限 ≤ 2）...`,
+    });
+
+    try {
+        const result = await runStoryAndCharacterArchivePipeline({
+            novelData: novelData || { title: '当前小说', cutoffChapterIndex: 0, totalChapters: 0, chapters: [] },
+            continuedChapters,
+            existingLedger,
+            mode,
+            maxConcurrency: 2,
+            callModel: caller.callModel,
+            onProgress: ({ step, totalSteps, label, logEntry }) => {
+                updateLiveProgress('memory', {
+                    isRunning: true,
+                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    logEntry,
+                });
+            },
+        });
+
+        await mergeArchivedDataIntoLedger(result, { mode });
+        updateLiveProgress('memory', {
+            isRunning: false,
+            text: `✅ 归档完成（至第 ${result.lastArchivedChapter} 章 · ${result.chronicle.length} 条编年史 · ${result.characters.length} 位人物灵魂卡 · ${result.hooks.length} 条伏笔），续写自动生效！`,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(
+            `已提炼 ${result.chronicle.length} 条剧情编年史、${result.characters.length} 位核心人物防 OOC 档案与 ${result.hooks.length} 条伏笔！`,
+            '小说续写阅读器',
+        );
+    } catch (error) {
+        updateLiveProgress('memory', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 归档失败：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`归档失败：${error?.message || error}`, '小说续写阅读器');
+    }
+}
+
+async function runStyleDistillTask({ incremental = false } = {}) {
     const novelData = await loadNovelData();
     if (!novelData?.chapters?.length) {
         globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件', '小说续写阅读器');
         return;
     }
 
-    const context = getContext();
-    if (typeof context?.generateRaw !== 'function') {
-        globalThis.toastr?.error?.('当前环境不支持 generateRaw 模型调用', '小说续写阅读器');
-        return;
-    }
-
-    const settings = getSettings();
     const ledger = await loadLedger();
     if (incremental && !ledger?.styleProfile?.styleCard) {
-        globalThis.toastr?.warning?.('请先执行一次完整文风蒸馏，再追加精炼轮次', '小说续写阅读器');
+        globalThis.toastr?.warning?.('请先执行一次完整文风蒸馏，再追加盲测精炼', '小说续写阅读器');
         return;
     }
 
-    let resolvedPreset;
+    let caller;
     try {
-        resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
+        caller = createPresetModelCaller();
     } catch (err) {
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
 
-    const rounds = Math.max(1, Math.min(3, Number(settings.distillRounds) || 2));
-    const modelLabel = getActiveApiModelLabel();
-    const presetLabel = resolvedPreset.label;
-    const origText = btnEl ? btnEl.textContent : '';
-    const progressEl = document.getElementById('tt-novel-style-progress');
-    if (btnEl) {
-        btnEl.disabled = true;
-        btnEl.textContent = incremental ? '🔄 正在追加盲测精炼...' : '🎨 正在多轮对抗蒸馏...';
-    }
-    if (progressEl) {
-        progressEl.classList.remove('displayNone');
-        progressEl.textContent = incremental
-            ? `⏳ 使用 [${modelLabel}] · 预设 [${presetLabel}] 追加 1 轮全新真迹盲测与对比评分...`
-            : `⏳ 使用 [${modelLabel}] · 预设 [${presetLabel}] 启动 ${rounds} 轮对抗盲测蒸馏（并发上限 ≤ 2）...`;
-    }
+    const rounds = Math.max(1, Math.min(3, Number(getSettings().distillRounds) || 2));
+    updateLiveProgress('style', {
+        isRunning: true,
+        isError: false,
+        resetLogs: !incremental,
+        text: incremental
+            ? `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 追加 1 轮全新真迹盲测与评分...`
+            : `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动 ${rounds} 轮骨相对抗蒸馏（并发上限 ≤ 2）...`,
+    });
 
     try {
         const styleProfile = await runStyleDistillationPipeline({
@@ -736,53 +792,187 @@ async function distillNovelStyleAdversarial(btnEl, { incremental = false } = {})
             maxConcurrency: 2,
             rounds,
             existingProfile: incremental ? ledger.styleProfile : null,
-            callModel: async ({ prompt, systemPrompt }) => {
-                if (resolvedPreset.presetObj) {
-                    const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
-                        systemPrompt,
-                        userPrompt: prompt,
-                    });
-                    const reply = await context.generateRaw({ prompt: messages });
-                    return String(reply || '');
-                }
-                const reply = await context.generateRaw({ prompt, systemPrompt });
-                return String(reply || '');
-            },
-            onProgress: ({ step, totalSteps, label }) => {
-                if (progressEl) {
-                    progressEl.textContent = `⏳ [${modelLabel}] [${step}/${totalSteps}] ${label}`;
-                }
+            callModel: caller.callModel,
+            onProgress: ({ step, totalSteps, label, logEntry }) => {
+                updateLiveProgress('style', {
+                    isRunning: true,
+                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    logEntry,
+                });
             },
         });
 
         ledger.styleProfile = styleProfile;
         await saveLedger(ledger);
-        await refreshSettingsStatusCard();
-        await refreshReaderWidgets();
-
         const scoreChain = (styleProfile.roundHistory || [])
-            .map(r => `第${r.round}轮 ${r.score !== null ? `${r.score}分` : '?'}`)
+            .map(r => `R${r.round} ${r.score !== null ? `${r.score}分` : '?'}`)
             .join(' → ');
-        if (progressEl) {
-            progressEl.textContent = `✅ 蒸馏完成（${String(styleProfile.styleCard).length} 字 · ${scoreChain || '已定稿'}）！后续每章续写自动生效。`;
-        }
-        globalThis.toastr?.success?.(
-            `原著文风蒸馏完成（${scoreChain || '已定稿'}），已永久绑定到当前对话！`,
-            '小说续写阅读器',
-        );
+        updateLiveProgress('style', {
+            isRunning: false,
+            text: `✅ 蒸馏完成（${String(styleProfile.styleCard).length} 字 · ${scoreChain || '已定稿'}），全过程已保存，后续每章自动生效！`,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(`原著文风骨相蒸馏完成（${scoreChain || '已定稿'}）！`, '小说续写阅读器');
     } catch (error) {
-        if (progressEl) {
-            progressEl.textContent = `❌ 蒸馏失败：${error?.message || error}`;
-        }
+        updateLiveProgress('style', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 蒸馏失败：${error?.message || error}`,
+        });
         globalThis.toastr?.error?.(`文风蒸馏失败：${error?.message || error}`, '小说续写阅读器');
-    } finally {
-        if (btnEl) {
-            btnEl.disabled = false;
-            btnEl.textContent = origText;
-        }
     }
 }
 
+async function runSurgicalDeclicheLatestTask() {
+    const status = getLatestClicheStatus();
+    if (!status.hasContinuedFloor) {
+        globalThis.toastr?.warning?.('当前还没有 AI 续写章节可供精修', '小说续写阅读器');
+        return;
+    }
+
+    let caller;
+    try {
+        caller = createPresetModelCaller();
+    } catch (err) {
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const context = getContext();
+    const msg = context?.chat?.[status.floorIndex];
+    if (!msg) return;
+
+    const ledger = await loadLedger();
+    const rawOriginal = String(msg.mes || '');
+    const hadGameWrapper = /<game>[\s\S]*<\/game>/i.test(rawOriginal);
+    const storyOnly = stripNonStoryBlocks(rawOriginal).replace(/<\/?game>/gi, '').trim();
+
+    updateLiveProgress('cliche', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 对第 ${status.chapterIndex} 章执行局部去八股精修（原稿将自动保留为上一个分支）...`,
+    });
+
+    try {
+        const { systemPrompt, prompt } = buildSurgicalDeclichePrompt({
+            storyText: storyOnly,
+            scanReport: status.report,
+            styleProfile: ledger.styleProfile,
+            customBlacklistText: getSettings().clicheBlacklist,
+        });
+        const refinedRaw = await caller.callModel({ systemPrompt, prompt });
+        const refinedClean = stripNonStoryBlocks(refinedRaw).replace(/<\/?game>/gi, '').trim();
+        if (!refinedClean || refinedClean.length < Math.min(120, Math.floor(storyOnly.length * 0.3))) {
+            throw new Error('精修返回正文异常过短，已保留原稿未覆盖');
+        }
+
+        const finalMes = hadGameWrapper ? `<game>\n${refinedClean}\n</game>` : refinedClean;
+        if (!Array.isArray(msg.swipes) || msg.swipes.length === 0) {
+            msg.swipes = [rawOriginal];
+        }
+        msg.swipes.push(finalMes);
+        msg.swipe_id = msg.swipes.length - 1;
+        msg.mes = finalMes;
+
+        const afterScan = scanStoryCliches(finalMes, getSettings().clicheBlacklist);
+        msg.extra = msg.extra || {};
+        msg.extra.novelClicheHits = afterScan.totalHits;
+
+        context.updateMessageBlock?.(status.floorIndex, msg);
+        await context.saveChat?.();
+        updateLiveProgress('cliche', {
+            isRunning: false,
+            text: `✅ 精修完成！八股命中数由 ${status.report?.totalHits ?? 0} 处降至 ${afterScan.totalHits} 处（原稿已自动保留在上一条 Swipe 分支，可随时左右切换）。`,
+        });
+        await refreshReaderWidgets();
+        globalThis.toastr?.success?.(
+            `局部去八股完成：${status.report?.totalHits ?? 0} → ${afterScan.totalHits} 处！`,
+            '小说续写阅读器',
+        );
+    } catch (error) {
+        updateLiveProgress('cliche', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 精修失败：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`局部去八股精修失败：${error?.message || error}`, '小说续写阅读器');
+    }
+}
+
+/* ==========================================================================
+   Import & Settings Handlers
+   ========================================================================== */
+async function handleImportNovelFile(file) {
+    try {
+        const context = getContext();
+        const hasActiveConversation = Boolean(
+            context?.chatId
+            || context?.getCurrentChatId?.()
+            || context?.groupId
+            || (context?.characterId !== undefined && context?.characterId !== null),
+        );
+        if (!hasActiveConversation) {
+            globalThis.toastr?.warning?.('请先打开一个角色卡并进入具体对话后再导入小说（小说数据按对话独立绑定）', '小说续写阅读器');
+            return;
+        }
+        const novelData = parseNovelTxt(await file.text(), file.name);
+        if (novelData.totalChapters === 0) {
+            globalThis.toastr?.warning?.('未能在文件中解析出有效文本内容', '小说续写阅读器');
+            return;
+        }
+        await saveNovelData(novelData);
+        await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex);
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(
+            `已绑定当前对话并导入《${novelData.title}》（共 ${novelData.totalChapters} 章，#1~#${novelData.totalChapters} 一一对应）！`,
+            '小说续写阅读器',
+        );
+    } catch (err) {
+        globalThis.toastr?.error?.(`导入失败：${err?.message || err}`, '小说续写阅读器');
+    }
+}
+
+async function handleImportCanonFiles(files) {
+    const canonDb = await loadCanonDb();
+    let addedCount = 0;
+    for (const file of files) {
+        const parsedItems = parseSupplementaryDatabase(await file.text(), file.name);
+        if (parsedItems.length > 0) {
+            canonDb.sources = [...new Set([...(canonDb.sources || []), file.name])];
+            canonDb.items.push(...parsedItems);
+            addedCount += parsedItems.length;
+        }
+    }
+    await saveCanonDb(canonDb);
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    globalThis.toastr?.success?.(`已挂载 ${addedCount} 条同人补充原作设定词条！`, '小说续写阅读器');
+}
+
+function handleUpdateSetting(key, value) {
+    const settings = getSettings();
+    settings[key] = value;
+    saveExtensionSettings();
+    if (key === 'enabled' && !settings.enabled) {
+        getContext()?.setExtensionPrompt?.(EXTENSION_PROMPT_TAG, '', extension_prompt_types.NONE, 0);
+        getContext()?.setExtensionPrompt?.(EXTENSION_PROMPT_TRAILER_TAG, '', extension_prompt_types.NONE, 0);
+    }
+    applyReaderBodyClasses(settings);
+    const masterChk = document.getElementById('tt-novel-chk-enabled-entry');
+    if (masterChk && key === 'enabled') masterChk.checked = Boolean(value);
+    void refreshSettingsStatusCard();
+}
+
+function handleToggleSetting(key) {
+    const settings = getSettings();
+    handleUpdateSetting(key, !settings[key]);
+}
+
+/* ==========================================================================
+   Ultra-Compact Tavern Extension Settings Drawer Entry Card
+   ========================================================================== */
 function mountSettingsPanel() {
     const container = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
     if (!container || document.getElementById('tt_novel_continuation_panel')) return;
@@ -793,271 +983,42 @@ function mountSettingsPanel() {
     wrapper.className = 'inline-drawer';
     wrapper.innerHTML = `
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>📖 小说续写阅读器 (太监/同人单次续写)</b>
+            <b>📖 小说续写阅读器 (v1.3 工作台)</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content tt-novel-settings-body">
-            <div id="tt-novel-status-card" class="tt-novel-status-card">正在读取当前聊天书籍状态...</div>
-            <div class="tt-novel-btn-group">
+            <div id="tt-novel-status-card" class="tt-novel-status-card">正在读取当前对话状态...</div>
+            <div class="tt-novel-action-bar">
+                <button type="button" id="tt-novel-open-workbench" class="menu_button tt-novel-btn-primary">
+                    ✨ 打开小说续写工作台（剧情/人物/文风/八股/设置）
+                </button>
                 <label class="menu_button tt-novel-file-label">
-                    <i class="fa-solid fa-file-import"></i> 导入太监/同人小说 (.txt/.md)
-                    <input type="file" id="tt-novel-import-txt" accept=".txt,.md,text/plain,text/markdown,*/*" hidden />
-                </label>
-                <label class="menu_button tt-novel-file-label">
-                    <i class="fa-solid fa-database"></i> 挂载同人补充设定库 (.json/.md/.txt)
-                    <input type="file" id="tt-novel-import-canon" accept=".json,.jsonl,.md,.txt,application/json,text/plain,*/*" multiple hidden />
+                    <i class="fa-solid fa-file-import"></i> 快速导入原著
+                    <input type="file" id="tt-novel-quick-import" accept=".txt,.md,text/plain,text/markdown,*/*" hidden />
                 </label>
             </div>
-            <div class="tt-novel-btn-group">
-                <button type="button" id="tt-novel-distill-style" class="menu_button">🎨 深度蒸馏原著文风 (多轮对抗 · 并发≤2)</button>
-                <button type="button" id="tt-novel-extract-cutoff" class="menu_button">⚡ 提炼断更现场状态 (仅调 1 次 API)</button>
-                <button type="button" id="tt-novel-open-toc" class="menu_button">📑 打开章节目录与截断跳转</button>
-            </div>
-            <div class="tt-novel-inline-field">
-                <span>文风对抗盲测迭代轮数（&lt;85分自动同题重考，≥92分提前达标）：</span>
-                <select id="tt-novel-distill-rounds" class="text_pole" style="width: 88px;">
-                    <option value="1" ${Number(settings.distillRounds) === 1 ? 'selected' : ''}>1 轮</option>
-                    <option value="2" ${Number(settings.distillRounds || 2) === 2 ? 'selected' : ''}>2 轮 (推荐)</option>
-                    <option value="3" ${Number(settings.distillRounds) === 3 ? 'selected' : ''}>3 轮 (深度)</option>
-                </select>
-            </div>
-            <div class="tt-novel-inline-field">
-                <span>🎛️ 蒸馏所用酒馆预设（自动剥离角色卡/聊天记录与脚本标记）：</span>
-                <select id="tt-novel-distill-preset" class="text_pole" style="max-width: 240px;"></select>
-            </div>
-            <div id="tt-novel-style-progress" class="tt-novel-style-progress displayNone"></div>
-            <details id="tt-novel-style-drawer" class="tt-novel-style-drawer">
-                <summary>🧬 查看 / 手动微调《原著文风 DNA 圣经》与多轮盲测评分报告</summary>
-                <div class="tt-novel-style-drawer-body">
-                    <div id="tt-novel-style-diff" class="tt-novel-style-diff">尚未执行文风蒸馏。蒸馏默认直接调用你当前酒馆顶部 API 连接面板里选中的模型。</div>
-                    <textarea id="tt-novel-style-editor" class="text_pole tt-novel-style-editor" rows="9" placeholder="蒸馏生成的《原著文风 DNA 圣经》（约 1800~2800 字）会显示在这里，你也可以手动微调任意一条规则后保存..."></textarea>
-                    <div class="tt-novel-btn-group">
-                        <button type="button" id="tt-novel-refine-style" class="menu_button">🔄 再追加 1 轮盲测精炼</button>
-                        <button type="button" id="tt-novel-save-style" class="menu_button">💾 保存文风修改</button>
-                        <button type="button" id="tt-novel-clear-style" class="menu_button">🗑️ 清空文风卡</button>
-                    </div>
-                </div>
-            </details>
-            <hr />
             <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-enabled" ${settings.enabled ? 'checked' : ''} />
-                <span>启用小说续写插件（关闭时彻底还原普通酒馆聊天与排版）</span>
+                <input type="checkbox" id="tt-novel-chk-enabled-entry" ${settings.enabled ? 'checked' : ''} />
+                <span>启用小说续写插件（关闭时彻底还原普通酒馆聊天）</span>
             </label>
-            <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-immersive" ${settings.immersiveMode ? 'checked' : ''} />
-                <span>开启「沉浸小说阅读模式」（隐藏头像、名字与气泡框，连续书页排版）</span>
-            </label>
-            <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-hide-user" ${settings.hideUserFloors ? 'checked' : ''} />
-                <span>自动隐藏所有「用户指令楼层」（让原著与续写章节无缝相连）</span>
-            </label>
-            <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-hide-cot" ${settings.hideReasoning !== false ? 'checked' : ''} />
-                <span>自动隐藏「AI 思维链与思考批注框」（隐藏思考批注及预设折叠思维链）</span>
-            </label>
-            <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-author-mode" ${settings.authorMode !== false ? 'checked' : ''} />
-                <span>开启「✍️ 作者境界」（屏蔽酒馆玩家 {{user}} 人设与 RP 规则，将输入自动转为导演大纲）</span>
-            </label>
-            <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-fold-user" ${settings.foldUserOutlineFloors !== false ? 'checked' : ''} />
-                <span>续写完成后自动折叠「用户大纲楼层」（大纲归档进该章元数据，让楼层号与章节号永远 1:1 严格对应）</span>
-            </label>
-            <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-autostate" ${settings.enableAutoStateBlock ? 'checked' : ''} />
-                <span>单次生成末尾顺带产出总结、人物状态与伏笔更新（0 额外 API 调用）</span>
-            </label>
-            <label class="checkbox_label">
-                <input type="checkbox" id="tt-novel-chk-sync-wi" ${settings.syncToWorldInfo ? 'checked' : ''} />
-                <span>自动将提取的人物/势力状态同步写入酒馆原生世界书 (World Info)</span>
-            </label>
-            <div class="tt-novel-inline-field">
-                <span>续写时直接发给 AI 的末尾原著章数：</span>
-                <input type="number" id="tt-novel-anchor-count" class="text_pole" min="1" max="20" value="${settings.mountAnchorChapters}" />
-            </div>
-            <div class="tt-novel-btn-group">
-                <button type="button" id="tt-novel-clear-canon" class="menu_button">清空补充设定库</button>
-                <button type="button" id="tt-novel-clear-all" class="menu_button">重置当前聊天小说数据</button>
-            </div>
-            <hr />
-            <div class="tt-novel-bridge-box">
-                <div><b>🔌 外部 Agent 远程介入桥 (WebSocket / MCP)</b></div>
-                <div class="tt-novel-bridge-row">
-                    <input type="text" id="tt-novel-bridge-url" class="text_pole" placeholder="ws://电脑局域网IP:17890/ws" value="${escapeHtml(settings.remoteBridgeUrl || '')}" />
-                    <button type="button" id="tt-novel-bridge-connect" class="menu_button">🔗 连接</button>
-                    <button type="button" id="tt-novel-bridge-disconnect" class="menu_button">⏹ 断开</button>
-                </div>
-                <small id="tt-novel-bridge-status" class="tt-novel-bridge-status">⚪ 未连接外部 Agent</small>
-            </div>
         </div>
     `;
 
     container.appendChild(wrapper);
-    bindSettingsEvents(wrapper);
-    refreshSettingsStatusCard();
-}
 
-function bindSettingsEvents(wrapper) {
-    const settings = getSettings();
-
-    wrapper.querySelector('#tt-novel-import-txt')?.addEventListener('change', async (e) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
-        try {
-            const context = getContext();
-            const hasActiveConversation = Boolean(
-                context?.chatId
-                || context?.getCurrentChatId?.()
-                || context?.groupId
-                || (context?.characterId !== undefined && context?.characterId !== null),
-            );
-            if (!hasActiveConversation) {
-                globalThis.toastr?.warning?.('请先打开一个角色卡并进入具体对话后再导入小说（小说数据按对话独立绑定）', '小说续写阅读器');
-                return;
-            }
-            const novelData = parseNovelTxt(await file.text(), file.name);
-            if (novelData.totalChapters === 0) {
-                globalThis.toastr?.warning?.('未能在文件中解析出有效文本内容', '小说续写阅读器');
-                return;
-            }
-            await saveNovelData(novelData);
-            await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex);
-            await refreshReaderWidgets();
-            await refreshSettingsStatusCard();
-            globalThis.toastr?.success?.(
-                `已绑定当前对话并导入《${novelData.title}》（共 ${novelData.totalChapters} 章，#1~#${novelData.totalChapters} 一一对应）！`,
-                '小说续写阅读器',
-            );
-        } catch (err) {
-            globalThis.toastr?.error?.(`导入失败：${err?.message || err}`, '小说续写阅读器');
-        } finally {
-            e.target.value = '';
-        }
+    wrapper.querySelector('#tt-novel-open-workbench')?.addEventListener('click', () => {
+        void openWorkbench('memory');
     });
-
-    wrapper.querySelector('#tt-novel-import-canon')?.addEventListener('change', async (e) => {
-        const files = [...(e.target.files || [])];
-        if (files.length === 0) return;
-        const canonDb = await loadCanonDb();
-        let addedCount = 0;
-        for (const file of files) {
-            const parsedItems = parseSupplementaryDatabase(await file.text(), file.name);
-            if (parsedItems.length > 0) {
-                canonDb.sources = [...new Set([...(canonDb.sources || []), file.name])];
-                canonDb.items.push(...parsedItems);
-                addedCount += parsedItems.length;
-            }
-        }
-        await saveCanonDb(canonDb);
-        await refreshSettingsStatusCard();
-        globalThis.toastr?.success?.(`已挂载 ${addedCount} 条同人补充原作设定词条！`, '小说续写阅读器');
+    wrapper.querySelector('#tt-novel-quick-import')?.addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (file) await handleImportNovelFile(file);
         e.target.value = '';
     });
-
-    wrapper.querySelector('#tt-novel-distill-style')?.addEventListener('click', (e) => distillNovelStyleAdversarial(e.currentTarget, { incremental: false }));
-    wrapper.querySelector('#tt-novel-refine-style')?.addEventListener('click', (e) => distillNovelStyleAdversarial(e.currentTarget, { incremental: true }));
-    wrapper.querySelector('#tt-novel-distill-rounds')?.addEventListener('change', (e) => {
-        settings.distillRounds = Math.max(1, Math.min(3, Number(e.target.value) || 2));
-        saveExtensionSettings();
-    });
-    const presetSelectEl = wrapper.querySelector('#tt-novel-distill-preset');
-    populateDistillPresetSelect(presetSelectEl, settings.distillPresetName);
-    presetSelectEl?.addEventListener('focus', () => {
-        populateDistillPresetSelect(presetSelectEl, settings.distillPresetName);
-    });
-    presetSelectEl?.addEventListener('change', (e) => {
-        settings.distillPresetName = String(e.target.value ?? '');
-        saveExtensionSettings();
-        void refreshSettingsStatusCard();
-    });
-    wrapper.querySelector('#tt-novel-extract-cutoff')?.addEventListener('click', (e) => extractCutoffSnapshotSingleCall(e.currentTarget));
-    wrapper.querySelector('#tt-novel-open-toc')?.addEventListener('click', () => toggleTocDrawer(true));
-
-    wrapper.querySelector('#tt-novel-save-style')?.addEventListener('click', async () => {
-        const editorEl = /** @type {HTMLTextAreaElement | null} */ (document.getElementById('tt-novel-style-editor'));
-        const text = String(editorEl?.value || '').trim();
-        const ledger = await loadLedger();
-        if (!text) {
-            ledger.styleProfile = null;
-        } else {
-            ledger.styleProfile = {
-                ...(ledger.styleProfile || { version: 1, fingerprintText: '', goldenExcerpts: '', diffFindings: '' }),
-                styleCard: text,
-                distilledAt: Date.now(),
-            };
-        }
-        await saveLedger(ledger);
-        await refreshSettingsStatusCard();
-        globalThis.toastr?.success?.(text ? '已保存修改后的《原著文风 DNA 卡》！' : '已清空文风卡', '小说续写阅读器');
+    wrapper.querySelector('#tt-novel-chk-enabled-entry')?.addEventListener('change', (e) => {
+        handleUpdateSetting('enabled', Boolean(e.target.checked));
     });
 
-    wrapper.querySelector('#tt-novel-clear-style')?.addEventListener('click', async () => {
-        const ledger = await loadLedger();
-        ledger.styleProfile = null;
-        await saveLedger(ledger);
-        await refreshSettingsStatusCard();
-        globalThis.toastr?.info?.('已清空当前书籍的原著文风 DNA 卡', '小说续写阅读器');
-    });
-
-    const bindCheckbox = (selector, key) => {
-        wrapper.querySelector(selector)?.addEventListener('change', (e) => {
-            settings[key] = Boolean(e.target.checked);
-            saveExtensionSettings();
-            if (key === 'enabled' && !settings.enabled) {
-                getContext()?.setExtensionPrompt?.(EXTENSION_PROMPT_TAG, '', extension_prompt_types.NONE, 0);
-            }
-            applyReaderBodyClasses(settings);
-        });
-    };
-
-    bindCheckbox('#tt-novel-chk-enabled', 'enabled');
-    bindCheckbox('#tt-novel-chk-immersive', 'immersiveMode');
-    bindCheckbox('#tt-novel-chk-hide-user', 'hideUserFloors');
-    bindCheckbox('#tt-novel-chk-hide-cot', 'hideReasoning');
-    bindCheckbox('#tt-novel-chk-author-mode', 'authorMode');
-    bindCheckbox('#tt-novel-chk-fold-user', 'foldUserOutlineFloors');
-    bindCheckbox('#tt-novel-chk-autostate', 'enableAutoStateBlock');
-    bindCheckbox('#tt-novel-chk-sync-wi', 'syncToWorldInfo');
-
-    wrapper.querySelector('#tt-novel-anchor-count')?.addEventListener('change', (e) => {
-        settings.mountAnchorChapters = Math.max(1, Math.min(20, Number(e.target.value) || 3));
-        saveExtensionSettings();
-    });
-
-    wrapper.querySelector('#tt-novel-clear-canon')?.addEventListener('click', async () => {
-        await saveCanonDb(createEmptyCanonDb());
-        await refreshSettingsStatusCard();
-        globalThis.toastr?.info?.('已清空当前聊天的同人补充设定库', '小说续写阅读器');
-    });
-
-    wrapper.querySelector('#tt-novel-clear-all')?.addEventListener('click', async () => {
-        if (!window.confirm('确定清空当前聊天导入的原著、时间线总结与伏笔记录吗？')) return;
-        await clearNovelData();
-        await saveLedger(createEmptyLedger());
-        await saveCanonDb(createEmptyCanonDb());
-        clearReadingProgress();
-        await refreshReaderWidgets();
-        await refreshSettingsStatusCard();
-    });
-
-    const updateBridgeUi = ({ state, detail }) => {
-        const statusEl = document.getElementById('tt-novel-bridge-status');
-        if (!statusEl) return;
-        const icon = state === 'connected' ? '🟢' : (state === 'connecting' ? '🟡' : (state === 'error' ? '🔴' : '⚪'));
-        statusEl.textContent = `${icon} ${detail || state}`;
-    };
-
-    wrapper.querySelector('#tt-novel-bridge-connect')?.addEventListener('click', () => {
-        const inputEl = /** @type {HTMLInputElement | null} */ (document.getElementById('tt-novel-bridge-url'));
-        const url = String(inputEl?.value || '').trim();
-        settings.remoteBridgeUrl = url;
-        saveExtensionSettings();
-        connectRemoteBridge(url, { getSettings, saveExtensionSettings }, updateBridgeUi);
-    });
-
-    wrapper.querySelector('#tt-novel-bridge-disconnect')?.addEventListener('click', () => {
-        disconnectRemoteBridge();
-    });
+    void refreshSettingsStatusCard();
 }
 
 async function refreshSettingsStatusCard() {
@@ -1065,71 +1026,22 @@ async function refreshSettingsStatusCard() {
     if (!card) return;
 
     const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
-    const settings = getSettings();
-    const presetSelectEl = document.getElementById('tt-novel-distill-preset');
-    if (presetSelectEl && document.activeElement !== presetSelectEl) {
-        populateDistillPresetSelect(presetSelectEl, settings.distillPresetName);
-    }
-    let distillPresetLabel = '不使用预设（纯净直连）';
-    try {
-        distillPresetLabel = resolveSelectedDistillationPreset(settings.distillPresetName).label;
-    } catch {
-        distillPresetLabel = `${settings.distillPresetName}（未找到）`;
-    }
-
+    const meta = getRuntimeMeta();
     const openHooksCount = (ledger?.hooks || []).filter(h => h.status !== 'resolved').length;
     const sp = ledger?.styleProfile;
-    const activeModel = getActiveApiModelLabel();
     const novelLine = novelData
-        ? `📚 <b>当前原著</b>：《${escapeHtml(novelData.title)}》（共 ${novelData.totalChapters} 章 · 续写锚点：第 ${novelData.cutoffChapterIndex} 章）`
-        : '📚 <b>当前原著</b>：尚未导入（可导入 .txt/.md 太监或同人小说）';
+        ? `📚 <b>原著</b>：《${escapeHtml(novelData.title)}》（${novelData.totalChapters}章 · 锚点 #${novelData.cutoffChapterIndex}）`
+        : '📚 <b>原著</b>：尚未导入';
     const scoreChain = Array.isArray(sp?.roundHistory) && sp.roundHistory.length > 0
-        ? ` · 盲测评分：${sp.roundHistory.map(r => `R${r.round} ${r.score !== null ? `${r.score}分` : '?'}`).join(' → ')}`
+        ? ` · ${sp.roundHistory.map(r => `R${r.round} ${r.score ?? '?'}分`).join('→')}`
         : '';
     const styleLine = sp?.styleCard
-        ? `🎨 <b>原著文风 DNA</b>：已定稿（${String(sp.styleCard).length} 字${escapeHtml(scoreChain)}）`
-        : '🎨 <b>原著文风 DNA</b>：尚未蒸馏（点击「🎨 深度蒸馏原著文风」可多轮对抗提取）';
-    const modelLine = `🤖 <b>当前蒸馏/续写模型</b>：<code>${escapeHtml(activeModel)}</code> · 🎛️ <b>蒸馏预设</b>：<code>${escapeHtml(distillPresetLabel)}</code>`;
-    const ledgerLine = `🧠 <b>时间线记忆</b>：${ledger.summaries.length} 章总结 · ${ledger.worldStates.length} 条人物/世界状态 · ${openHooksCount} 条待填伏笔`;
-    const canonLine = `🗂️ <b>同人补充数据库</b>：已挂载 ${canonDb.items.length} 个设定词条${canonDb.sources.length ? `（${escapeHtml(canonDb.sources.join(', '))}）` : ''}`;
+        ? `🎨 <b>文风骨相</b>：${String(sp.styleCard).length}字${escapeHtml(scoreChain)}`
+        : '🎨 <b>文风骨相</b>：未蒸馏';
+    const memLine = `🧠 <b>归档记忆</b>：${ledger.characters.length}人物 · ${ledger.chronicle.length}编年史 · ${openHooksCount}待填伏笔 · ${canonDb.items.length}补充设定`;
+    const presetLine = `🎛️ <b>模型/预设</b>：<code>${escapeHtml(meta.activeModel)}</code> · <code>${escapeHtml(meta.presetLabel)}</code>`;
 
-    card.innerHTML = `<div>${novelLine}</div><div>${styleLine}</div><div>${modelLine}</div><div>${ledgerLine}</div><div>${canonLine}</div>`;
-
-    const diffEl = document.getElementById('tt-novel-style-diff');
-    if (diffEl) {
-        if (sp?.styleCard) {
-            const parts = [];
-            if (sp.fingerprintText) {
-                parts.push(`<b>📊 本地客观指纹：</b><br>${escapeHtml(sp.fingerprintText).replace(/\n/g, '<br>')}`);
-            }
-            if (sp.diffFindings) {
-                parts.push(`<b>🔍 盲测对抗揪出的 AI 味破绽与纠偏：</b><br>${escapeHtml(sp.diffFindings).replace(/\n/g, '<br>')}`);
-            }
-            diffEl.innerHTML = parts.join('<hr style="margin:6px 0;opacity:0.25;" />') || '已加载手动编辑的文风 DNA 卡。';
-        } else {
-            diffEl.textContent = '尚未执行文风蒸馏。点击上方「🎨 蒸馏原著文风」按钮，插件会以并发上限 2 自动完成：客观指纹分析 → 双路解剖 → 盲测仿写 → 真迹找茬纠偏。';
-        }
-    }
-
-    const editorEl = /** @type {HTMLTextAreaElement | null} */ (document.getElementById('tt-novel-style-editor'));
-    if (editorEl && document.activeElement !== editorEl) {
-        editorEl.value = sp?.styleCard || '';
-    }
-}
-
-function handleToggleSetting(key) {
-    const settings = getSettings();
-    settings[key] = !settings[key];
-    saveExtensionSettings();
-    applyReaderBodyClasses(settings);
-    const chkMap = {
-        immersiveMode: '#tt-novel-chk-immersive',
-        hideUserFloors: '#tt-novel-chk-hide-user',
-        hideReasoning: '#tt-novel-chk-hide-cot',
-        authorMode: '#tt-novel-chk-author-mode',
-    };
-    const chk = document.querySelector(chkMap[key]);
-    if (chk) chk.checked = settings[key];
+    card.innerHTML = `<div>${novelLine}</div><div>${styleLine}</div><div>${memLine}</div><div>${presetLine}</div>`;
 }
 
 let initialized = false;
@@ -1143,23 +1055,49 @@ export async function init() {
 
     mountSettingsPanel();
     mountReaderUi({
-        settings,
+        getSettings,
+        onUpdateSetting: handleUpdateSetting,
         onToggleSetting: handleToggleSetting,
         onCutoffFromChapter: handleCutoffFromChapter,
         onViewChapter: handleViewOriginalChapter,
+        onImportNovelFile: handleImportNovelFile,
+        onImportCanonFiles: handleImportCanonFiles,
+        onClearCanon: async () => {
+            await saveCanonDb(createEmptyCanonDb());
+            await refreshReaderWidgets();
+            await refreshSettingsStatusCard();
+            globalThis.toastr?.info?.('已清空当前对话的同人补充设定库', '小说续写阅读器');
+        },
+        onClearAll: async () => {
+            if (!window.confirm('确定清空当前对话导入的原著、编年史、人物灵魂档案、文风与伏笔记录吗？')) return;
+            await clearNovelData();
+            await saveLedger(createEmptyLedger());
+            await saveCanonDb(createEmptyCanonDb());
+            clearReadingProgress();
+            await refreshReaderWidgets();
+            await refreshSettingsStatusCard();
+        },
+        onRunArchive: runStoryArchiveTask,
+        onRunStyleDistill: runStyleDistillTask,
+        onRunDeclicheLatest: runSurgicalDeclicheLatestTask,
+        onConnectBridge: (url) => {
+            settings.remoteBridgeUrl = url;
+            saveExtensionSettings();
+            connectRemoteBridge(url, { getSettings, saveExtensionSettings }, updateBridgeStatusUi);
+        },
+        onDisconnectBridge: () => {
+            disconnectRemoteBridge();
+        },
+        getRuntimeMeta,
+        getLatestClicheStatus,
     });
+
     await restoreNovelFloorsIfNeeded();
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
 
     if (settings.remoteBridgeUrl) {
-        const updateBridgeUi = ({ state, detail }) => {
-            const statusEl = document.getElementById('tt-novel-bridge-status');
-            if (!statusEl) return;
-            const icon = state === 'connected' ? '🟢' : (state === 'connecting' ? '🟡' : (state === 'error' ? '🔴' : '⚪'));
-            statusEl.textContent = `${icon} ${detail || state}`;
-        };
-        connectRemoteBridge(settings.remoteBridgeUrl, { getSettings, saveExtensionSettings }, updateBridgeUi);
+        connectRemoteBridge(settings.remoteBridgeUrl, { getSettings, saveExtensionSettings }, updateBridgeStatusUi);
     }
 
     const { eventSource, eventTypes } = context;

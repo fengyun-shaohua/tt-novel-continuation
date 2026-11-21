@@ -20,9 +20,13 @@ const memoryStoreCache = new Map();
 export function createEmptyLedger() {
     return {
         summaries: [],
+        chronicle: [],
+        characters: [],
         worldStates: [],
         hooks: [],
         styleProfile: null,
+        lastArchivedChapter: 0,
+        archiveProcessLog: [],
     };
 }
 
@@ -207,9 +211,13 @@ export async function loadLedger() {
     if (!raw || typeof raw !== 'object') return createEmptyLedger();
     return {
         summaries: Array.isArray(raw.summaries) ? raw.summaries : [],
+        chronicle: Array.isArray(raw.chronicle) ? raw.chronicle : [],
+        characters: Array.isArray(raw.characters) ? raw.characters : [],
         worldStates: Array.isArray(raw.worldStates) ? raw.worldStates : [],
         hooks: Array.isArray(raw.hooks) ? raw.hooks : [],
         styleProfile: raw.styleProfile && typeof raw.styleProfile === 'object' ? raw.styleProfile : null,
+        lastArchivedChapter: Number(raw.lastArchivedChapter || 0),
+        archiveProcessLog: Array.isArray(raw.archiveProcessLog) ? raw.archiveProcessLog : [],
     };
 }
 
@@ -217,6 +225,103 @@ export async function saveLedger(ledger) {
     const store = getExtensionStoreAdapter();
     if (!store) return;
     await store.set(KEY_LEDGER, ledger);
+}
+
+function hooksMatchLoosely(a, b) {
+    const sa = String(a || '').replace(/[\s，。！？、：；“”"'（）()\[\]【】]/g, '');
+    const sb = String(b || '').replace(/[\s，。！？、：；“”"'（）()\[\]【】]/g, '');
+    if (!sa || !sb) return false;
+    if (sa === sb || sa.includes(sb.slice(0, 8)) || sb.includes(sa.slice(0, 8))) return true;
+    const minLen = Math.min(sa.length, sb.length);
+    if (minLen < 4) return false;
+    const bigramsA = new Set();
+    for (let i = 0; i < sa.length - 1; i += 1) bigramsA.add(sa.slice(i, i + 2));
+    let shared = 0;
+    const totalB = Math.max(1, sb.length - 1);
+    for (let i = 0; i < sb.length - 1; i += 1) {
+        if (bigramsA.has(sb.slice(i, i + 2))) shared += 1;
+    }
+    return shared >= 3 && shared / Math.min(bigramsA.size, totalB) >= 0.45;
+}
+
+/**
+ * Merges structured full-novel or incremental archiver output into the single-truth ledger,
+ * preserving user-pinned hooks and manual edits when running incrementally.
+ */
+export async function mergeArchivedDataIntoLedger(archiveResult, { mode = 'full' } = {}) {
+    const ledger = await loadLedger();
+    const isFull = mode === 'full';
+
+    if (Array.isArray(archiveResult.chronicle) && archiveResult.chronicle.length > 0) {
+        if (isFull) {
+            ledger.chronicle = archiveResult.chronicle;
+        } else {
+            const byKey = new Map(ledger.chronicle.map(e => [`${e.chapterRange}|${e.title}`, e]));
+            for (const evt of archiveResult.chronicle) {
+                byKey.set(`${evt.chapterRange}|${evt.title}`, evt);
+            }
+            ledger.chronicle = [...byKey.values()].sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0));
+        }
+    }
+
+    if (Array.isArray(archiveResult.characters) && archiveResult.characters.length > 0) {
+        if (isFull) {
+            ledger.characters = archiveResult.characters;
+        } else {
+            const byName = new Map(ledger.characters.map(c => [String(c.name || '').toLowerCase(), c]));
+            for (const ch of archiveResult.characters) {
+                const key = String(ch.name || '').toLowerCase();
+                const prev = byName.get(key);
+                byName.set(key, prev ? {
+                    ...prev,
+                    role: ch.role || prev.role,
+                    canonFoundation: ch.canonFoundation || prev.canonFoundation,
+                    currentSituation: ch.currentSituation || prev.currentSituation,
+                    voiceAndQuotes: ch.voiceAndQuotes || prev.voiceAndQuotes,
+                    oocRedLines: ch.oocRedLines || prev.oocRedLines,
+                    updatedChapter: ch.updatedChapter || prev.updatedChapter,
+                } : ch);
+            }
+            ledger.characters = [...byName.values()];
+        }
+    }
+
+    if (Array.isArray(archiveResult.worldStates) && archiveResult.worldStates.length > 0) {
+        for (const ws of archiveResult.worldStates) {
+            const idx = ledger.worldStates.findIndex(w => w.name === ws.name && w.category === ws.category);
+            if (idx >= 0) ledger.worldStates[idx] = ws;
+            else ledger.worldStates.push(ws);
+        }
+    }
+
+    if (Array.isArray(archiveResult.hooks) && archiveResult.hooks.length > 0) {
+        const manualHooks = ledger.hooks.filter(h => !h.autoExtracted);
+        const existingAuto = isFull ? [] : ledger.hooks.filter(h => h.autoExtracted);
+        const combined = [...manualHooks, ...existingAuto];
+        for (const incoming of archiveResult.hooks) {
+            const match = combined.find(h => hooksMatchLoosely(h.content, incoming.content));
+            if (match) {
+                if (incoming.status === 'resolved' && match.status !== 'resolved') {
+                    match.status = 'resolved';
+                    match.resolvedChapter = incoming.resolvedChapter || archiveResult.lastArchivedChapter;
+                }
+            } else {
+                combined.push(incoming);
+            }
+        }
+        ledger.hooks = combined;
+    }
+
+    ledger.lastArchivedChapter = Math.max(
+        isFull ? 0 : Number(ledger.lastArchivedChapter || 0),
+        Number(archiveResult.lastArchivedChapter || 0),
+    );
+    if (Array.isArray(archiveResult.processLog)) {
+        ledger.archiveProcessLog = archiveResult.processLog;
+    }
+
+    await saveLedger(ledger);
+    return ledger;
 }
 
 export async function loadCanonDb() {
@@ -242,6 +347,7 @@ export async function saveCanonDb(canonDb) {
 export async function pruneLedgerAfterChapter(maxChapterIndex) {
     const ledger = await loadLedger();
     ledger.summaries = ledger.summaries.filter(s => Number(s.chapterIndex || 0) <= maxChapterIndex);
+    ledger.chronicle = (ledger.chronicle || []).filter(e => Number(e.startChapter || 0) <= maxChapterIndex);
     ledger.worldStates = ledger.worldStates.filter(w => Number(w.effectiveChapter || 0) <= maxChapterIndex);
     ledger.hooks = ledger.hooks.filter(h => Number(h.plantedChapter || 0) <= maxChapterIndex);
     for (const hook of ledger.hooks) {
@@ -249,6 +355,9 @@ export async function pruneLedgerAfterChapter(maxChapterIndex) {
             hook.status = 'open';
             delete hook.resolvedChapter;
         }
+    }
+    if (Number(ledger.lastArchivedChapter || 0) > maxChapterIndex) {
+        ledger.lastArchivedChapter = maxChapterIndex;
     }
     await saveLedger(ledger);
     return ledger;
@@ -306,14 +415,14 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
         if (!hook.content) continue;
         if (hook.action === 'resolve') {
             const target = ledger.hooks.find(
-                h => h.status !== 'resolved' && (h.content.includes(hook.content.slice(0, 8)) || hook.content.includes(h.content.slice(0, 8))),
+                h => h.status !== 'resolved' && hooksMatchLoosely(h.content, hook.content),
             );
             if (target) {
                 target.status = 'resolved';
                 target.resolvedChapter = chapterIndex;
             }
         } else {
-            const exists = ledger.hooks.some(h => h.content === hook.content);
+            const exists = ledger.hooks.some(h => h.status !== 'resolved' && hooksMatchLoosely(h.content, hook.content));
             if (!exists) {
                 ledger.hooks.push({
                     id: `hook_${now}_${Math.random().toString(36).slice(2, 7)}`,

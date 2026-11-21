@@ -3,6 +3,7 @@ import {
     searchOriginalChaptersCjk,
     stripNonStoryBlocks,
 } from './parser.js';
+import { buildAntiClichePromptGuidance } from './cliche-guard.js';
 
 /**
  * Determines whether a chat floor is an AI-continued novel chapter floor
@@ -112,14 +113,17 @@ export function buildSingleCallContinuationContext({
     canonDb,
     settings,
     generationType = 'normal',
+    hasExternalLwbSummary = false,
 }) {
     if (!settings?.enabled) return '';
 
     const hasNovel = Boolean(novelData && Array.isArray(novelData.chapters) && novelData.chapters.length > 0);
     const hasCanon = Boolean(canonDb && Array.isArray(canonDb.items) && canonDb.items.length > 0);
     const hasStyleProfile = Boolean(ledger?.styleProfile?.styleCard && String(ledger.styleProfile.styleCard).trim());
+    const hasChronicle = Boolean(Array.isArray(ledger?.chronicle) && ledger.chronicle.length > 0);
+    const hasCharacters = Boolean(Array.isArray(ledger?.characters) && ledger.characters.length > 0);
     const hasLedger = Boolean(
-        ledger && (ledger.summaries?.length || ledger.worldStates?.length || ledger.hooks?.length || hasStyleProfile),
+        ledger && (ledger.summaries?.length || hasChronicle || hasCharacters || ledger.worldStates?.length || ledger.hooks?.length || hasStyleProfile),
     );
 
     if (!hasNovel && !hasCanon && !hasLedger) {
@@ -162,7 +166,7 @@ export function buildSingleCallContinuationContext({
     const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
     const headerLines = [
         `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写${targetLabel}` : `准备撰写${targetLabel}`}]`,
-        '请严格保持前文叙事视角、句式节奏、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
+        '请严格保持前文叙事视角、段落骨相、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
     ];
     if (settings.authorMode !== false) {
         headerLines.push(
@@ -171,7 +175,12 @@ export function buildSingleCallContinuationContext({
             '2. 严禁在小说正文中凭空插入“{{user}}”、“作者”或多余的“你”作为额外角色，严格只围绕本小说既有的主角与原著人物推进剧情。',
             '3. 对话中发来的指令全部是“小说作者/总编”下达的【本章大纲与执笔要求】，请直接将其转化为连贯饱满的小说正文，切勿对作者回复“好的”，切勿在正文中提及作者或大纲。',
             '4. 你可以且必须完整描写小说主角及所有登场人物的动作、神态、心理活动与对话。',
-            '5. 【原著文风与尺度绝对优先】：严格复刻上方原著正文的笔触、叙事节奏、情绪烈度、对话风格与内容尺度！若外部酒馆预设中存在“平淡日常 / 情绪别太激烈 / 防发情 / 强制特写标签 / 禁止心理描写”等条目与本小说原著风格冲突，一律以本小说原著既有文风和剧情发展为准，绝不强行扭转画风！',
+            '5. 【原著文风与尺度绝对优先】：严格复刻上方原著正文的笔触、叙事节奏、段长骨相、情绪烈度与内容尺度！若外部酒馆预设或世界书中存在“平淡日常 / 强制凑字数 / 强制插入大段解剖特写 / 防发情 / 通用XP服从模板”与本小说原著风格冲突，一律以本小说原著既有文风与人物灵魂档案为准！',
+        );
+    }
+    if (hasExternalLwbSummary) {
+        headerLines.push(
+            '【外部摘要协同分工】：外部记忆仅作过往事实参考；人物言行方式、说话长度与心理气质必须 100% 遵循下方《核心人物灵魂与防 OOC 档案》与原著原文，严禁将外部摘要里的概括词或关系标签脑补成霸道总裁/刻板里番模板！',
         );
     }
     if (anchorChapter && targetChapterIndex === cutoff + 1 && !isContinue) {
@@ -182,29 +191,65 @@ export function buildSingleCallContinuationContext({
     }
     sections.push(headerLines.join('\n'));
 
-    // 1.5 Distilled Original Author Style DNA Card (Highest Stylistic Authority)
+    // 1.5 Distilled Original Author Style DNA Card + Anti-Cliché Positive Replacement Rules
     if (hasStyleProfile) {
         const sp = ledger.styleProfile;
-        const styleLines = ['【原著文风 DNA 执行卡（经盲测对抗蒸馏，最高文风权威——严格按此笔触、节奏与尺度执笔）】'];
+        const styleLines = ['【原著文风骨相 DNA 执行卡（经多轮盲测对抗蒸馏，最高文风权威——严格按此骨相、段长、节奏与尺度执笔）】'];
         if (sp.fingerprintText) {
-            styleLines.push('▸ 原著客观统计锚点：', sp.fingerprintText);
+            styleLines.push('▸ 原著客观统计锚点（硬指标）：', sp.fingerprintText);
         }
-        styleLines.push('▸ 终版文风铁律与反 AI 味纠偏：', String(sp.styleCard).trim());
+        styleLines.push('▸ 终版文风骨相铁律：', String(sp.styleCard).trim());
         if (sp.goldenExcerpts && String(sp.goldenExcerpts).trim()) {
-            styleLines.push('▸ 原著灵魂语感活样本（请模仿其行文节奏、断句与对话口癖，勿照抄情节）：', String(sp.goldenExcerpts).trim());
+            styleLines.push('▸ 原著灵魂语感活样本（模仿其行文节奏、断句与对话口癖，勿照抄情节）：', String(sp.goldenExcerpts).trim());
         }
+        styleLines.push(buildAntiClichePromptGuidance(settings.clicheBlacklist));
         sections.push(styleLines.join('\n'));
+    } else {
+        sections.push(buildAntiClichePromptGuidance(settings.clicheBlacklist));
     }
 
-    // 2. Tier 1: Active Timeline World States & Recent Summaries (Highest Priority)
+    // 1.8 Core Character 4-Dimension Soul & Anti-OOC Profiles (Bridges Canon Foundation + Fanfic Evolution)
+    if (hasCharacters) {
+        const activeChars = ledger.characters
+            .filter(c => c && c.name)
+            .slice(0, 12);
+        if (activeChars.length > 0) {
+            const charLines = [
+                '【核心人物 4 维灵魂与防 OOC 档案（最高人物权威——保留原作/游戏硬设定底骨，同时 100% 锁死本小说真实性格与言行禁区）】',
+            ];
+            for (const ch of activeChars) {
+                const roleSuffix = ch.role ? `（${ch.role}）` : '';
+                charLines.push(`◆ ${ch.name}${roleSuffix}`);
+                if (ch.canonFoundation) charLines.push(`  · 原作底骨与能力：${ch.canonFoundation}`);
+                if (ch.currentSituation) charLines.push(`  · 当前处境与关系：${ch.currentSituation}`);
+                if (ch.voiceAndQuotes) charLines.push(`  · 原著言行与声线锚点：${ch.voiceAndQuotes}`);
+                if (ch.oocRedLines) charLines.push(`  · 🚫 绝对 OOC 红线：${ch.oocRedLines}`);
+            }
+            sections.push(charLines.join('\n'));
+        }
+    }
+
+    // 2. Tier 1: Active Timeline Chronicle, World States & Recent Chapter Summaries (Highest Factual Authority)
+    const activeChronicle = (ledger?.chronicle || [])
+        .filter(e => Number(e.startChapter || 0) < targetChapterIndex)
+        .sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0))
+        .slice(-20);
     const activeStates = resolveTimelineWorldStates(ledger?.worldStates || [], targetChapterIndex - 1);
     const activeSummaries = (ledger?.summaries || [])
         .filter(s => Number(s.chapterIndex || 0) < targetChapterIndex)
         .sort((a, b) => a.chapterIndex - b.chapterIndex)
         .slice(-(Number(settings.maxRecentSummaries) || 6));
 
-    if (activeStates.length > 0 || activeSummaries.length > 0) {
+    if (activeChronicle.length > 0 || activeStates.length > 0 || activeSummaries.length > 0) {
         const tier1Lines = ['【第一优先级：当前时间线已确认状态与前情提要（最高事实权威）】'];
+        if (activeChronicle.length > 0) {
+            tier1Lines.push('▸ 全本原著剧情编年史（客观事实与信息差）：');
+            for (const evt of activeChronicle) {
+                const timePart = evt.timeLabel ? `[${evt.timeLabel}] ` : '';
+                const gapPart = evt.infoGap ? ` ｜ 信息差：${evt.infoGap}` : '';
+                tier1Lines.push(`  - (${evt.chapterRange || `#${evt.startChapter}`}) ${timePart}${evt.title}：${evt.summary}${gapPart}`);
+            }
+        }
         if (activeStates.length > 0) {
             tier1Lines.push('▸ 当前人物/势力/物品最新状态：');
             for (const st of activeStates.slice(-18)) {
@@ -224,7 +269,7 @@ export function buildSingleCallContinuationContext({
     const openHooks = resolveTimelineHooks(ledger?.hooks || [], targetChapterIndex - 1);
     if (openHooks.length > 0) {
         const pinned = openHooks.filter(h => h.status === 'pinned');
-        const unpinned = openHooks.filter(h => h.status !== 'pinned').slice(-6);
+        const unpinned = openHooks.filter(h => h.status !== 'pinned').slice(-8);
         const hookLines = ['【伏笔与长线线索调度】'];
         if (pinned.length > 0) {
             hookLines.push('▸ 🎯 本章必须推进或回收的重点伏笔（请自然融入本章剧情）：');
@@ -242,8 +287,6 @@ export function buildSingleCallContinuationContext({
     }
 
     // 4. Tier 2: Local CJK Flashback Retrieval from Imported Original Novel (<= cutoffChapterIndex)
-    // Exclude all trailing chapters already present in `coreChat` so earlier mounted chapters (e.g. ch 3)
-    // are never re-injected after the cutoff chapter (e.g. ch 4) and cause the LLM to rewind.
     if (hasNovel && queryText.trim()) {
         const hits = searchOriginalChaptersCjk(queryText, novelData.chapters, {
             cutoffChapterIndex: cutoff,
@@ -270,7 +313,7 @@ export function buildSingleCallContinuationContext({
         });
         if (canonHits.length > 0) {
             const tier3Lines = [
-                '【第三优先级：同人补充原作设定数据库（注意蝴蝶效应保护：若以下原作设定与【第一/第二优先级】中本作品已改写的同人剧情冲突，严格以本作品已发生的事实为准！）】',
+                '【第三优先级：同人补充原作设定数据库（注意蝴蝶效应保护：原作设定提供世界观、能力、历史与性格底骨；若与【第一/第二优先级】中本作品已改写的同人剧情冲突，严格以本作品已发生的事实为准！）】',
             ];
             for (const item of canonHits) {
                 tier3Lines.push(`  - [${item.category}] ${item.title}：${item.content}`);
@@ -286,25 +329,56 @@ export function buildSingleCallContinuationContext({
         );
     }
 
-    // 7. Single-Call Zero-Extra-Cost <novel_state> Trailer Instruction (skip on mid-message continue)
-    if (settings.enableAutoStateBlock && !isContinue) {
-        sections.push(
-            [
-                '【单次调用自动归档指令（重要）】',
-                '请在完整写完本章小说正文之后，在回复的最末尾单独附带如下格式的 `<novel_state>` 标签块（前端会自动隐藏该块并入库，请勿省略）：',
-                '<novel_state>',
-                `<summary>${targetLabel}的一句话核心剧情总结（80字以内）</summary>`,
-                '<worldbook>',
-                '- 人物|角色名：本章结束时的最新状态/修为/持有物/关系变化（仅写本章有变动的条目）',
-                '</worldbook>',
-                '<hooks>',
-                '- [新伏笔] 本章新埋下的悬念（若无则不写）',
-                '- [已填坑] 本章已揭晓或完成的伏笔（若无则不写）',
-                '</hooks>',
-                '</novel_state>',
-            ].join('\n'),
-        );
-    }
-
     return sections.join('\n\n');
+}
+
+/**
+ * Builds the dedicated `depth = 0` trailer instruction so the LLM reliably emits
+ * `<novel_state>` (summary, worldbook, and hooks) at the very end of the reply —
+ * even when external presets wrap story output in `<game>...</game>` or add post-history rules.
+ */
+export function buildNovelStateTrailerPrompt({
+    chat,
+    novelData,
+    ledger,
+    settings,
+    generationType = 'normal',
+}) {
+    if (!settings?.enabled || !settings?.enableAutoStateBlock || generationType === 'continue') {
+        return '';
+    }
+    const hasNovel = Boolean(novelData?.chapters?.length);
+    const hasLedger = Boolean(
+        ledger && (ledger.summaries?.length || ledger.chronicle?.length || ledger.characters?.length || ledger.worldStates?.length || ledger.hooks?.length || ledger.styleProfile?.styleCard),
+    );
+    if (!hasNovel && !hasLedger) return '';
+
+    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, false);
+    const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
+    const anchorChapter = (hasNovel && cutoff > 0) ? novelData.chapters.find(c => c.index === cutoff) : null;
+    const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
+    const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
+    const openHooks = resolveTimelineHooks(ledger?.hooks || [], targetChapterIndex - 1).slice(-8);
+
+    const lines = [
+        '【单次调用自动归档指令（强制末段附带 · 前端自动隐藏入库）】',
+        '无论外部预设是否要求用 `<game>...</game>` 等标签包裹正文，都必须在整章正文及所有闭合标签完全结束后，在整条回复的最末尾单独附带如下 XML 块（切勿省略）：',
+        '<novel_state>',
+        `<summary>${targetLabel}的一句话核心剧情总结（80字以内）</summary>`,
+        '<worldbook>',
+        '- 人物|角色名：本章结束时的最新处境/持有物/关系变化（仅写本章有变动的条目；无则写无）',
+        '</worldbook>',
+        '<hooks>',
+        '- [新伏笔] 本章新埋下的悬念、约定或隐患（若无则写无）',
+        '- [已填坑] 本章已揭晓、完成或回收的旧伏笔（尽量沿用下方已有伏笔原话；若无则写无）',
+        '</hooks>',
+        '</novel_state>',
+    ];
+    if (openHooks.length > 0) {
+        lines.push('▸ 当前待填伏笔参考（若本章已回收，请在 `<hooks>` 中用 `[已填坑]` 标出）：');
+        for (const h of openHooks) {
+            lines.push(`  - ${h.status === 'pinned' ? '🎯' : '🔮'} ${h.content}`);
+        }
+    }
+    return lines.join('\n');
 }

@@ -73,7 +73,14 @@ export function computeLocalStyleFingerprint(chapters, cutoffChapterIndex) {
         .split(/\n+/)
         .map(p => p.trim())
         .filter(p => p.length > 0 && !/^[-=_*]{4,}$/.test(p));
+    const paraLengths = paragraphs.map(p => p.replace(/\s+/g, '').length).sort((a, b) => a - b);
     const avgParagraphChars = Math.round(totalChars / Math.max(1, paragraphs.length));
+    const p90ParagraphChars = paraLengths.length > 0
+        ? paraLengths[Math.min(paraLengths.length - 1, Math.floor(paraLengths.length * 0.9))]
+        : 0;
+    const shortParagraphRatio = paraLengths.length > 0
+        ? Math.round((paraLengths.filter(len => len <= 60).length / paraLengths.length) * 100)
+        : 0;
 
     const sentences = fullText
         .split(/[。！？!?\n]+/)
@@ -115,6 +122,8 @@ export function computeLocalStyleFingerprint(chapters, cutoffChapterIndex) {
         totalChars,
         paragraphCount: paragraphs.length,
         avgParagraphChars,
+        p90ParagraphChars,
+        shortParagraphRatio,
         avgSentenceChars,
         shortSentenceRatio,
         dialogueRatio,
@@ -140,9 +149,13 @@ export function formatFingerprintText(fp) {
     if ((p.heart ?? 0) > 0) {
         marks.push(`爱心符号❤/♡(${p.heart}/千字)`);
     }
+    const paraTail = fp.p90ParagraphChars
+        ? `（≤60字短段占 ${fp.shortParagraphRatio ?? 0}%，90%段落不超过 ${fp.p90ParagraphChars} 字）`
+        : '';
     return [
         `- 叙事人称倾向：${fp.povHint}`,
-        `- 段落与句长：平均每段 ${fp.avgParagraphChars} 字，平均每句 ${fp.avgSentenceChars} 字（≤15字短句占比 ${fp.shortSentenceRatio}%）`,
+        `- 段落骨相：平均每段 ${fp.avgParagraphChars} 字${paraTail}`,
+        `- 句长节奏：平均每句 ${fp.avgSentenceChars} 字（≤15字短句占比 ${fp.shortSentenceRatio}%）`,
         `- 对话密度：对话占比约 ${fp.dialogueRatio}%，平均单句台词 ${fp.avgDialogueChars} 字`,
         `- 标点语气频次：${marks.join('、')}`,
     ].join('\n');
@@ -443,22 +456,38 @@ export async function runStyleDistillationPipeline({
         throw new Error('原著文本过短，无法切分训练样本与盲测真迹样本');
     }
 
-    const analystSystem = '你是一位顶尖文学编辑与法医级文风分析师。你严禁输出“文笔细腻、描写生动、节奏紧凑”这类空泛形容词，必须输出详尽、具体、可量化、附带原著实句对照的深度写作圣经。';
-    const outlineSystem = '你是剧情梗概提炼员。你的任务是把一段小说原文剥光一切文风、修辞、心理修饰和原句措辞，只还原成 3~5 句极度干瘪、客观、白开水般的“事件清单”，用于后续盲测仿写。';
-    const ghostwriterSystem = '你是一位小说代笔作者。请严格遵照给定的《原著文风 DNA 圣经》和《原著灵魂活样本》的笔触、节奏、标点和尺度，将干瘪事件大纲扩写成 800~1000 字的小说正文。直接输出正文，切勿解释。';
+    const analystSystem = '你是一位顶尖文学编辑与法医级文风分析师。你严禁输出“文笔细腻、描写生动、节奏紧凑”这类空泛形容词，必须输出详尽、具体、可量化、附带原著实句对照的深度写作圣经，重点抓住原著的【段落骨相、零抒情克制感、视角呼吸与去网文八股替换动作】。';
+    const outlineSystem = '你是剧情梗概提炼员。你的任务是把一段小说原文剥光一切文风、修辞、心理修饰和原句措辞，只还原成 4~6 句极度干瘪、客观、白开水般的“场景与节拍清单”，用于后续盲测仿写。';
+    const ghostwriterSystem = '你是一位小说代笔作者。请严格遵照给定的《原著文风 DNA 圣经》和《原著灵魂活样本》的骨相、段长上限、节奏、标点和尺度，将干瘪事件大纲扩写成 750~950 字的小说正文。严禁原地水字数、严禁堆砌网文八股形容词。直接输出正文，切勿解释。';
 
     let currentStyleCard = existingProfile?.styleCard || '';
     let goldenExcerpts = existingProfile?.goldenExcerpts || '';
     const roundHistory = Array.isArray(existingProfile?.roundHistory) ? [...existingProfile.roundHistory] : [];
+    const processLog = Array.isArray(existingProfile?.processLog) ? [...existingProfile.processLog] : [];
     const preStrippedOutlines = new Map();
 
     if (!isIncremental) {
+        const stage0Entry = {
+            id: 'stage0_fingerprint',
+            type: 'stage',
+            title: '阶段 0 · 本地统计指纹与无重叠样本切分（0 API）',
+            summary: `统计 ${fingerprint.totalChars} 字（平均段长 ${fingerprint.avgParagraphChars} 字，≤60字短段占 ${fingerprint.shortParagraphRatio ?? 0}%，对话占比 ${fingerprint.dialogueRatio}%）；切分出 ${samples.holdouts.length} 组盲测真迹考题。`,
+            detail: `${fingerprintText}\n\n盲测真迹考题池：\n${samples.holdouts.map((h, i) => `  ${i + 1}. ${h.label}（${h.text.length} 字）`).join('\n')}`,
+        };
+        processLog.push(stage0Entry);
+        onProgress({
+            step: 0,
+            totalSteps,
+            label: stage0Entry.summary,
+            logEntry: stage0Entry,
+        });
+
         // Stage 1: Bounded 2-way parallel deep anatomy
         currentStep = 1;
         onProgress({
             step: currentStep,
             totalSteps,
-            label: `步骤 ${currentStep}/${totalSteps}（并发 ${concurrency} 路）：深度解剖多章句法视角尺度 & 筛选多场景灵魂范例...`,
+            label: `步骤 ${currentStep}/${totalSteps}（并发 ${concurrency} 路）：深度解剖多章骨相/句法/视角尺度 & 筛选多场景灵魂范例...`,
         });
 
         const trainTextCombined = [
@@ -473,11 +502,12 @@ export async function runStyleDistillationPipeline({
                 systemPrompt: analystSystem,
                 prompt: [
                     `以下是小说《${novelData.title}》的本地客观统计指纹与多章节原著样本。`,
-                    '请做「法医级微观句法、视角与感官尺度深度解剖」（越具体、越细粒度越好，多引用原著里的真实短句作为依据，不要复述剧情）：',
-                    '1. 叙事视角与心理距离：人称视角如何运作？是否有视角微滑？内心想法是直白写出来、用极短碎片词带过，还是全靠微动作折射？',
-                    '2. 句法骨架与动词/修辞偏好：长短句交替规律、主语省略习惯、高频动作动词类型（急躁暴力 vs 缓慢粘稠？）、比喻习惯（通俗直给还是书面文艺？）。',
-                    '3. 分场景描写策略：日常铺垫、人物对峙、高张力/亲密/感官桥段分别怎么运镜？内容尺度落在哪一档？',
-                    '4. 初步发现的“原著绝不会使用的 AI 味/出版味表达”清单。',
+                    '请做「法医级骨相、句法、视角与感官尺度深度解剖」（越具体、越细粒度越好，多引用原著里的真实短句作为依据，不要复述剧情）：',
+                    '1. 段落骨相与信息密度（决定神似而非形似）：原著单个自然段通常多长？是否极度惜墨、用短段快切推进？有没有超过 150 字的静态外貌/环境大段描写？氛围是靠抒情形容词渲染，还是靠冷冰冰的白描动作与留白？',
+                    '2. 叙事视角与内心独白质感：人称视角如何运作？主角内心独白是直接穿插在段落里的口语碎碎念（无引号），还是克制隐藏？情绪温度偏松弛冷眼旁观还是浓烈煽情？',
+                    '3. 句法骨架与动词/修辞偏好：长短句交替规律、主语省略习惯、高频动词质感、比喻密度（直白通俗还是书面文艺？）。',
+                    '4. 分场景运镜与尺度边界：日常铺垫、人物对峙、高张力/亲密/感官桥段分别如何推进？',
+                    '5. 初步发现的“原著绝不会使用的网文/AI八股”及对应的【原著真实替代写法】（用“想表达X时，原著直接写Y，而非套话Z”的格式）。',
                     '',
                     '【本地客观统计指纹】：',
                     fingerprintText,
@@ -493,7 +523,7 @@ export async function runStyleDistillationPipeline({
                     '请完成两项任务，严格按 `<dialogue_pacing>` 和 `<excerpts>` 两个标签输出：',
                     '1. 在 `<dialogue_pacing>` 中深度解剖：',
                     '   - 台词节奏与口癖：台词长度、口语松散度、引号内外标点习惯（是否经常省略句末标点直接接动作？）、省略号/波浪号/感叹号/特殊符号的实际用法。',
-                    '   - 角色声线反差：核心登场角色说话风格、情绪温度和反应方式有什么鲜明反差？',
+                    '   - 角色声线反差：核心登场角色说话字数、寡言度、情绪温度和反抗/试探方式有什么鲜明反差？',
                     '   - 场景推进与转场：一节之内如何切镜、如何制造压迫感或悬念？',
                     '2. 在 `<excerpts>` 中，从下方样本里**一字不改原样摘录 3~4 段**不同场景（例如：日常氛围、对话交锋、微观感官/张力描写）最具作者灵魂辨识度的原文片段（每段 200~300 字，标注代表什么笔法特征），供后续 Few-Shot 语感锚定。',
                     '',
@@ -506,12 +536,40 @@ export async function runStyleDistillationPipeline({
         const dialogueNotes = extractTaggedSection(anatomyDialogueRaw, 'dialogue_pacing');
         goldenExcerpts = extractTaggedSection(anatomyDialogueRaw, 'excerpts');
 
+        const stage1aEntry = {
+            id: 'stage1a_anatomy',
+            type: 'stage',
+            title: '阶段 1A · 骨相、段落节奏、视角与尺度深度解剖',
+            summary: `产出 ${syntaxNotes.length} 字微观骨相剖析`,
+            detail: syntaxNotes,
+        };
+        const stage1bEntry = {
+            id: 'stage1b_dialogue',
+            type: 'stage',
+            title: '阶段 1B · 对话声线反差与原著灵魂范例摘录',
+            summary: `产出 ${dialogueNotes.length} 字声线剖析 + ${goldenExcerpts.length} 字原著黄金范例`,
+            detail: `【对话与声线剖析】\n${dialogueNotes}\n\n【原著灵魂原文范例】\n${goldenExcerpts}`,
+        };
+        processLog.push(stage1aEntry, stage1bEntry);
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `步骤 ${currentStep}/${totalSteps} 完成：已产出微观骨相剖析与灵魂范例摘录`,
+            logEntry: stage1aEntry,
+        });
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `步骤 ${currentStep}/${totalSteps} 完成：已收录黄金范例`,
+            logEntry: stage1bEntry,
+        });
+
         // Stage 2: Bounded 2-way parallel (Merge Deep Draft Style Bible || Strip Holdout #1 dry outline)
         currentStep = 2;
         onProgress({
             step: currentStep,
             totalSteps,
-            label: `步骤 ${currentStep}/${totalSteps}（并发 ${concurrency} 路）：合成初版深度文风圣经 & 剥离第 1 轮盲测事件大纲...`,
+            label: `步骤 ${currentStep}/${totalSteps}（并发 ${concurrency} 路）：合成初版深度文风骨相圣经 & 剥离第 1 轮盲测节拍清单...`,
         });
 
         const [draftCardRaw, dryOutline1Raw] = await runBoundedPool([
@@ -519,20 +577,20 @@ export async function runStyleDistillationPipeline({
                 stage: '2A_merge_draft',
                 systemPrompt: analystSystem,
                 prompt: [
-                    `请将以下关于《${novelData.title}》的本地统计指纹与两份深度文风剖析，去噪融合成一份详尽、可落地执行的【初版原著文风 DNA 圣经】（目标 **1,600 ~ 2,400 字**，宁要细致实操规则与原著短句示例，不要空泛浓缩！）。`,
+                    `请将以下关于《${novelData.title}》的本地统计指纹与两份深度文风剖析，去噪融合成一份详尽、可落地执行的【初版原著文风骨相 DNA 圣经】（目标 **1,800 ~ 2,600 字**，宁要细致实操规则与原著短句示例，不要空泛浓缩！）。`,
                     '必须分模块写清：',
-                    '一、叙事视角与心理表达铁律（含正反例句）',
-                    '二、句式、段长、排版与标点口癖（含具体数值锚点与标点示例）',
-                    '三、对话结构与核心人物声线反差',
-                    '四、分场景节奏推进与内容尺度定位',
-                    '五、原作者招牌动词/感官描写抓手（附原著实句拆解）',
-                    '六、初步反 AI 味禁忌清单',
+                    '一、段落骨相与防注水硬红线（明确单段字数上限、短段快切比例、严禁大段静态氛围/外貌水字数）',
+                    '二、叙事视角、内心独白口吻与零抒情克制度（含原著实句示例）',
+                    '三、句式、排版与标点口癖（含具体数值锚点与标点示例）',
+                    '四、对话结构与核心人物声线/寡言度反差',
+                    '五、分场景推进节奏与内容尺度定位',
+                    '六、原作者招牌动词/感官抓手与【反八股正向替换清单】（用“写某反应时 → 直接用原著某白描动作，绝不用套话”的实句对照）',
                     '请用 `<style_dna>...</style_dna>` 包裹输出。',
                     '',
                     '【本地客观统计指纹】：',
                     fingerprintText,
                     '',
-                    '【微观句法与尺度剖析】：',
+                    '【微观骨相与尺度剖析】：',
                     syntaxNotes,
                     '',
                     '【对话与角色声线剖析】：',
@@ -543,7 +601,7 @@ export async function runStyleDistillationPipeline({
                 stage: '2B_extract_dry_outline_1',
                 systemPrompt: outlineSystem,
                 prompt: [
-                    '请将下面这段小说原文压缩成 3~5 句极度干瘪客观的事件大纲（只写时间地点、人物、动作顺序与客观结果，严禁照抄原句修辞与台词）：',
+                    '请将下面这段小说原文压缩成 4~6 句客观的“场景与节拍清单”（按顺序列出时间地点、出场人物、每个动作与情绪转折节拍、结果，严禁照抄原句修辞与原话）：',
                     '',
                     samples.holdouts[0].text,
                 ].join('\n'),
@@ -552,6 +610,21 @@ export async function runStyleDistillationPipeline({
 
         currentStyleCard = extractTaggedSection(draftCardRaw, 'style_dna');
         preStrippedOutlines.set(0, stripNonStoryBlocks(dryOutline1Raw));
+
+        const stage2Entry = {
+            id: 'stage2a_draft',
+            type: 'stage',
+            title: '阶段 2 · 初版《原著文风骨相圣经》合稿',
+            summary: `初版文风圣经共 ${currentStyleCard.length} 字，即将进入盲测对抗打分`,
+            detail: currentStyleCard,
+        };
+        processLog.push(stage2Entry);
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `步骤 ${currentStep}/${totalSteps} 完成：初版圣经（${currentStyleCard.length} 字）就绪，准备盲测考试`,
+            logEntry: stage2Entry,
+        });
     }
 
     // Iterative Adversarial Blind-Test & Forensic Calibration Loop
@@ -689,11 +762,34 @@ export async function runStyleDistillationPipeline({
             currentStyleCard = nextStyleCard;
         }
 
+        const holdoutLabelFull = `${holdout.label}${isRetest ? ' (错题重考)' : ''}`;
         roundHistory.push({
             round: roundNum,
-            holdoutLabel: `${holdout.label}${isRetest ? ' (错题重考)' : ''}`,
+            holdoutLabel: holdoutLabelFull,
             score: roundScore,
             diffNotes: roundDiffNotes,
+        });
+
+        const roundLogEntry = {
+            id: `round_${roundNum}`,
+            type: 'round',
+            round: roundNum,
+            title: `第 ${roundNum} 轮盲测对抗 · ${holdoutLabelFull}`,
+            holdoutLabel: holdoutLabelFull,
+            isRetest,
+            score: roundScore,
+            dryOutline,
+            blindRewrite,
+            holdoutTruth: holdout.text,
+            diffNotes: roundDiffNotes,
+            styleCardLength: currentStyleCard.length,
+        };
+        processLog.push(roundLogEntry);
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `第 ${roundNum} 轮盲测评分完成：${roundScore !== null ? `${roundScore}/100 分` : '已评估'}（圣经现 ${currentStyleCard.length} 字）`,
+            logEntry: roundLogEntry,
         });
 
         // Early convergence if >= 2 rounds completed and score already reached 92+
@@ -715,13 +811,14 @@ export async function runStyleDistillationPipeline({
         .join('\n\n');
 
     return {
-        version: 2,
+        version: 3,
         title: novelData.title,
         cutoffChapterIndex: cutoff,
         distilledAt: Date.now(),
         roundsCompleted: roundHistory.length,
         latestScore,
         roundHistory,
+        processLog,
         fingerprint,
         fingerprintText,
         styleCard: currentStyleCard,

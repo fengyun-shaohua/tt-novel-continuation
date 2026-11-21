@@ -7,6 +7,7 @@ import {
     saveWorldInfo,
     world_names,
 } from '/scripts/world-info.js';
+import { inspectBatchExtractionQuality } from './story-archiver.js';
 
 export const EXTENSION_NAMESPACE = 'novel-continuation';
 
@@ -26,6 +27,8 @@ export function createEmptyLedger() {
         hooks: [],
         styleProfile: null,
         lastArchivedChapter: 0,
+        archiveBatches: [],
+        archiveNeedsResynth: false,
         archiveProcessLog: [],
     };
 }
@@ -204,11 +207,41 @@ export async function clearNovelData() {
     if (store) await store.remove(KEY_NOVEL_DATA);
 }
 
+function migrateBatchesFromLegacyLog(archiveProcessLog) {
+    if (!Array.isArray(archiveProcessLog) || archiveProcessLog.length === 0) return [];
+    const recovered = [];
+    for (const item of archiveProcessLog) {
+        if (!item?.id || !/^batch_(\d+)$/.test(item.id)) continue;
+        const idxMatch = item.id.match(/^batch_(\d+)$/);
+        const rangeMatch = String(item.title || '').match(/第\s*(\d+)\s*~\s*(\d+)\s*章/);
+        const charMatch = String(item.title || '').match(/（(\d+)\s*字）/);
+        if (!idxMatch || !rangeMatch) continue;
+        const notes = String(item.detail || '');
+        const quality = inspectBatchExtractionQuality(notes);
+        recovered.push({
+            batchIndex: Number(idxMatch[1]),
+            startChapter: Number(rangeMatch[1]),
+            endChapter: Number(rangeMatch[2]),
+            chapterTitles: [],
+            charCount: charMatch ? Number(charMatch[1]) : 0,
+            status: quality.status,
+            statusNote: quality.statusNote,
+            notes,
+            updatedAt: Date.now(),
+        });
+    }
+    return recovered.sort((a, b) => a.batchIndex - b.batchIndex);
+}
+
 export async function loadLedger() {
     const store = getExtensionStoreAdapter();
     if (!store) return createEmptyLedger();
     const raw = await store.get(KEY_LEDGER);
     if (!raw || typeof raw !== 'object') return createEmptyLedger();
+    const rawLog = Array.isArray(raw.archiveProcessLog) ? raw.archiveProcessLog : [];
+    const archiveBatches = Array.isArray(raw.archiveBatches) && raw.archiveBatches.length > 0
+        ? raw.archiveBatches
+        : migrateBatchesFromLegacyLog(rawLog);
     return {
         summaries: Array.isArray(raw.summaries) ? raw.summaries : [],
         chronicle: Array.isArray(raw.chronicle) ? raw.chronicle : [],
@@ -217,7 +250,9 @@ export async function loadLedger() {
         hooks: Array.isArray(raw.hooks) ? raw.hooks : [],
         styleProfile: raw.styleProfile && typeof raw.styleProfile === 'object' ? raw.styleProfile : null,
         lastArchivedChapter: Number(raw.lastArchivedChapter || 0),
-        archiveProcessLog: Array.isArray(raw.archiveProcessLog) ? raw.archiveProcessLog : [],
+        archiveBatches,
+        archiveNeedsResynth: Boolean(raw.archiveNeedsResynth),
+        archiveProcessLog: rawLog,
     };
 }
 
@@ -316,8 +351,15 @@ export async function mergeArchivedDataIntoLedger(archiveResult, { mode = 'full'
         isFull ? 0 : Number(ledger.lastArchivedChapter || 0),
         Number(archiveResult.lastArchivedChapter || 0),
     );
+    if (Array.isArray(archiveResult.batches)) {
+        ledger.archiveBatches = archiveResult.batches;
+    }
+    ledger.archiveNeedsResynth = false;
     if (Array.isArray(archiveResult.processLog)) {
         ledger.archiveProcessLog = archiveResult.processLog;
+    } else if (archiveResult.synthLogEntry) {
+        const filtered = (ledger.archiveProcessLog || []).filter(l => l.id !== 'synth_complete');
+        ledger.archiveProcessLog = [...filtered, archiveResult.synthLogEntry];
     }
 
     await saveLedger(ledger);
@@ -348,6 +390,7 @@ export async function pruneLedgerAfterChapter(maxChapterIndex) {
     const ledger = await loadLedger();
     ledger.summaries = ledger.summaries.filter(s => Number(s.chapterIndex || 0) <= maxChapterIndex);
     ledger.chronicle = (ledger.chronicle || []).filter(e => Number(e.startChapter || 0) <= maxChapterIndex);
+    ledger.archiveBatches = (ledger.archiveBatches || []).filter(b => Number(b.startChapter || 0) <= maxChapterIndex);
     ledger.worldStates = ledger.worldStates.filter(w => Number(w.effectiveChapter || 0) <= maxChapterIndex);
     ledger.hooks = ledger.hooks.filter(h => Number(h.plantedChapter || 0) <= maxChapterIndex);
     for (const hook of ledger.hooks) {

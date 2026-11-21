@@ -38,7 +38,11 @@ import {
     saveNovelData,
     syncWorldUpdatesToTavernLorebook,
 } from './storage.js';
-import { runStoryAndCharacterArchivePipeline } from './story-archiver.js';
+import {
+    rerunArchiveBatches,
+    runStoryAndCharacterArchivePipeline,
+    synthesizeArchiveFromBatches,
+} from './story-archiver.js';
 import { buildDistillationPresetMessages, runStyleDistillationPipeline } from './style-distiller.js';
 
 const SETTINGS_KEY = 'novel_continuation';
@@ -57,6 +61,12 @@ const DEFAULT_SETTINGS = Object.freeze({
     mountAnchorChapters: 3,
     distillRounds: 2,
     distillPresetName: '__current__',
+    bgApiMode: 'tavern',
+    bgCustomApiUrl: '',
+    bgCustomApiKey: '',
+    bgCustomApiModel: '',
+    bgCustomApiModelsCache: [],
+    bgCustomTemperature: 0.7,
     clicheBlacklist: '',
     maxOriginalHits: 3,
     maxCanonHits: 4,
@@ -590,19 +600,164 @@ function resolveSelectedDistillationPreset(presetSelection) {
     return { presetObj: rawPreset, label: selected };
 }
 
+function normalizeCustomApiBaseUrl(rawUrl) {
+    return String(rawUrl || '')
+        .trim()
+        .replace(/\/chat\/completions\/?$/i, '')
+        .replace(/\/models\/?$/i, '')
+        .replace(/\/+$/, '');
+}
+
+function extractChatCompletionText(data) {
+    if (!data) return '';
+    if (typeof data === 'string') return data;
+    if (data.error) {
+        const msg = typeof data.error === 'string'
+            ? data.error
+            : (data.error.message || JSON.stringify(data.error));
+        throw new Error(msg);
+    }
+    const msgContent = data?.choices?.[0]?.message?.content;
+    if (typeof msgContent === 'string') return msgContent;
+    if (Array.isArray(msgContent)) {
+        return msgContent.map(part => (typeof part === 'string' ? part : (part?.text || ''))).join('');
+    }
+    if (typeof data?.choices?.[0]?.text === 'string') return data.choices[0].text;
+    if (Array.isArray(data?.content)) {
+        return data.content.map(part => part?.text || '').join('');
+    }
+    if (typeof data?.content === 'string') return data.content;
+    return '';
+}
+
+async function callCustomOpenAiViaHost({ baseUrl, apiKey, model, temperature, messages }) {
+    const context = getContext();
+    const headers = typeof context?.getRequestHeaders === 'function'
+        ? { ...context.getRequestHeaders(), 'Content-Type': 'application/json' }
+        : { 'Content-Type': 'application/json' };
+
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            chat_completion_source: 'custom',
+            custom_url: '',
+            reverse_proxy: baseUrl,
+            proxy_password: apiKey,
+            model,
+            messages,
+            temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : 0.7,
+            max_tokens: 8192,
+            stream: false,
+            type: 'quiet',
+        }),
+    });
+
+    const rawText = await response.text();
+    let parsed = null;
+    try {
+        parsed = JSON.parse(rawText);
+    } catch {
+        // Non-JSON error body
+    }
+    if (!response.ok) {
+        const errMsg = parsed?.error?.message || parsed?.message || rawText.slice(0, 240) || `HTTP ${response.status}`;
+        throw new Error(`自定义 API 请求失败 (${response.status})：${errMsg}`);
+    }
+    return extractChatCompletionText(parsed ?? rawText);
+}
+
+async function fetchCustomApiModels() {
+    const settings = getSettings();
+    const baseUrl = normalizeCustomApiBaseUrl(settings.bgCustomApiUrl);
+    if (!baseUrl) {
+        globalThis.toastr?.warning?.('请先填写自定义 API 的 Base URL（例如 https://api.xxx.com/v1）', '小说续写阅读器');
+        return [];
+    }
+    const apiKey = String(settings.bgCustomApiKey || '').trim();
+    const context = getContext();
+    const headers = typeof context?.getRequestHeaders === 'function'
+        ? { ...context.getRequestHeaders(), 'Content-Type': 'application/json' }
+        : { 'Content-Type': 'application/json' };
+
+    const response = await fetch('/api/backends/chat-completions/status', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            chat_completion_source: 'custom',
+            custom_url: '',
+            reverse_proxy: baseUrl,
+            proxy_password: apiKey,
+            bypass_status_check: false,
+        }),
+    });
+    const result = await response.json();
+    if (result?.error) {
+        throw new Error(String(result.message || '连接自定义 API 失败'));
+    }
+    const rawList = Array.isArray(result?.data)
+        ? result.data
+        : (Array.isArray(result?.data?.data) ? result.data.data : []);
+    const modelIds = [...new Set(rawList.map(m => String(m?.id || m?.name || m || '').trim()).filter(Boolean))];
+    settings.bgCustomApiModelsCache = modelIds;
+    if (!settings.bgCustomApiModel && modelIds.length > 0) {
+        settings.bgCustomApiModel = modelIds[0];
+    }
+    saveExtensionSettings();
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    return modelIds;
+}
+
 /**
  * Unified preset-wrapped LLM caller shared by:
- * 1) Story & Character Archiver (`story-archiver.js`)
+ * 1) Story & Character Archiver (`story-archiver.js` — full, incremental, single-slice retry, re-synth)
  * 2) Multi-round Style Distiller (`style-distiller.js`)
  * 3) Surgical De-Cliché Refiner (`cliche-guard.js`)
+ * Supports BOTH Tavern's current active API (`bgApiMode: 'tavern'`) and Custom OpenAI-compatible API (`bgApiMode: 'custom'`).
  */
 function createPresetModelCaller() {
     const context = getContext();
+    const settings = getSettings();
+    const resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
+    const apiMode = settings.bgApiMode === 'custom' ? 'custom' : 'tavern';
+
+    if (apiMode === 'custom') {
+        const baseUrl = normalizeCustomApiBaseUrl(settings.bgCustomApiUrl);
+        const apiKey = String(settings.bgCustomApiKey || '').trim();
+        const model = String(settings.bgCustomApiModel || '').trim();
+        if (!baseUrl) {
+            throw new Error('当前已选择「自定义 API」，请先在「工作台 → 设置」填写 Base URL');
+        }
+        if (!model) {
+            throw new Error('当前已选择「自定义 API」，请先在「工作台 → 设置」选择或填写模型名称');
+        }
+        const callModel = async ({ prompt, systemPrompt }) => {
+            const messages = resolvedPreset.presetObj
+                ? buildDistillationPresetMessages(resolvedPreset.presetObj, { systemPrompt, userPrompt: prompt })
+                : [
+                    ...(systemPrompt ? [{ role: 'system', content: String(systemPrompt).trim() }] : []),
+                    { role: 'user', content: String(prompt || '').trim() },
+                ];
+            const reply = await callCustomOpenAiViaHost({
+                baseUrl,
+                apiKey,
+                model,
+                temperature: settings.bgCustomTemperature,
+                messages,
+            });
+            return String(reply || '');
+        };
+        return {
+            callModel,
+            modelLabel: `自定义API / ${model}`,
+            presetLabel: resolvedPreset.label,
+        };
+    }
+
     if (typeof context?.generateRaw !== 'function') {
         throw new Error('当前环境不支持 generateRaw 模型调用');
     }
-    const settings = getSettings();
-    const resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
     const modelLabel = getActiveApiModelLabel();
 
     const callModel = async ({ prompt, systemPrompt }) => {
@@ -620,7 +775,7 @@ function createPresetModelCaller() {
 
     return {
         callModel,
-        modelLabel,
+        modelLabel: `酒馆API / ${modelLabel}`,
         presetLabel: resolvedPreset.label,
     };
 }
@@ -636,8 +791,14 @@ function getRuntimeMeta() {
     const activePresetName = String(
         getPresetManager('openai')?.getSelectedPresetName?.() || oai_settings?.preset_settings_openai || '',
     ).trim();
+    const isCustom = settings.bgApiMode === 'custom';
+    const bgModelLabel = isCustom
+        ? `自定义API / ${settings.bgCustomApiModel || '未填模型'}`
+        : `酒馆API / ${getActiveApiModelLabel()}`;
     return {
-        activeModel: getActiveApiModelLabel(),
+        activeModel: bgModelLabel,
+        tavernModel: getActiveApiModelLabel(),
+        bgApiMode: isCustom ? 'custom' : 'tavern',
         presetLabel,
         activePresetName,
         presetNames: getAvailableOpenAiPresetNames(),
@@ -735,14 +896,17 @@ async function runStoryArchiveTask(mode = 'full') {
         });
 
         await mergeArchivedDataIntoLedger(result, { mode });
+        const warnTail = result.failedBatchCount > 0
+            ? ` ⚠️ 其中有 ${result.failedBatchCount} 个切片疑似道歉/失败，请在下方「分批切片管理」中单独重跑后点「重新合稿」！`
+            : ' 全部切片均正常提取，续写自动生效！';
         updateLiveProgress('memory', {
             isRunning: false,
-            text: `✅ 归档完成（至第 ${result.lastArchivedChapter} 章 · ${result.chronicle.length} 条编年史 · ${result.characters.length} 位人物灵魂卡 · ${result.hooks.length} 条伏笔），续写自动生效！`,
+            text: `✅ 归档完成（至第 ${result.lastArchivedChapter} 章 · ${result.chronicle.length} 条编年史 · ${result.characters.length} 位人物灵魂卡 · ${result.hooks.length} 条伏笔）。${warnTail}`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
         globalThis.toastr?.success?.(
-            `已提炼 ${result.chronicle.length} 条剧情编年史、${result.characters.length} 位核心人物防 OOC 档案与 ${result.hooks.length} 条伏笔！`,
+            `已提炼 ${result.chronicle.length} 条剧情编年史、${result.characters.length} 位人物档案与 ${result.hooks.length} 条伏笔${result.failedBatchCount > 0 ? `（${result.failedBatchCount} 片需单独重跑）` : ''}！`,
             '小说续写阅读器',
         );
     } catch (error) {
@@ -752,6 +916,133 @@ async function runStoryArchiveTask(mode = 'full') {
             text: `❌ 归档失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`归档失败：${error?.message || error}`, '小说续写阅读器');
+    }
+}
+
+async function runRerunArchiveBatchesTask(targetBatchIndices) {
+    const novelData = await loadNovelData();
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    const ledger = await loadLedger();
+    const indices = Array.isArray(targetBatchIndices) ? targetBatchIndices : [Number(targetBatchIndices)];
+    const validIndices = indices.filter(n => Number.isFinite(n) && n > 0);
+    if (validIndices.length === 0 || !ledger.archiveBatches?.length) {
+        globalThis.toastr?.warning?.('没有可重跑的切片记录', '小说续写阅读器');
+        return;
+    }
+
+    let caller;
+    try {
+        caller = createPresetModelCaller();
+    } catch (err) {
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    updateLiveProgress('memory', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 重跑 ${validIndices.length} 个切片（#${validIndices.join(', #')}）...`,
+    });
+
+    try {
+        const { batches, refreshed } = await rerunArchiveBatches({
+            novelData: novelData || { title: '当前小说', cutoffChapterIndex: 0, totalChapters: 0, chapters: [] },
+            continuedChapters,
+            existingBatches: ledger.archiveBatches,
+            targetBatchIndices: validIndices,
+            maxConcurrency: 2,
+            callModel: caller.callModel,
+            onProgress: ({ step, totalSteps, label }) => {
+                updateLiveProgress('memory', {
+                    isRunning: true,
+                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                });
+            },
+        });
+
+        ledger.archiveBatches = batches;
+        const okRefreshed = refreshed.filter(b => b.status === 'ok').length;
+        if (okRefreshed > 0) {
+            ledger.archiveNeedsResynth = true;
+        }
+        await saveLedger(ledger);
+        const stillBad = refreshed.filter(b => b.status !== 'ok').length;
+        updateLiveProgress('memory', {
+            isRunning: false,
+            isError: stillBad > 0 && okRefreshed === 0,
+            text: okRefreshed > 0
+                ? `✅ 重跑完成：${okRefreshed}/${refreshed.length} 个切片已恢复正常！请点击「🔁 用当前切片重新合稿总账」把补齐的章节合并进编年史与人物卡。`
+                : `⚠️ 重跑的 ${refreshed.length} 个切片仍疑似道歉或失败，建议在「⚙️ 设置」中切换自定义 API 或调整预设（例如选「不使用预设（纯净直连）」）后再重跑！`,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+    } catch (error) {
+        updateLiveProgress('memory', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 切片重跑失败：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`切片重跑失败：${error?.message || error}`, '小说续写阅读器');
+    }
+}
+
+async function runResynthArchiveTask() {
+    const novelData = await loadNovelData();
+    const ledger = await loadLedger();
+    if (!ledger.archiveBatches?.length) {
+        globalThis.toastr?.warning?.('尚无已保存的切片数据，请先执行一次全本通读归档', '小说续写阅读器');
+        return;
+    }
+
+    let caller;
+    try {
+        caller = createPresetModelCaller();
+    } catch (err) {
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    updateLiveProgress('memory', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 复用现有正常切片重新合稿总账（不重读原文）...`,
+    });
+
+    try {
+        const synth = await synthesizeArchiveFromBatches({
+            novelTitle: novelData?.title || '当前小说',
+            batches: ledger.archiveBatches,
+            existingLedger: ledger,
+            mode: 'full',
+            maxConcurrency: 2,
+            callModel: caller.callModel,
+            onProgress: ({ step, totalSteps, label, logEntry }) => {
+                updateLiveProgress('memory', {
+                    isRunning: true,
+                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    logEntry,
+                });
+            },
+        });
+
+        await mergeArchivedDataIntoLedger(synth, { mode: 'full' });
+        updateLiveProgress('memory', {
+            isRunning: false,
+            text: `✅ 重新合稿完成：${synth.chronicle.length} 条编年史 · ${synth.characters.length} 位人物灵魂卡 · ${synth.hooks.length} 条伏笔（已复用全部正常切片）！`,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(
+            `重新合稿完成：${synth.chronicle.length} 条编年史 · ${synth.characters.length} 位人物灵魂卡！`,
+            '小说续写阅读器',
+        );
+    } catch (error) {
+        updateLiveProgress('memory', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 重新合稿失败：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`重新合稿失败：${error?.message || error}`, '小说续写阅读器');
     }
 }
 
@@ -1078,6 +1369,18 @@ export async function init() {
             await refreshSettingsStatusCard();
         },
         onRunArchive: runStoryArchiveTask,
+        onRerunArchiveBatch: (batchIndex) => runRerunArchiveBatchesTask([batchIndex]),
+        onRerunFailedArchiveBatches: async () => {
+            const cur = await loadLedger();
+            const bad = (cur.archiveBatches || []).filter(b => b.status !== 'ok').map(b => b.batchIndex);
+            if (bad.length === 0) {
+                globalThis.toastr?.info?.('当前所有切片均已正常，无需重跑', '小说续写阅读器');
+                return;
+            }
+            await runRerunArchiveBatchesTask(bad);
+        },
+        onResynthArchive: runResynthArchiveTask,
+        onFetchCustomModels: fetchCustomApiModels,
         onRunStyleDistill: runStyleDistillTask,
         onRunDeclicheLatest: runSurgicalDeclicheLatestTask,
         onConnectBridge: (url) => {

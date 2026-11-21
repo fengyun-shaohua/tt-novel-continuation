@@ -948,3 +948,66 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     gap: 6px;
     margin-top: 6px;
 }
+
+/* 10. Per-Slice Archive Manager & Custom API Box */
+.tt-novel-slice-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.tt-novel-slice-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.tt-novel-slice-row {
+    padding: 7px 9px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.03);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tt-novel-slice-row.is-bad {
+    border-color: rgba(235, 92, 92, 0.5);
+    background: rgba(235, 82, 82, 0.09);
+}
+
+.tt-novel-slice-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.tt-novel-slice-info {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 0.79rem;
+}
+
+.tt-novel-chip.is-ok {
+    background: rgba(56, 172, 118, 0.25);
+    color: #b5f5d1;
+    font-weight: 600;
+}
+
+.tt-novel-slice-detail > summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.tt-novel-custom-api-box {
+    padding: 9px 10px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.22);
+    border: 1px dashed rgba(212, 163, 89, 0.35);
+}

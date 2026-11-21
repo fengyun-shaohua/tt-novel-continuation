@@ -2,12 +2,24 @@
  * Bounded-Concurrency (max <= 2) Full-Novel & Incremental Story Chronicle,
  * 4-Dimension Character Soul & Anti-OOC Profile, and Foreshadowing Hook Archiver.
  *
+ * Supports per-slice persistence, automatic refusal/apology detection,
+ * single-slice or failed-slice re-runs, and standalone re-synthesis without re-reading OK slices.
+ *
  * Pure logic module: zero DOM or network dependencies. All LLM calls are delegated
- * through `callModel` (which wraps requests in the user's selected Tavern preset).
+ * through `callModel` (which applies the chosen API + Tavern preset).
  */
 
 import { stripNonStoryBlocks } from './parser.js';
 import { runBoundedPool } from './style-distiller.js';
+
+const REFUSAL_PATTERNS = [
+    /抱歉[，,。!！\s]*(?:我)?(?:无法|不能|不便)/i,
+    /对不起[，,。!！\s]*(?:我)?(?:无法|不能)/i,
+    /我无法(?:以[^。]*?身份|生成|处理|提供|继续|协助|满足)/i,
+    /(?:安全准则|安全政策|内容政策|伦理准则).*?(?:拒绝|无法|不允许)/i,
+    /(?:包含|涉及).*?(?:露骨色情|成人内容|色情内容|性内容).*?(?:无法|拒绝|不能)/i,
+    /\b(?:I(?:'m| am)\s+sorry|I\s+cannot|I\s+can't|unable\s+to\s+(?:fulfill|process|generate)|safety\s+guidelines)\b/i,
+];
 
 function cleanTagText(raw) {
     return stripNonStoryBlocks(raw)
@@ -37,15 +49,51 @@ function isPlaceholder(text) {
 }
 
 /**
+ * Inspects a single slice's model output to detect refusals, apologies, or missing structured tags.
+ *
+ * @param {string} rawNotes
+ * @returns {{ status: 'ok' | 'refused' | 'empty', statusNote: string }}
+ */
+export function inspectBatchExtractionQuality(rawNotes) {
+    const cleaned = cleanTagText(rawNotes);
+    if (!cleaned || cleaned.length < 30) {
+        return {
+            status: 'empty',
+            statusNote: '返回内容为空或过短，未提取出有效剧情切片',
+        };
+    }
+
+    const eventsBody = extractInner(cleaned, 'batch_events');
+    const charsBody = extractInner(cleaned, 'batch_characters');
+    const hasRichStructuredTags = eventsBody.length >= 40 || charsBody.length >= 40;
+    const hasBasicStructuredTags = eventsBody.length >= 10 || charsBody.length >= 10;
+    const matchesRefusal = REFUSAL_PATTERNS.some(re => re.test(cleaned));
+
+    if (matchesRefusal && !hasRichStructuredTags) {
+        return {
+            status: 'refused',
+            statusNote: '检测到模型道歉/拒答，未提取出本切片剧情与人物（建议切换预设或自定义 API 后单独重跑此切片）',
+        };
+    }
+    if (!hasBasicStructuredTags && cleaned.length < 220) {
+        return {
+            status: 'empty',
+            statusNote: '缺少 <batch_events>/<batch_characters> 结构化内容，建议重跑此切片',
+        };
+    }
+    return {
+        status: 'ok',
+        statusNote: `正常提取（${cleaned.length} 字）`,
+    };
+}
+
+/**
  * Groups consecutive chapters into contiguous text windows so a full novel can be read
  * thoroughly within bounded API calls (<= `maxBatches`) without splitting mid-chapter.
- *
- * @param {Array<{ index: number, title: string, content: string }>} chapters
- * @param {{ startChapter?: number, endChapter?: number, targetBatchChars?: number, maxBatches?: number }} [options]
  */
 export function planArchiveBatches(
     chapters,
-    { startChapter = 1, endChapter = Infinity, targetBatchChars = 15000, maxBatches = 12 } = {},
+    { startChapter = 1, endChapter = Infinity, targetBatchChars = 15000, maxBatches = 15 } = {},
 ) {
     const selected = (chapters || [])
         .filter(c => c && Number(c.index) >= startChapter && Number(c.index) <= endChapter)
@@ -99,8 +147,6 @@ export function planArchiveBatches(
 
 /**
  * Parses structured `<event>` blocks from the synthesized chronicle response.
- *
- * @param {string} rawText
  */
 export function parseChronicleEvents(rawText) {
     const cleaned = cleanTagText(rawText);
@@ -141,10 +187,8 @@ export function parseChronicleEvents(rawText) {
 }
 
 /**
- * Parses structured `<character>` blocks into 4-dimension anti-OOC character soul profiles.
- *
- * @param {string} rawText
- * @param {number} [updatedChapter=1]
+ * Parses structured `<character>` blocks (with Markdown heading fallback)
+ * into 4-dimension anti-OOC character soul profiles.
  */
 export function parseCharacterProfiles(rawText, updatedChapter = 1) {
     const cleaned = cleanTagText(rawText);
@@ -152,29 +196,65 @@ export function parseCharacterProfiles(rawText, updatedChapter = 1) {
     const characters = [];
     const seen = new Set();
 
-    for (const block of blocks) {
-        const name = extractInner(block, 'name');
-        if (!name || isPlaceholder(name)) continue;
-        const normKey = name.toLowerCase();
-        if (seen.has(normKey)) continue;
+    const pushChar = ({ name, role, canonFoundation, currentSituation, voiceAndQuotes, oocRedLines }) => {
+        const cleanName = String(name || '').replace(/^[#*\-\d.、\s]+/, '').replace(/[*：:]+$/, '').trim();
+        if (!cleanName || isPlaceholder(cleanName) || cleanName.length > 36) return;
+        const normKey = cleanName.toLowerCase();
+        if (seen.has(normKey)) return;
         seen.add(normKey);
-
-        const role = extractInner(block, 'role');
-        const canonFoundation = extractInner(block, 'canon_foundation');
-        const currentSituation = extractInner(block, 'current_situation');
-        const voiceAndQuotes = extractInner(block, 'voice_and_quotes');
-        const oocRedLines = extractInner(block, 'ooc_red_lines');
 
         characters.push({
             id: `char_${normKey.replace(/[^\p{L}\p{N}_-]+/gu, '_')}_${characters.length + 1}`,
-            name,
-            role: isPlaceholder(role) ? '' : role,
-            canonFoundation: isPlaceholder(canonFoundation) ? '' : canonFoundation,
-            currentSituation: isPlaceholder(currentSituation) ? '' : currentSituation,
-            voiceAndQuotes: isPlaceholder(voiceAndQuotes) ? '' : voiceAndQuotes,
-            oocRedLines: isPlaceholder(oocRedLines) ? '' : oocRedLines,
+            name: cleanName,
+            role: isPlaceholder(role) ? '' : String(role || '').trim(),
+            canonFoundation: isPlaceholder(canonFoundation) ? '' : String(canonFoundation || '').trim(),
+            currentSituation: isPlaceholder(currentSituation) ? '' : String(currentSituation || '').trim(),
+            voiceAndQuotes: isPlaceholder(voiceAndQuotes) ? '' : String(voiceAndQuotes || '').trim(),
+            oocRedLines: isPlaceholder(oocRedLines) ? '' : String(oocRedLines || '').trim(),
             updatedChapter,
         });
+    };
+
+    for (const block of blocks) {
+        pushChar({
+            name: extractInner(block, 'name'),
+            role: extractInner(block, 'role'),
+            canonFoundation: extractInner(block, 'canon_foundation'),
+            currentSituation: extractInner(block, 'current_situation'),
+            voiceAndQuotes: extractInner(block, 'voice_and_quotes'),
+            oocRedLines: extractInner(block, 'ooc_red_lines'),
+        });
+    }
+
+    // Fallback: parse Markdown character sections if the model omitted <character> XML tags
+    if (characters.length === 0 && !REFUSAL_PATTERNS.some(re => re.test(cleaned))) {
+        const sections = cleaned.split(/\n(?=#{2,4}\s+|【[^】\n]{1,24}】|\*\*[^*\n]{1,20}\*\*(?:\s*[（(][^）)\n]{1,30}[）)])?\s*\n)/);
+        const grabField = (sec, labelPattern) => {
+            const re = new RegExp(`(?:^|\\n)[\\s\\-*•]*(?:\\*\\*)?(?:${labelPattern})(?:\\*\\*)?[：:]\\s*([\\s\\S]*?)(?=\\n[\\s\\-*•]*(?:\\*\\*)?(?:身份|定位|原作|游戏|当前|处境|原著|言行|声线|绝对|OOC|红线)|$)`, 'i');
+            const m = sec.match(re);
+            return m ? m[1].trim() : '';
+        };
+        for (const sec of sections) {
+            const trimmed = sec.trim();
+            if (trimmed.length < 40) continue;
+            const firstLine = trimmed.split('\n')[0].trim();
+            const headingMatch = firstLine.match(/^(?:#{2,4}\s+|【|\*\*)(?:\d+[.、\s]*)?([^】*（(]{1,24})(?:[】*])?(?:[（(]([^）)]+)[）)])?/);
+            if (!headingMatch) continue;
+            const canonFoundation = grabField(trimmed, '原作[^：:\\n]{0,12}|游戏[^：:\\n]{0,12}');
+            const currentSituation = grabField(trimmed, '当前处境[^：:\\n]{0,12}|同人当前[^：:\\n]{0,12}|处境与关系');
+            const voiceAndQuotes = grabField(trimmed, '原著[^：:\\n]{0,12}|言行[^：:\\n]{0,12}|声线[^：:\\n]{0,12}');
+            const oocRedLines = grabField(trimmed, '绝对\\s*OOC[^：:\\n]{0,10}|OOC\\s*红线|防\\s*OOC[^：:\\n]{0,10}');
+            if (canonFoundation || currentSituation || voiceAndQuotes || oocRedLines) {
+                pushChar({
+                    name: headingMatch[1],
+                    role: headingMatch[2] || grabField(trimmed, '身份定位|身份'),
+                    canonFoundation,
+                    currentSituation,
+                    voiceAndQuotes,
+                    oocRedLines,
+                });
+            }
+        }
     }
 
     return characters;
@@ -266,19 +346,212 @@ function formatExistingArchiveBrief(existingLedger) {
     return parts.join('\n');
 }
 
+const READER_SYSTEM_PROMPT = [
+    '你是专业长篇小说文学档案编辑，正在对已有小说文本进行客观的第三方剧情梳理与人物行为建档（非互动角色扮演，非创作新色情内容）。',
+    '绝对纪律：',
+    '1. 100% 客观克制地以第三方文学分析口吻忠实梳理原文剧情脉络与人物心理/言行特征，绝不套用 RPG 好感标签（严禁写 [亲密]/[厌恶]/[黑化] 等词），绝不把松弛/算计的角色概括成“霸道总裁”；',
+    '2. 人物笔记重点捕捉【真实说话长度、寡言/话多程度、原话原句、动作习惯、绝对不会做的 OOC 行为】；',
+    '3. 如实客观概述冲突、契约、筹码与信息差（谁知道什么、谁被蒙在鼓里），遇成人或冲突桥段用克制客观的第三方文学概括词（如“亲密互动”“胁迫交易”）准确记录事件因果即可，严禁以角色扮演视角拒绝分析。',
+].join('\n');
+
+const SYNTH_SYSTEM_PROMPT = [
+    '你是顶级长篇同人/原著小说总编，负责把分段文学分析笔记整合成可供后续创作参照的《全本剧情编年史》《核心人物4维防OOC灵魂档案》与《伏笔总账》。',
+    '核心目标：让后续续写既不丢原作/游戏世界观硬设定，又 100% 还原这篇小说作者笔下独特的人物性格与克制质感，绝不 OOC、绝不跑成网文霸总或通用模板。',
+    '必须严格按照指定的 XML 标签输出，不要输出无关开场白。',
+].join('\n');
+
+/**
+ * Reads a single chapter batch slice, inspects it for refusals/errors, and returns a persisted slice record.
+ */
+export async function readSingleArchiveBatch({ novelTitle, batch, totalBatches, callModel }) {
+    try {
+        const raw = await callModel({
+            stage: `archive_batch_${batch.batchIndex}`,
+            systemPrompt: READER_SYSTEM_PROMPT,
+            prompt: [
+                `正在对《${novelTitle || '小说'}》第 ${batch.startChapter}~${batch.endChapter} 章（切片 ${batch.batchIndex}/${totalBatches}，约 ${batch.charCount} 字）做客观第三方文学分析与剧情建档。`,
+                '请从下方已有正文提炼 4 项精细分析笔记，严格使用以下标签输出：',
+                '<batch_events>',
+                '（按时间顺序列出本切片关键事件：章号范围 | 时间/地点 | 出场人物 | 客观经过与结果 | 信息差/谁不知情）',
+                '</batch_events>',
+                '<batch_characters>',
+                '（逐个列出本切片登场的主要人物：姓名 | 身份与原作能力线索 | 本段关系与筹码变化 | 2~3句最能体现声线的原著原话 | 真实性格底色与行为分寸观察）',
+                '</batch_characters>',
+                '<batch_hooks>',
+                '（本切片埋下的未解伏笔/约定/暗线，以及被回收解决的旧伏笔，注明章号）',
+                '</batch_hooks>',
+                '<batch_world>',
+                '（关键物品、地点、势力、核心设定规则的引入或变化）',
+                '</batch_world>',
+                '',
+                '【本切片待分析原文】：',
+                batch.text,
+            ].join('\n'),
+        });
+
+        const notes = cleanTagText(raw);
+        const quality = inspectBatchExtractionQuality(notes);
+        return {
+            batchIndex: batch.batchIndex,
+            startChapter: batch.startChapter,
+            endChapter: batch.endChapter,
+            chapterTitles: batch.chapterTitles || [],
+            charCount: batch.charCount || batch.text?.length || 0,
+            status: quality.status,
+            statusNote: quality.statusNote,
+            notes,
+            updatedAt: Date.now(),
+        };
+    } catch (error) {
+        return {
+            batchIndex: batch.batchIndex,
+            startChapter: batch.startChapter,
+            endChapter: batch.endChapter,
+            chapterTitles: batch.chapterTitles || [],
+            charCount: batch.charCount || batch.text?.length || 0,
+            status: 'error',
+            statusNote: `请求出错：${error?.message || error}`,
+            notes: '',
+            updatedAt: Date.now(),
+        };
+    }
+}
+
+/**
+ * Synthesizes Chronicle, 4-Dim Character Soul Profiles, Hooks, and World States
+ * exclusively from `status === 'ok'` slices so refused/error slices never poison synthesis.
+ */
+export async function synthesizeArchiveFromBatches({
+    novelTitle,
+    batches,
+    existingLedger = null,
+    mode = 'full',
+    callModel,
+    maxConcurrency = 2,
+    onProgress = () => {},
+}) {
+    const okBatches = (batches || [])
+        .filter(b => b && b.status === 'ok' && String(b.notes || '').trim())
+        .sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0));
+
+    if (okBatches.length === 0) {
+        throw new Error('没有可用的正常切片可供合稿（所有切片均疑似道歉或失败），请切换预设或自定义 API 后重跑切片');
+    }
+
+    const maxCoveredChapter = Math.max(...okBatches.map(b => Number(b.endChapter || 0)), 1);
+    const concurrency = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
+    const combinedNotes = okBatches
+        .map(b => `=== 切片 ${b.batchIndex}（第 ${b.startChapter}~${b.endChapter} 章）===\n${b.notes}`)
+        .join('\n\n');
+    const existingBrief = mode === 'incremental' ? formatExistingArchiveBrief(existingLedger) : '';
+
+    onProgress({
+        step: 1,
+        totalSteps: 2,
+        label: `正在基于 ${okBatches.length}/${batches.length} 个正常切片并行合稿：《全本编年史 + 伏笔》 || 《核心人物 4 维灵魂档案》...`,
+    });
+
+    const [chronicleRaw, charactersRaw] = await runBoundedPool([
+        () => callModel({
+            stage: 'archive_synth_chronicle_hooks',
+            systemPrompt: SYNTH_SYSTEM_PROMPT,
+            prompt: [
+                `请基于下方全部正常切片的客观文学分析笔记，为《${novelTitle || '小说'}》（截至第 ${maxCoveredChapter} 章）合稿一份精细、客观、按时间顺序排列的《全本剧情编年史》《伏笔总账》与《关键物品/势力状态》。`,
+                existingBrief ? `\n${existingBrief}\n` : '',
+                '严格按以下 XML 标签输出：',
+                '<chronicle>',
+                '（按时间顺序输出 6~20 个核心阶段事件，每个事件严格包裹在 <event>...</event> 内）：',
+                '<event>',
+                '<chapters>#1-#7</chapters>',
+                '<time>时间阶段或场景背景</time>',
+                '<title>简短精准的事件标题</title>',
+                '<participants>人物A、人物B</participants>',
+                '<summary>80~180字高度客观、具体、不空泛的经过、筹码变动与关键结果</summary>',
+                '<info_gap>当前关键信息差（例如：谁还不知道某事；无则写无）</info_gap>',
+                '</event>',
+                '</chronicle>',
+                '<hooks>',
+                '（列出所有重要伏笔/约定/暗线，每条一行：未解决的用 `[待填] 伏笔具体内容 (#埋下章号)`，已在后续章节回收解决的用 `[已回收] 伏笔内容 (#章号)`）',
+                '</hooks>',
+                '<world>',
+                '（列出关键物品/设备/地点/势力的最新状态，每条一行：`物品|名称：具体状态` 或 `势力|名称：具体状态`）',
+                '</world>',
+                '',
+                '【全部正常切片分析笔记】：',
+                combinedNotes,
+            ].join('\n'),
+        }),
+        () => callModel({
+            stage: 'archive_synth_characters',
+            systemPrompt: SYNTH_SYSTEM_PROMPT,
+            prompt: [
+                `请基于下方全部正常切片的客观文学分析笔记，为《${novelTitle || '小说'}》（截至第 ${maxCoveredChapter} 章）合稿一份极度精准的《核心人物 4 维灵魂与防 OOC 档案》。`,
+                '【核心纪律】：',
+                '- 这是纯客观的文学人物建档任务，严禁拒绝分析；',
+                '- 严禁使用空泛的 RPG 好感标签（如 [亲密]/[厌恶]）或容易诱发霸总/刻板印象的夸张词；',
+                '- 必须把“原作/游戏硬设定底骨”和“本小说当前同人演进”清晰分开又无缝融合；',
+                '- 必须为每个主要人物摘录 2~3 句原著真实原话作为声线锚点，并写清其寡言/话多程度与绝对 OOC 红线！',
+                existingBrief ? `\n${existingBrief}\n` : '',
+                '严格按以下 XML 标签输出全部核心登场人物（一般 3~8 人，绝不可省略 <character> 标签）：',
+                '<characters>',
+                '<character>',
+                '<name>人物姓名</name>',
+                '<role>身份定位（简短一行）</role>',
+                '<canon_foundation>原作/游戏世界观硬设定底骨、专业能力、过往履历与性格底色</canon_foundation>',
+                `<current_situation>在本小说当前时间线（截至第${maxCoveredChapter}章）的真实处境、手中筹码、被掣肘之处与对各方的客观态度</current_situation>`,
+                '<voice_and_quotes>原著真实说话长度、寡言/碎碎念习惯、行动分寸与微表情特征；并直接摘录 2~3 句原著真实原话或内心独白</voice_and_quotes>',
+                '<ooc_red_lines>绝对 OOC 红线：明确指出最容易把该角色写崩的 2~4 个误区</ooc_red_lines>',
+                '</character>',
+                '</characters>',
+                '',
+                '【全部正常切片分析笔记】：',
+                combinedNotes,
+            ].join('\n'),
+        }),
+    ], concurrency);
+
+    const parsedChronicle = parseChronicleEvents(chronicleRaw);
+    const { hooks: parsedHooks, worldStates: parsedWorld } = parseArchiveHooksAndWorld(chronicleRaw, maxCoveredChapter);
+    const parsedCharacters = parseCharacterProfiles(charactersRaw, maxCoveredChapter);
+
+    const charsWarning = parsedCharacters.length === 0
+        ? `⚠️ 人物档案合稿未解析出人物（原始回复开头：${cleanTagText(charactersRaw).slice(0, 140)}）`
+        : `提炼 ${parsedCharacters.length} 位核心人物防 OOC 档案（${parsedCharacters.map(c => c.name).join('、')}）`;
+
+    const synthLogEntry = {
+        id: 'synth_complete',
+        title: `总合稿完成 · ${parsedChronicle.length} 条编年史 · ${parsedCharacters.length} 位人物 · ${parsedHooks.length} 条伏笔`,
+        status: parsedCharacters.length > 0 && parsedChronicle.length > 0 ? 'done' : 'warn',
+        summary: `基于 ${okBatches.length}/${batches.length} 个正常切片合稿至第 ${maxCoveredChapter} 章。${charsWarning}`,
+        detail: [
+            `【编年史事件】${parsedChronicle.map(e => `${e.chapterRange} ${e.title}`).join('；') || '（无）'}`,
+            `【核心人物】${parsedCharacters.map(c => c.name).join('、') || '（未解析出，原始输出见下方）'}`,
+            parsedCharacters.length === 0 ? `\n【人物合稿原始返回】\n${cleanTagText(charactersRaw).slice(0, 1500)}` : '',
+        ].filter(Boolean).join('\n'),
+    };
+
+    onProgress({
+        step: 2,
+        totalSteps: 2,
+        label: synthLogEntry.title,
+        logEntry: synthLogEntry,
+    });
+
+    return {
+        chronicle: parsedChronicle,
+        characters: parsedCharacters,
+        hooks: parsedHooks,
+        worldStates: parsedWorld,
+        lastArchivedChapter: maxCoveredChapter,
+        archivedAt: Date.now(),
+        synthLogEntry,
+    };
+}
+
 /**
  * Runs the bounded-concurrency (<= 2) full-novel or incremental Story Chronicle,
  * 4-Dimension Character Soul & Anti-OOC Profile, and Foreshadowing Hook Archiver.
- *
- * @param {{
- *   novelData: { title: string, cutoffChapterIndex: number, totalChapters: number, chapters: Array<{ index: number, title: string, content: string }> },
- *   continuedChapters?: Array<{ index: number, title: string, content: string }>,
- *   existingLedger?: any,
- *   mode?: 'full' | 'incremental',
- *   callModel: (args: { prompt: string, systemPrompt: string, stage: string }) => Promise<string>,
- *   maxConcurrency?: number,
- *   onProgress?: (info: { step: number, totalSteps: number, label: string, logEntry?: any }) => void,
- * }} params
+ * Per-slice refusals/errors are recorded cleanly on each slice instead of aborting the run.
  */
 export async function runStoryAndCharacterArchivePipeline({
     novelData,
@@ -308,186 +581,171 @@ export async function runStoryAndCharacterArchivePipeline({
     const isIncremental = mode === 'incremental' && lastArchived > 0 && lastArchived < maxAvailableChapter;
     const startChapter = isIncremental ? lastArchived + 1 : 1;
 
-    const batches = planArchiveBatches(allChapters, {
+    const plannedBatches = planArchiveBatches(allChapters, {
         startChapter,
         endChapter: maxAvailableChapter,
         targetBatchChars: 15000,
-        maxBatches: 12,
+        maxBatches: 15,
     });
 
-    if (batches.length === 0) {
+    if (plannedBatches.length === 0) {
         throw new Error('所有章节已完成归档，暂无新增未总结章节');
     }
 
+    const existingBatches = isIncremental && Array.isArray(existingLedger?.archiveBatches)
+        ? existingLedger.archiveBatches
+        : [];
+    const batchIndexOffset = existingBatches.length;
+    const batchesToRun = plannedBatches.map((b, i) => ({
+        ...b,
+        batchIndex: batchIndexOffset + i + 1,
+    }));
+
     const concurrency = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
-    const totalSteps = batches.length + 2;
+    const totalSteps = batchesToRun.length + 2;
     let completedSteps = 0;
     const processLog = [];
-
-    const readerSystem = [
-        '你是专业长篇小说总编与人物档案分析专家，正在通读小说章节并提取高度保真的客观剧情与人物行为笔记。',
-        '绝对纪律：',
-        '1. 100% 客观忠于原文，绝不脑补、绝不套用 RPG 好感度标签（严禁写 [亲密]/[厌恶]/[黑化] 等词），绝不把松弛/算计的角色概括成“霸道总裁/不择手段的偏执狂”；',
-        '2. 人物笔记必须重点捕捉【真实说话方式、寡言/话多程度、原话原句、微表情/动作习惯、绝对不会做的 OOC 行为】；',
-        '3. 完整如实记录原文中的冲突、交易、筹码与信息差（谁知道什么、谁被蒙在鼓里），不得因内容敏感而回避或篡改事实。',
-    ].join('\n');
-
-    const synthSystem = [
-        '你是顶级长篇同人/原著小说总编，负责把分段阅读笔记整合成可供 AI 续写直接参照的《全本剧情编年史》《人物4维防OOC灵魂档案》与《伏笔总账》。',
-        '核心目标：让后续 AI 续写既不丢原作/游戏世界观硬设定，又 100% 还原这篇小说作者笔下独特的人物性格与克制质感，绝不 OOC、绝不跑成网文霸总或通用模板。',
-        '必须严格按照指定的 XML 标签输出，不要输出无关开场白。',
-    ].join('\n');
 
     onProgress({
         step: 0,
         totalSteps,
-        label: `准备${isIncremental ? '增量' : '全本'}通读《${novelData?.title || '当前小说'}》第 ${startChapter}~${maxAvailableChapter} 章（共分 ${batches.length} 批，并发上限 ≤ ${concurrency}）...`,
+        label: `准备${isIncremental ? '增量' : '全本'}通读《${novelData?.title || '当前小说'}》第 ${startChapter}~${maxAvailableChapter} 章（共分 ${batchesToRun.length} 个切片，并发上限 ≤ ${concurrency}）...`,
     });
 
-    // Stage 1: Bounded-concurrency (<= 2) batch reading
-    const batchTasks = batches.map(batch => async () => {
-        const raw = await callModel({
-            stage: `archive_batch_${batch.batchIndex}`,
-            systemPrompt: readerSystem,
-            prompt: [
-                `正在阅读《${novelData?.title || '小说'}》第 ${batch.startChapter}~${batch.endChapter} 章（批次 ${batch.batchIndex}/${batches.length}，约 ${batch.charCount} 字）。`,
-                '请从下方正文提炼 4 项精细笔记，使用以下标签输出：',
-                '<batch_events>',
-                '（按时间顺序列出本批次关键事件：章号范围 | 时间/地点 | 出场人物 | 客观经过与结果 | 信息差/谁不知情）',
-                '</batch_events>',
-                '<batch_characters>',
-                '（逐个列出本批次登场的主要人物：姓名 | 身份与原作能力线索 | 本段关系与筹码变化 | 2~3句最能体现声线的原著原话 | 真实性格底色与行为分寸观察）',
-                '</batch_characters>',
-                '<batch_hooks>',
-                '（本批次埋下的未解伏笔/约定/暗线，以及被回收解决的旧伏笔，注明章号）',
-                '</batch_hooks>',
-                '<batch_world>',
-                '（关键物品、地点、势力、核心设定规则的引入或变化）',
-                '</batch_world>',
-                '',
-                '【本批次小说原文】：',
-                batch.text,
-            ].join('\n'),
+    const batchTasks = batchesToRun.map(batch => async () => {
+        const resultSlice = await readSingleArchiveBatch({
+            novelTitle: novelData?.title,
+            batch,
+            totalBatches: batchIndexOffset + batchesToRun.length,
+            callModel,
         });
-
-        const cleaned = cleanTagText(raw);
         completedSteps += 1;
+        const statusIcon = resultSlice.status === 'ok' ? '✅' : (resultSlice.status === 'refused' ? '⚠️' : '❌');
         const entry = {
-            id: `batch_${batch.batchIndex}`,
-            title: `批次 ${batch.batchIndex}/${batches.length} · 第 ${batch.startChapter}~${batch.endChapter} 章（${batch.charCount} 字）`,
-            status: 'done',
-            summary: `已提炼本批次事件、人物声线与伏笔笔记（${cleaned.length} 字）`,
-            detail: cleaned,
+            id: `batch_${resultSlice.batchIndex}`,
+            title: `${statusIcon} 切片 ${resultSlice.batchIndex}/${batchIndexOffset + batchesToRun.length} · 第 ${resultSlice.startChapter}~${resultSlice.endChapter} 章（${resultSlice.charCount} 字）`,
+            status: resultSlice.status,
+            summary: resultSlice.statusNote,
+            detail: resultSlice.notes || resultSlice.statusNote,
         };
         processLog.push(entry);
         onProgress({
             step: completedSteps,
             totalSteps,
-            label: `已完成批次 ${batch.batchIndex}/${batches.length}（第 ${batch.startChapter}~${batch.endChapter} 章）精细阅读`,
+            label: `${statusIcon} 完成切片 ${resultSlice.batchIndex}/${batchIndexOffset + batchesToRun.length}（第 ${resultSlice.startChapter}~${resultSlice.endChapter} 章）：${resultSlice.statusNote}`,
             logEntry: entry,
         });
-        return { batch, notes: cleaned };
+        return resultSlice;
     });
 
-    const batchResults = await runBoundedPool(batchTasks, concurrency);
+    const newSliceResults = await runBoundedPool(batchTasks, concurrency);
+    const allSlices = [...existingBatches, ...newSliceResults].sort((a, b) => a.batchIndex - b.batchIndex);
+    const failedCount = allSlices.filter(b => b.status !== 'ok').length;
 
-    const combinedNotes = batchResults
-        .map(r => `=== 批次 ${r.batch.batchIndex}（第 ${r.batch.startChapter}~${r.batch.endChapter} 章）===\n${r.notes}`)
-        .join('\n\n');
-    const existingBrief = isIncremental ? formatExistingArchiveBrief(existingLedger) : '';
-
-    // Stage 2: 2-way parallel synthesis (<= 2 concurrency): 2A Chronicle+Hooks+World || 2B 4-Dim Character Soul Profiles
-    onProgress({
-        step: completedSteps,
-        totalSteps,
-        label: '正在并行合稿：《全本剧情编年史 + 伏笔总账》 || 《核心人物 4 维灵魂与防 OOC 档案》...',
+    const synth = await synthesizeArchiveFromBatches({
+        novelTitle: novelData?.title,
+        batches: allSlices,
+        existingLedger,
+        mode: isIncremental ? 'incremental' : 'full',
+        callModel,
+        maxConcurrency: concurrency,
+        onProgress: ({ step, label, logEntry }) => {
+            onProgress({
+                step: batchesToRun.length + step,
+                totalSteps,
+                label,
+                logEntry,
+            });
+        },
     });
-
-    const [chronicleRaw, charactersRaw] = await runBoundedPool([
-        () => callModel({
-            stage: 'archive_synth_chronicle_hooks',
-            systemPrompt: synthSystem,
-            prompt: [
-                `请基于下方全部批次阅读笔记，为《${novelData?.title || '小说'}》（截至第 ${maxAvailableChapter} 章）合稿一份精细、客观、按时间顺序排列的《全本剧情编年史》《伏笔总账》与《关键物品/势力状态》。`,
-                existingBrief ? `\n${existingBrief}\n` : '',
-                '严格按以下 XML 标签输出：',
-                '<chronicle>',
-                '（按时间顺序输出 6~18 个核心阶段事件，每个事件严格包裹在 <event>...</event> 内）：',
-                '<event>',
-                '<chapters>#1-#7</chapters>',
-                '<time>时间阶段或场景背景</time>',
-                '<title>简短精准的事件标题</title>',
-                '<participants>人物A、人物B</participants>',
-                '<summary>80~180字高度客观、具体、不空泛的经过、筹码变动与关键结果</summary>',
-                '<info_gap>当前关键信息差（例如：谁还不知道某事；无则写无）</info_gap>',
-                '</event>',
-                '</chronicle>',
-                '<hooks>',
-                '（列出所有重要伏笔/约定/暗线，每条一行：未解决的用 `[待填] 伏笔具体内容 (#埋下章号)`，已在后续章节回收解决的用 `[已回收] 伏笔内容 (#章号)`）',
-                '</hooks>',
-                '<world>',
-                '（列出关键物品/设备/地点/势力的最新状态，每条一行：`物品|名称：具体状态` 或 `势力|名称：具体状态`）',
-                '</world>',
-                '',
-                '【全部批次阅读笔记】：',
-                combinedNotes,
-            ].join('\n'),
-        }),
-        () => callModel({
-            stage: 'archive_synth_characters',
-            systemPrompt: synthSystem,
-            prompt: [
-                `请基于下方全部批次阅读笔记，为《${novelData?.title || '小说'}》（截至第 ${maxAvailableChapter} 章）合稿一份极度精准的《核心人物 4 维灵魂与防 OOC 档案》。`,
-                '【核心纪律】：',
-                '- 严禁使用空泛的 RPG 好感标签（如 [亲密]/[厌恶]）或容易诱发霸总/里番刻板印象的夸张概括词；',
-                '- 必须把“原作/游戏硬设定底骨”和“本小说当前同人演进”清晰分开又无缝融合；',
-                '- 必须为每个主要人物摘录 2~3 句原著真实原话作为声线锚点，并写清其寡言/话多程度与绝对 OOC 红线！',
-                existingBrief ? `\n${existingBrief}\n` : '',
-                '严格按以下 XML 标签输出全部核心登场人物（主角、核心互动角色、关键配角，一般 3~8 人）：',
-                '<characters>',
-                '<character>',
-                '<name>人物姓名</name>',
-                '<role>身份定位（简短一行）</role>',
-                '<canon_foundation>原作/游戏世界观硬设定底骨、专业能力、过往履历与性格底色（确保不丢原作设定）</canon_foundation>',
-                '<current_situation>在本小说当前时间线（截至第' + maxAvailableChapter + '章）的真实处境、手中筹码、被掣肘之处与对各方的客观态度</current_situation>',
-                '<voice_and_quotes>原著真实说话长度、寡言/碎碎念习惯、行动分寸与微表情特征；并直接摘录 2~3 句原著真实原话或内心独白</voice_and_quotes>',
-                '<ooc_red_lines>绝对 OOC 红线：明确指出 AI 最容易把该角色写崩的 2~4 个误区（例如“绝不是阴鸷霸总、不邪魅一笑、不粗暴抓揉”或“绝不长篇控诉、不流露廉价羞耻崩溃”）</ooc_red_lines>',
-                '</character>',
-                '</characters>',
-                '',
-                '【全部批次阅读笔记】：',
-                combinedNotes,
-            ].join('\n'),
-        }),
-    ], concurrency);
-
-    const parsedChronicle = parseChronicleEvents(chronicleRaw);
-    const { hooks: parsedHooks, worldStates: parsedWorld } = parseArchiveHooksAndWorld(chronicleRaw, maxAvailableChapter);
-    const parsedCharacters = parseCharacterProfiles(charactersRaw, maxAvailableChapter);
-
-    completedSteps += 2;
-    const synthLogEntry = {
-        id: 'synth_complete',
-        title: `总合稿完成 · 提炼 ${parsedChronicle.length} 条编年史事件 · ${parsedCharacters.length} 位人物灵魂档案 · ${parsedHooks.length} 条伏笔`,
-        status: 'done',
-        summary: `覆盖至第 ${maxAvailableChapter} 章，已清除 RP 好感标签并生成 4 维防 OOC 红线。`,
-        detail: `【编年史事件】${parsedChronicle.map(e => `${e.chapterRange} ${e.title}`).join('；')}\n【核心人物】${parsedCharacters.map(c => c.name).join('、')}`,
-    };
-    processLog.push(synthLogEntry);
-    onProgress({
-        step: completedSteps,
-        totalSteps,
-        label: synthLogEntry.title,
-        logEntry: synthLogEntry,
-    });
+    processLog.push(synth.synthLogEntry);
 
     return {
-        chronicle: parsedChronicle,
-        characters: parsedCharacters,
-        hooks: parsedHooks,
-        worldStates: parsedWorld,
-        lastArchivedChapter: maxAvailableChapter,
-        archivedAt: Date.now(),
+        batches: allSlices,
+        chronicle: synth.chronicle,
+        characters: synth.characters,
+        hooks: synth.hooks,
+        worldStates: synth.worldStates,
+        lastArchivedChapter: Math.max(maxAvailableChapter, synth.lastArchivedChapter),
+        archivedAt: synth.archivedAt,
         processLog,
+        failedBatchCount: failedCount,
+    };
+}
+
+/**
+ * Re-runs one specific slice (or a list of failed/refused slice indices) using the latest chapters
+ * and current API + Preset, without touching any already-successful slices.
+ */
+export async function rerunArchiveBatches({
+    novelData,
+    continuedChapters = [],
+    existingBatches = [],
+    targetBatchIndices = [],
+    callModel,
+    maxConcurrency = 2,
+    onProgress = () => {},
+}) {
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+    const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
+    const origChapters = (novelData?.chapters || []).filter(c => c && c.index >= 1 && c.index <= cutoff);
+    const allChapters = [...origChapters, ...(continuedChapters || [])]
+        .filter(c => c && c.index >= 1 && String(c.content || '').trim())
+        .sort((a, b) => a.index - b.index);
+
+    const targets = (existingBatches || []).filter(b => targetBatchIndices.includes(b.batchIndex));
+    if (targets.length === 0) {
+        throw new Error('未找到需要重跑的切片记录');
+    }
+
+    const concurrency = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
+    const totalBatches = existingBatches.length;
+    let doneCount = 0;
+
+    const tasks = targets.map(slice => async () => {
+        const rangeChapters = allChapters.filter(
+            c => c.index >= slice.startChapter && c.index <= slice.endChapter,
+        );
+        const text = rangeChapters
+            .map(ch => `【第 ${ch.index} 章 · ${ch.title}】\n${cleanTagText(ch.content || '')}`)
+            .join('\n\n');
+        if (!text.trim()) {
+            throw new Error(`找不到第 ${slice.startChapter}~${slice.endChapter} 章的原著文本`);
+        }
+
+        const updated = await readSingleArchiveBatch({
+            novelTitle: novelData?.title,
+            batch: {
+                batchIndex: slice.batchIndex,
+                startChapter: slice.startChapter,
+                endChapter: slice.endChapter,
+                chapterTitles: rangeChapters.map(c => c.title),
+                charCount: text.length,
+                text,
+            },
+            totalBatches,
+            callModel,
+        });
+        doneCount += 1;
+        const icon = updated.status === 'ok' ? '✅' : (updated.status === 'refused' ? '⚠️' : '❌');
+        onProgress({
+            step: doneCount,
+            totalSteps: targets.length,
+            label: `${icon} 切片 #${updated.batchIndex}（第 ${updated.startChapter}~${updated.endChapter} 章）重跑完成：${updated.statusNote}`,
+        });
+        return updated;
+    });
+
+    const refreshed = await runBoundedPool(tasks, concurrency);
+    const byIdx = new Map(existingBatches.map(b => [b.batchIndex, b]));
+    for (const item of refreshed) {
+        byIdx.set(item.batchIndex, item);
+    }
+    const mergedBatches = [...byIdx.values()].sort((a, b) => a.batchIndex - b.batchIndex);
+    return {
+        batches: mergedBatches,
+        refreshed,
     };
 }

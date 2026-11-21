@@ -300,12 +300,15 @@ function renderWorkbench() {
    TAB 1: 📚 剧情与人物 (LittleWhiteBox-Style Structured Memory Dashboard)
    ========================================================================== */
 function renderMemoryTab(bodyEl) {
-    const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], worldStates: [], summaries: [] };
+    const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], worldStates: [], summaries: [], archiveBatches: [] };
     const chars = ledger.characters || [];
     const chronicle = ledger.chronicle || [];
     const hooks = ledger.hooks || [];
     const worldStates = ledger.worldStates || [];
     const summaries = ledger.summaries || [];
+    const batches = ledger.archiveBatches || [];
+    const failedBatches = batches.filter(b => b.status !== 'ok');
+    const okBatchCount = batches.length - failedBatches.length;
     const openHooks = hooks.filter(h => h.status !== 'resolved');
     const resolvedHooks = hooks.filter(h => h.status === 'resolved');
     const task = liveTaskState.memory;
@@ -315,10 +318,56 @@ function renderMemoryTab(bodyEl) {
         ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
         : '';
 
+    const failedRangeText = failedBatches.map(b => `第${b.startChapter}~${b.endChapter}章`).join('、');
+    const sliceManagerHtml = batches.length > 0
+        ? `
+        <details class="tt-novel-fold-card tt-novel-slice-box" ${(failedBatches.length > 0 || ledger.archiveNeedsResynth) ? 'open' : ''}>
+            <summary>
+                🧩 分批切片管理（共 ${batches.length} 片 · ✅ ${okBatchCount} 正常${failedBatches.length > 0 ? ` · ⚠️ ${failedBatches.length} 道歉/失败` : ''}）
+            </summary>
+            <div class="tt-novel-slice-body">
+                ${failedBatches.length > 0 ? `<div class="tt-novel-banner is-warn">⚠️ 以下切片疑似模型道歉或失败，尚未纳入总账：<b>${escapeHtml(failedRangeText)}</b>。可直接在下方点「🔄 重跑此切片」，或去「⚙️ 设置」换自定义 API / 调整预设后再重跑！</div>` : ''}
+                ${ledger.archiveNeedsResynth ? '<div class="tt-novel-banner is-running">💡 已有切片完成重跑更新，请点击下方「🔁 用当前切片重新合稿总账」将新内容合并进编年史与人物卡。</div>' : ''}
+                <div class="tt-novel-action-bar">
+                    ${failedBatches.length > 0 ? `<button type="button" id="tt-novel-rerun-failed-slices" class="menu_button tt-novel-btn-sm tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>⚡ 一键重跑全部失败切片 (${failedBatches.length})</button>` : ''}
+                    <button type="button" id="tt-novel-resynth-slices" class="menu_button tt-novel-btn-sm ${(ledger.archiveNeedsResynth || chars.length === 0) ? 'tt-novel-btn-primary' : ''}" ${task.running || okBatchCount === 0 ? 'disabled' : ''}>
+                        🔁 用当前正常切片重新合稿总账（不重读原文）
+                    </button>
+                </div>
+                <div class="tt-novel-slice-list">
+                    ${batches.map(b => {
+                        const isOk = b.status === 'ok';
+                        const isRefused = b.status === 'refused';
+                        const chipClass = isOk ? 'is-ok' : 'is-danger';
+                        const statusText = isOk ? '✅ 正常' : (isRefused ? '⚠️ 疑似道歉' : '❌ 异常');
+                        return `
+                            <div class="tt-novel-slice-row ${isOk ? '' : 'is-bad'}">
+                                <div class="tt-novel-slice-head">
+                                    <div class="tt-novel-slice-info">
+                                        <span class="tt-novel-chip ${chipClass}">${statusText}</span>
+                                        <strong>切片 #${b.batchIndex} · 第 ${b.startChapter}~${b.endChapter} 章</strong>
+                                        <span class="tt-novel-muted">${b.charCount ? `${b.charCount}字` : ''}</span>
+                                    </div>
+                                    <button type="button" class="menu_button tt-novel-btn-sm" data-action="rerun-slice" data-batch="${b.batchIndex}" ${task.running ? 'disabled' : ''}>
+                                        🔄 重跑此切片
+                                    </button>
+                                </div>
+                                <details class="tt-novel-slice-detail">
+                                    <summary class="tt-novel-muted">${escapeHtml(b.statusNote || '查看切片笔记')}</summary>
+                                    <pre class="tt-novel-pre">${escapeHtml(b.notes || b.statusNote || '（空）')}</pre>
+                                </details>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            </div>
+        </details>`
+        : '';
+
     const logHtml = processLogs.length > 0
         ? `
         <details class="tt-novel-fold-card" ${task.running ? 'open' : ''}>
-            <summary>🔬 查看全本通读与归档过程日志（${processLogs.length} 条记录）</summary>
+            <summary>🔬 查看合稿与运行日志（${processLogs.length} 条记录）</summary>
             <div class="tt-novel-log-list">
                 ${processLogs.map(item => `
                     <details class="tt-novel-step-item">
@@ -467,6 +516,7 @@ function renderMemoryTab(bodyEl) {
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'world' ? 'active' : ''}" data-filter="world">🌍 状态 (${worldStates.length + summaries.length})</button>
         </div>
         ${progressHtml}
+        ${sliceManagerHtml}
         ${logHtml}
         ${showChars ? `<section class="tt-novel-section"><div class="tt-novel-section-title">👤 核心人物 4 维灵魂与防 OOC 档案（已归档至第 ${ledger.lastArchivedChapter || 0} 章）</div><div class="tt-novel-card-grid">${charCardsHtml}</div></section>` : ''}
         ${showChronicle ? `<section class="tt-novel-section"><div class="tt-novel-section-title">📜 全本剧情编年史（无 RP 标签 · 保留信息差）</div><div class="tt-novel-card-stack">${chronicleHtml}</div></section>` : ''}
@@ -476,6 +526,14 @@ function renderMemoryTab(bodyEl) {
 
     bodyEl.querySelector('#tt-novel-run-archive-full')?.addEventListener('click', () => handlers.onRunArchive?.('full'));
     bodyEl.querySelector('#tt-novel-run-archive-inc')?.addEventListener('click', () => handlers.onRunArchive?.('incremental'));
+    bodyEl.querySelector('#tt-novel-rerun-failed-slices')?.addEventListener('click', () => handlers.onRerunFailedArchiveBatches?.());
+    bodyEl.querySelector('#tt-novel-resynth-slices')?.addEventListener('click', () => handlers.onResynthArchive?.());
+    bodyEl.querySelectorAll('[data-action="rerun-slice"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const idx = Number(btn.getAttribute('data-batch'));
+            if (idx > 0) handlers.onRerunArchiveBatch?.(idx);
+        });
+    });
     bodyEl.querySelectorAll('.tt-novel-filter-pill').forEach(btn => {
         btn.addEventListener('click', () => {
             memoryFilter = btn.getAttribute('data-filter') || 'all';
@@ -1020,6 +1078,10 @@ function renderSettingsTab(bodyEl) {
     const savedPreset = String(settings.distillPresetName ?? '__current__');
     const icon = lastBridgeUi.state === 'connected' ? '🟢' : (lastBridgeUi.state === 'connecting' ? '🟡' : (lastBridgeUi.state === 'error' ? '🔴' : '⚪'));
 
+    const isCustomApi = settings.bgApiMode === 'custom';
+    const cachedModels = Array.isArray(settings.bgCustomApiModelsCache) ? settings.bgCustomApiModelsCache : [];
+    const customModelVal = String(settings.bgCustomApiModel || '');
+
     const presetOptions = [
         `<option value="__current__" ${savedPreset === '__current__' ? 'selected' : ''}>使用当前酒馆预设${meta.activePresetName ? `（${escapeHtml(meta.activePresetName)}）` : ''}</option>`,
         `<option value="" ${savedPreset === '' ? 'selected' : ''}>不使用预设（纯净直连）</option>`,
@@ -1028,6 +1090,15 @@ function renderSettingsTab(bodyEl) {
     if (savedPreset && savedPreset !== '__current__' && !presetNames.includes(savedPreset)) {
         presetOptions.push(`<option value="${escapeHtml(savedPreset)}" selected>${escapeHtml(savedPreset)}（未找到）</option>`);
     }
+
+    const modelOptionsHtml = cachedModels.length > 0
+        ? `
+            <select id="tt-novel-wb-custom-model-select" class="text_pole">
+                <option value="">-- 从已拉取列表快速选模型（${cachedModels.length}个）--</option>
+                ${cachedModels.map(m => `<option value="${escapeHtml(m)}" ${m === customModelVal ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+            </select>
+        `
+        : '';
 
     bodyEl.innerHTML = `
         <section class="tt-novel-section tt-novel-card">
@@ -1050,10 +1121,42 @@ function renderSettingsTab(bodyEl) {
         </section>
 
         <section class="tt-novel-section tt-novel-card">
-            <div class="tt-novel-section-title">🎛️ 模型与防拒答预设配置</div>
-            <div class="tt-novel-muted">当前酒馆模型：<code>${escapeHtml(meta.activeModel || '当前酒馆已连接模型')}</code></div>
+            <div class="tt-novel-section-title">🎛️ 后台任务 API 来源与防拒答预设（蒸馏 / 剧情人物总结 / 去八股共用）</div>
             <div class="tt-novel-inline-field">
-                <span>蒸馏 / 剧情人物总结 / 去八股精修 共用酒馆预设：</span>
+                <span>API 来源选择：</span>
+                <select id="tt-novel-wb-api-mode" class="text_pole" style="max-width: 240px;">
+                    <option value="tavern" ${!isCustomApi ? 'selected' : ''}>酒馆当前 API（${escapeHtml(meta.tavernModel || '跟随顶部连接')}）</option>
+                    <option value="custom" ${isCustomApi ? 'selected' : ''}>自定义 OpenAI 兼容 API（独立配置）</option>
+                </select>
+            </div>
+            ${isCustomApi ? `
+                <div class="tt-novel-custom-api-box">
+                    <div class="tt-novel-edit-grid">
+                        <label>Base URL（OpenAI 兼容接口根地址，如 https://api.xxx.com/v1）：
+                            <input type="text" id="tt-novel-wb-custom-url" class="text_pole" placeholder="https://api.example.com/v1" value="${escapeHtml(settings.bgCustomApiUrl || '')}" />
+                        </label>
+                        <label>API Key（通过酒馆本地后端转发，无跨域限制）：
+                            <div class="tt-novel-bridge-row">
+                                <input type="password" id="tt-novel-wb-custom-key" class="text_pole" placeholder="sk-..." value="${escapeHtml(settings.bgCustomApiKey || '')}" />
+                                <button type="button" id="tt-novel-wb-toggle-key" class="menu_button tt-novel-btn-sm" title="显示/隐藏 Key">👁️</button>
+                            </div>
+                        </label>
+                        <label>模型名称（可点右侧按钮自动拉取，也可直接手填）：
+                            <div class="tt-novel-bridge-row">
+                                <input type="text" id="tt-novel-wb-custom-model" class="text_pole" placeholder="例如 gemini-2.5-pro / deepseek-chat" value="${escapeHtml(customModelVal)}" />
+                                <button type="button" id="tt-novel-wb-fetch-models" class="menu_button tt-novel-btn-sm">🔄 拉取模型</button>
+                            </div>
+                        </label>
+                        ${modelOptionsHtml}
+                        <div class="tt-novel-inline-field">
+                            <span>温度 Temperature (0.0 ~ 1.5)：</span>
+                            <input type="number" id="tt-novel-wb-custom-temp" class="text_pole" min="0" max="1.5" step="0.1" value="${Number(settings.bgCustomTemperature ?? 0.7)}" style="width: 78px;" />
+                        </div>
+                    </div>
+                </div>
+            ` : `<div class="tt-novel-muted">当前酒馆模型：<code>${escapeHtml(meta.tavernModel || '当前酒馆已连接模型')}</code>（不影响正常聊天续写）</div>`}
+            <div class="tt-novel-inline-field">
+                <span>共用酒馆预设（套用预设或选纯净直连）：</span>
                 <select id="tt-novel-wb-preset-select" class="text_pole" style="max-width: 240px;">${presetOptions.join('')}</select>
             </div>
             <div class="tt-novel-inline-field">
@@ -1097,6 +1200,58 @@ function renderSettingsTab(bodyEl) {
     });
     bodyEl.querySelector('#tt-novel-wb-clear-canon')?.addEventListener('click', () => handlers.onClearCanon?.());
     bodyEl.querySelector('#tt-novel-wb-clear-all')?.addEventListener('click', () => handlers.onClearAll?.());
+
+    bodyEl.querySelector('#tt-novel-wb-api-mode')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('bgApiMode', e.target.value === 'custom' ? 'custom' : 'tavern');
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-wb-custom-url')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('bgCustomApiUrl', String(e.target.value || '').trim());
+    });
+    bodyEl.querySelector('#tt-novel-wb-custom-key')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('bgCustomApiKey', String(e.target.value || '').trim());
+    });
+    bodyEl.querySelector('#tt-novel-wb-toggle-key')?.addEventListener('click', () => {
+        const keyInput = bodyEl.querySelector('#tt-novel-wb-custom-key');
+        if (keyInput) keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+    });
+    bodyEl.querySelector('#tt-novel-wb-custom-model')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('bgCustomApiModel', String(e.target.value || '').trim());
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-wb-custom-model-select')?.addEventListener('change', (e) => {
+        const picked = String(e.target.value || '').trim();
+        if (!picked) return;
+        handlers.onUpdateSetting?.('bgCustomApiModel', picked);
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-wb-custom-temp')?.addEventListener('change', (e) => {
+        const t = Math.max(0, Math.min(1.5, Number(e.target.value)));
+        handlers.onUpdateSetting?.('bgCustomTemperature', Number.isFinite(t) ? t : 0.7);
+    });
+    bodyEl.querySelector('#tt-novel-wb-fetch-models')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const urlInput = bodyEl.querySelector('#tt-novel-wb-custom-url');
+        const keyInput = bodyEl.querySelector('#tt-novel-wb-custom-key');
+        if (urlInput) handlers.onUpdateSetting?.('bgCustomApiUrl', String(urlInput.value || '').trim());
+        if (keyInput) handlers.onUpdateSetting?.('bgCustomApiKey', String(keyInput.value || '').trim());
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ 拉取中...';
+        try {
+            const list = await handlers.onFetchCustomModels?.();
+            if (Array.isArray(list) && list.length > 0) {
+                globalThis.toastr?.success?.(`已拉取到 ${list.length} 个模型，可在下方下拉框选择！`, '小说续写阅读器');
+            } else {
+                globalThis.toastr?.warning?.('接口已连上，但未返回模型列表，可直接手动填写模型名', '小说续写阅读器');
+            }
+        } catch (err) {
+            globalThis.toastr?.error?.(`拉取模型失败：${err?.message || err}`, '小说续写阅读器');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+    });
 
     bodyEl.querySelector('#tt-novel-wb-preset-select')?.addEventListener('change', (e) => {
         handlers.onUpdateSetting?.('distillPresetName', String(e.target.value ?? ''));

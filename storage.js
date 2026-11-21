@@ -13,7 +13,7 @@ export const EXTENSION_NAMESPACE = 'novel-continuation';
 const KEY_NOVEL_DATA = 'novel_data_v1';
 const KEY_LEDGER = 'timeline_ledger_v1';
 const KEY_CANON_DB = 'canon_db_v1';
-const GLOBAL_FALLBACK_SCOPE = 'global_default_scope';
+const CHAT_SCOPE_META_KEY = 'novelContinuationScopeId';
 
 const memoryStoreCache = new Map();
 
@@ -33,39 +33,69 @@ export function createEmptyCanonDb() {
     };
 }
 
-/**
- * Resolves a persistent scope identifier that survives exiting/re-entering a blank character card.
- * Prioritizes the character's stable `avatar` filename (or `groupId`), falling back to `GLOBAL_FALLBACK_SCOPE`
- * so importing on a blank character card or welcome screen never loses data when chat filenames change.
- */
-export function getPersistentScopeKey() {
-    const context = getContext();
-    const chid = context?.characterId;
-    const character = (chid !== undefined && chid !== null && Array.isArray(context?.characters))
-        ? context.characters[chid]
-        : null;
-
-    const rawScope = String(
-        character?.avatar
-        || context?.groupId
-        || (context?.name2 && context.name2 !== 'SillyTavern System' ? context.name2 : '')
-        || GLOBAL_FALLBACK_SCOPE,
-    ).trim();
-
+function hashToScopeKey(rawScope) {
     let hash = 2166136261;
     for (let i = 0; i < rawScope.length; i += 1) {
         hash ^= rawScope.charCodeAt(i);
         hash = Math.imul(hash, 16777619);
     }
     const hex = (hash >>> 0).toString(16).padStart(8, '0');
-    const asciiPrefix = rawScope.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'scope';
-    return `${asciiPrefix}_${hex}`;
+    const asciiPrefix = rawScope.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'chat';
+    return `chat_${asciiPrefix}_${hex}`;
 }
 
 /**
- * Resolves the TauriTavern `api.extension.store` adapter.
- * Also supports falling back to the global scope if the user imported a novel on the welcome screen
- * and then switched into a blank character card.
+ * Resolves a strict per-conversation (对话级) scope key stored in `context.chatMetadata.novelContinuationScopeId`
+ * and/or derived from the current conversation's `chatId`.
+ * Different chats under the same character card are 100% isolated and never share or leak novels.
+ *
+ * @param {{ createIfMissing?: boolean }} [options]
+ * @returns {string | null}
+ */
+export function getPersistentScopeKey({ createIfMissing = false } = {}) {
+    const context = getContext();
+    if (!context) return null;
+
+    const existingMetaScope = String(context.chatMetadata?.[CHAT_SCOPE_META_KEY] || '').trim();
+    if (existingMetaScope) {
+        return existingMetaScope;
+    }
+
+    const rawChatId = String(context.chatId || context.getCurrentChatId?.() || '').trim();
+    const hasActiveConversation = Boolean(
+        rawChatId
+        || context.groupId
+        || (context.characterId !== undefined && context.characterId !== null),
+    );
+    if (!hasActiveConversation) {
+        return null;
+    }
+
+    if (rawChatId) {
+        const scopeKey = hashToScopeKey(rawChatId);
+        if (createIfMissing && context.chatMetadata) {
+            context.chatMetadata[CHAT_SCOPE_META_KEY] = scopeKey;
+            context.chatMetadata.tainted = true;
+            context.saveMetadataDebounced?.();
+        }
+        return scopeKey;
+    }
+
+    if (!createIfMissing) {
+        return null;
+    }
+
+    const generated = `chat_uid_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    if (context.chatMetadata) {
+        context.chatMetadata[CHAT_SCOPE_META_KEY] = generated;
+        context.chatMetadata.tainted = true;
+        context.saveMetadataDebounced?.();
+    }
+    return generated;
+}
+
+/**
+ * Resolves the TauriTavern `api.extension.store` adapter strictly scoped to the current conversation.
  */
 function getExtensionStoreAdapter() {
     const extStore = globalThis.__TAURITAVERN__?.api?.extension?.store;
@@ -75,7 +105,8 @@ function getExtensionStoreAdapter() {
 
     return {
         async get(key) {
-            const scope = getPersistentScopeKey();
+            const scope = getPersistentScopeKey({ createIfMissing: false });
+            if (!scope) return null;
             const primaryKey = makeKey(scope, key);
             if (memoryStoreCache.has(primaryKey)) {
                 return memoryStoreCache.get(primaryKey);
@@ -90,26 +121,16 @@ function getExtensionStoreAdapter() {
                     memoryStoreCache.set(primaryKey, res.value);
                     return res.value;
                 }
-                // Fallback: check global latest novel if current blank character has none yet
-                const fallbackKey = makeKey(GLOBAL_FALLBACK_SCOPE, key);
-                if (scope !== GLOBAL_FALLBACK_SCOPE) {
-                    const fallbackRes = await extStore.tryGetJson({
-                        namespace: EXTENSION_NAMESPACE,
-                        table: 'chat_scoped',
-                        key: fallbackKey,
-                    });
-                    if (fallbackRes?.found && fallbackRes.value) {
-                        memoryStoreCache.set(primaryKey, fallbackRes.value);
-                        return fallbackRes.value;
-                    }
-                }
                 return null;
             } catch {
                 return null;
             }
         },
         async set(key, value) {
-            const scope = getPersistentScopeKey();
+            const scope = getPersistentScopeKey({ createIfMissing: true });
+            if (!scope) {
+                throw new Error('当前未打开具体对话，请先进入一个角色卡对话后再保存小说数据');
+            }
             const primaryKey = makeKey(scope, key);
             memoryStoreCache.set(primaryKey, value);
             await extStore.setJson({
@@ -118,30 +139,30 @@ function getExtensionStoreAdapter() {
                 key: primaryKey,
                 value,
             });
-            // Also mirror to global fallback scope so switching from welcome screen or blank card keeps it accessible
-            const fallbackKey = makeKey(GLOBAL_FALLBACK_SCOPE, key);
-            memoryStoreCache.set(fallbackKey, value);
-            await extStore.setJson({
-                namespace: EXTENSION_NAMESPACE,
-                table: 'chat_scoped',
-                key: fallbackKey,
-                value,
-            });
+            const context = getContext();
+            if (context?.chatMetadata) {
+                context.chatMetadata[CHAT_SCOPE_META_KEY] = scope;
+                context.chatMetadata.tainted = true;
+                try {
+                    await context.saveMetadata?.();
+                } catch {
+                    context.saveMetadataDebounced?.();
+                }
+            }
         },
         async remove(key) {
-            const scope = getPersistentScopeKey();
-            for (const s of new Set([scope, GLOBAL_FALLBACK_SCOPE])) {
-                const k = makeKey(s, key);
-                memoryStoreCache.delete(k);
-                try {
-                    await extStore.deleteJson({
-                        namespace: EXTENSION_NAMESPACE,
-                        table: 'chat_scoped',
-                        key: k,
-                    });
-                } catch {
-                    // Ignore
-                }
+            const scope = getPersistentScopeKey({ createIfMissing: false });
+            if (!scope) return;
+            const k = makeKey(scope, key);
+            memoryStoreCache.delete(k);
+            try {
+                await extStore.deleteJson({
+                    namespace: EXTENSION_NAMESPACE,
+                    table: 'chat_scoped',
+                    key: k,
+                });
+            } catch {
+                // Ignore
             }
         },
     };

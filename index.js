@@ -389,7 +389,11 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
         context.chat.push(floor);
     }
 
+    if (context.chatMetadata) {
+        context.chatMetadata.tainted = true;
+    }
     try {
+        await context.saveMetadata?.();
         await context.saveChat?.();
     } catch {
         // Ignore save errors on temporary welcome screen
@@ -742,20 +746,36 @@ function bindSettingsEvents(wrapper) {
     wrapper.querySelector('#tt-novel-import-txt')?.addEventListener('change', async (e) => {
         const file = e.target.files?.[0];
         if (!file) return;
-        const novelData = parseNovelTxt(await file.text(), file.name);
-        if (novelData.totalChapters === 0) {
-            globalThis.toastr?.warning?.('未能在文件中解析出有效文本内容', '小说续写阅读器');
-            return;
+        try {
+            const context = getContext();
+            const hasActiveConversation = Boolean(
+                context?.chatId
+                || context?.getCurrentChatId?.()
+                || context?.groupId
+                || (context?.characterId !== undefined && context?.characterId !== null),
+            );
+            if (!hasActiveConversation) {
+                globalThis.toastr?.warning?.('请先打开一个角色卡并进入具体对话后再导入小说（小说数据按对话独立绑定）', '小说续写阅读器');
+                return;
+            }
+            const novelData = parseNovelTxt(await file.text(), file.name);
+            if (novelData.totalChapters === 0) {
+                globalThis.toastr?.warning?.('未能在文件中解析出有效文本内容', '小说续写阅读器');
+                return;
+            }
+            await saveNovelData(novelData);
+            await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex);
+            await refreshReaderWidgets();
+            await refreshSettingsStatusCard();
+            globalThis.toastr?.success?.(
+                `已绑定当前对话并导入《${novelData.title}》（共 ${novelData.totalChapters} 章，#1~#${novelData.totalChapters} 一一对应）！`,
+                '小说续写阅读器',
+            );
+        } catch (err) {
+            globalThis.toastr?.error?.(`导入失败：${err?.message || err}`, '小说续写阅读器');
+        } finally {
+            e.target.value = '';
         }
-        await saveNovelData(novelData);
-        await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex);
-        await refreshReaderWidgets();
-        await refreshSettingsStatusCard();
-        globalThis.toastr?.success?.(
-            `已导入《${novelData.title}》（共 ${novelData.totalChapters} 章），全部章节已按 #1~#${novelData.totalChapters} 一一对应铺入当前聊天！`,
-            '小说续写阅读器',
-        );
-        e.target.value = '';
     });
 
     wrapper.querySelector('#tt-novel-import-canon')?.addEventListener('change', async (e) => {

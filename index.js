@@ -1,5 +1,6 @@
 import { extension_settings, getContext } from '/scripts/extensions.js';
 import { extension_prompt_roles, extension_prompt_types } from '/scripts/extension-prompts.js';
+import { resetChatSurfaceView } from '/script.js';
 import { escapeHtml } from '/scripts/utils.js';
 import { buildSingleCallContinuationContext, resolveCurrentTargetChapterIndex } from './context-assembler.js';
 import { extractNovelStateBlock, parseNovelTxt, parseSupplementaryDatabase } from './parser.js';
@@ -299,6 +300,13 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
         await context.saveChat?.();
     } catch {
         // Ignore save errors on temporary welcome screen
+    }
+    // Reset TauriTavern's mounted floor ID cache before printMessages() so newly added chapters
+    // beyond the previous chat's floor count (e.g. floors #9..#17 after an 8-floor chat) are all rendered!
+    try {
+        resetChatSurfaceView?.({ includeAuxiliary: true });
+    } catch {
+        // Ignore if surface is not yet initialized
     }
     await context.printMessages?.();
     applyReaderBodyClasses(settings);

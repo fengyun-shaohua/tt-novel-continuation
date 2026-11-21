@@ -1,6 +1,6 @@
 import { escapeHtml, debounce } from '/scripts/utils.js';
 import { getContext } from '/scripts/extensions.js';
-import { isBoundedChatSurfaceView, jumpBoundedChatSurfaceToMessage } from '/script.js';
+import { isBoundedChatSurfaceView, jumpBoundedChatSurfaceToMessage, resetChatSurfaceView } from '/script.js';
 import { isContinuedNovelFloor } from './context-assembler.js';
 import { loadLedger, loadNovelData, saveLedger } from './storage.js';
 
@@ -108,13 +108,15 @@ function mountQuickBar(settings) {
     });
     bar.querySelector('#tt-novel-btn-prev-ch')?.addEventListener('click', async () => {
         if (!cachedNovelData?.totalChapters) return;
-        const curr = Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
+        const curr = getCurrentVisibleOriginalChapterIndex()
+            || Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
         const target = Math.max(1, curr - 1);
         await onViewChapterCallback?.(target);
     });
     bar.querySelector('#tt-novel-btn-next-ch')?.addEventListener('click', async () => {
         if (!cachedNovelData?.totalChapters) return;
-        const curr = Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
+        const curr = getCurrentVisibleOriginalChapterIndex()
+            || Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
         const target = Math.min(cachedNovelData.totalChapters, curr + 1);
         await onViewChapterCallback?.(target);
     });
@@ -485,8 +487,32 @@ function openOriginalChapterPreview(chapterIndex) {
 }
 
 /**
+ * Returns the original chapter index currently visible near the top of `#chat`, or null if none.
+ * @returns {number | null}
+ */
+function getCurrentVisibleOriginalChapterIndex() {
+    const chatEl = document.getElementById('chat');
+    const chat = getContext()?.chat;
+    if (!chatEl || !Array.isArray(chat)) return null;
+
+    const rect = chatEl.getBoundingClientRect();
+    const probeY = rect.top + Math.min(140, rect.height * 0.25);
+    const blocks = chatEl.querySelectorAll('.mes:not([is_user="true"])');
+    for (const block of blocks) {
+        const bRect = block.getBoundingClientRect();
+        if (bRect.top <= probeY && bRect.bottom >= rect.top + 8) {
+            const mesId = Number(block.getAttribute('mesid'));
+            const origIdx = Number(chat[mesId]?.extra?.novelChapterIndex);
+            if (origIdx > 0) return origIdx;
+        }
+    }
+    return null;
+}
+
+/**
  * Scrolls `#chat` to the specified message floor index, using TauriTavern's native
- * `jumpBoundedChatSurfaceToMessage` when BoundedChatSurface virtualization is active.
+ * `jumpBoundedChatSurfaceToMessage` when BoundedChatSurface virtualization is active,
+ * and self-healing if classic mode missed mounting newly added floors.
  * @param {number} floorIndex
  */
 export async function scrollToChatFloor(floorIndex) {
@@ -514,13 +540,33 @@ export async function scrollToChatFloor(floorIndex) {
         await new Promise(resolve => setTimeout(resolve, 20));
     }
 
-    targetMes = chatEl.querySelector(`.mes[mesid="${floorIndex}"]`) || targetMes;
-    if (targetMes) {
-        targetMes.scrollIntoView({ behavior: 'auto', block: 'start' });
-        targetMes.classList.add('tt-novel-flash-highlight');
-        setTimeout(() => targetMes.classList.remove('tt-novel-flash-highlight'), 1600);
-        saveReadingProgress(floorIndex);
+    // Self-heal if floor exists in context.chat but wasn't mounted in DOM (e.g. stale mountedIds cache)
+    const context = getContext();
+    if (!chatEl.querySelector(`.mes[mesid="${floorIndex}"]`) && Array.isArray(context?.chat) && floorIndex < context.chat.length) {
+        try {
+            resetChatSurfaceView?.({ includeAuxiliary: true });
+            await context.printMessages?.();
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        } catch (err) {
+            console.warn('[小说续写阅读器] 自愈重绘聊天楼层失败：', err);
+        }
     }
+
+    const alignFloor = () => {
+        const mes = chatEl.querySelector(`.mes[mesid="${floorIndex}"]`) || targetMes;
+        if (!mes) return false;
+        const chatRect = chatEl.getBoundingClientRect();
+        const mesRect = mes.getBoundingClientRect();
+        chatEl.scrollTop = Math.max(0, chatEl.scrollTop + (mesRect.top - chatRect.top) - 8);
+        mes.classList.add('tt-novel-flash-highlight');
+        setTimeout(() => mes.classList.remove('tt-novel-flash-highlight'), 1600);
+        saveReadingProgress(floorIndex);
+        return true;
+    };
+
+    alignFloor();
+    // Re-assert after TauriTavern's 200ms scrollOnMediaLoad delay
+    setTimeout(() => alignFloor(), 240);
 }
 
 async function jumpToCutoffBoundary() {

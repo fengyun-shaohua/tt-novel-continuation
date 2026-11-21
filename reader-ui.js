@@ -12,12 +12,13 @@ let onCutoffCallback = null;
 let onSettingChangeCallback = null;
 
 /**
- * Applies or removes the body CSS classes for Immersive Novel Mode and Hide User Floors.
- * @param {{ immersiveMode?: boolean, hideUserFloors?: boolean }} settings
+ * Applies or removes the body CSS classes for Immersive Novel Mode, Hide User Floors, and Hide Reasoning.
+ * @param {{ immersiveMode?: boolean, hideUserFloors?: boolean, hideReasoning?: boolean }} settings
  */
 export function applyReaderBodyClasses(settings) {
     document.body.classList.toggle('tt-novel-immersive', Boolean(settings?.immersiveMode));
     document.body.classList.toggle('tt-novel-hide-user-floors', Boolean(settings?.hideUserFloors));
+    document.body.classList.toggle('tt-novel-hide-cot', settings?.hideReasoning !== false);
     syncQuickBarState(settings);
 }
 
@@ -50,6 +51,9 @@ function mountQuickBar(settings) {
             <button type="button" id="tt-novel-btn-hide-user" class="tt-novel-pill" title="隐藏所有用户指令楼层，让原著与续写正文无缝相连">
                 <i class="fa-solid fa-eye-slash"></i> <span>隐藏指令</span>
             </button>
+            <button type="button" id="tt-novel-btn-hide-cot" class="tt-novel-pill" title="隐藏 AI 思考批注与预设思维链折叠框">
+                <i class="fa-solid fa-brain"></i> <span>隐藏思维链</span>
+            </button>
             <button type="button" id="tt-novel-btn-toc" class="tt-novel-pill tt-novel-pill-accent" title="打开章节目录、进度跳转与截断重续抽屉">
                 <i class="fa-solid fa-list-ul"></i> <span id="tt-novel-toc-badge">章节目录</span>
             </button>
@@ -65,6 +69,9 @@ function mountQuickBar(settings) {
     bar.querySelector('#tt-novel-btn-hide-user')?.addEventListener('click', () => {
         onSettingChangeCallback?.('hideUserFloors');
     });
+    bar.querySelector('#tt-novel-btn-hide-cot')?.addEventListener('click', () => {
+        onSettingChangeCallback?.('hideReasoning');
+    });
     bar.querySelector('#tt-novel-btn-toc')?.addEventListener('click', () => {
         toggleTocDrawer();
     });
@@ -75,11 +82,15 @@ function mountQuickBar(settings) {
 export function syncQuickBarState(settings) {
     const btnImmersive = document.getElementById('tt-novel-btn-immersive');
     const btnHideUser = document.getElementById('tt-novel-btn-hide-user');
+    const btnHideCot = document.getElementById('tt-novel-btn-hide-cot');
     if (btnImmersive) {
         btnImmersive.classList.toggle('active', Boolean(settings?.immersiveMode));
     }
     if (btnHideUser) {
         btnHideUser.classList.toggle('active', Boolean(settings?.hideUserFloors));
+    }
+    if (btnHideCot) {
+        btnHideCot.classList.toggle('active', settings?.hideReasoning !== false);
     }
 }
 

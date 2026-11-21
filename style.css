@@ -37,11 +37,25 @@ body.tt-novel-immersive #chat .mes[is_user="true"] + .mes[is_user="false"]::befo
 }
 
 body.tt-novel-immersive #chat .mes[is_user="false"] .mesAvatarWrapper,
-body.tt-novel-immersive #chat .mes[is_user="false"] .ch_name .name_text,
+body.tt-novel-immersive #chat .mes[is_user="false"] .ch_name,
 body.tt-novel-immersive #chat .mes[is_user="false"] .timestamp,
 body.tt-novel-immersive #chat .mes[is_user="false"] .mesIDDisplay,
 body.tt-novel-immersive #chat .mes[is_user="false"] .mes_timer,
 body.tt-novel-immersive #chat .mes[is_user="false"] .tokenCounterDisplay {
+    display: none !important;
+}
+
+/* Keep edit confirmation buttons visible if the user is actively editing a floor */
+body.tt-novel-immersive #chat .mes[is_user="false"]:has(textarea) .ch_name {
+    display: flex !important;
+}
+
+/* Hide AI reasoning / Chain-of-Thought blocks (both native reasoning & preset regex <details> capsules) */
+body.tt-novel-hide-cot #chat .mes .mes_reasoning_details,
+body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text details,
+body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text think,
+body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text thinking,
+body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text cot {
     display: none !important;
 }
 
@@ -50,28 +64,9 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_block {
     width: 100% !important;
 }
 
-/* Hover-to-reveal chapter action buttons & swipe controls */
-body.tt-novel-immersive #chat .mes[is_user="false"] .ch_name {
-    position: absolute;
-    top: 6px;
-    right: 16px;
-    z-index: 5;
-    margin: 0 !important;
-    opacity: 0;
-    transition: opacity 0.2s ease;
-}
-
-body.tt-novel-immersive #chat .mes[is_user="false"]:hover .ch_name,
-body.tt-novel-immersive #chat .mes[is_user="false"]:focus-within .ch_name {
-    opacity: 0.92;
-}
-
 @media (hover: none), (max-width: 768px) {
     body.tt-novel-immersive #chat .mes[is_user="false"] {
         padding: 10px 14px 22px 14px !important;
-    }
-    body.tt-novel-immersive #chat .mes[is_user="false"] .ch_name {
-        opacity: 0.48;
     }
 }
 

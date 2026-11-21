@@ -31,6 +31,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     immersiveMode: true,
     hideUserFloors: true,
+    hideReasoning: true,
     enableAutoStateBlock: true,
     syncToWorldInfo: true,
     mountAnchorChapters: 3,
@@ -330,6 +331,10 @@ function mountSettingsPanel() {
                 <span>自动隐藏所有「用户指令楼层」（让原著与续写章节无缝相连）</span>
             </label>
             <label class="checkbox_label">
+                <input type="checkbox" id="tt-novel-chk-hide-cot" ${settings.hideReasoning !== false ? 'checked' : ''} />
+                <span>自动隐藏「AI 思维链与思考批注框」（隐藏思考批注及预设折叠思维链）</span>
+            </label>
+            <label class="checkbox_label">
                 <input type="checkbox" id="tt-novel-chk-autostate" ${settings.enableAutoStateBlock ? 'checked' : ''} />
                 <span>单次生成末尾顺带产出总结、人物状态与伏笔更新（0 额外 API 调用）</span>
             </label>
@@ -408,6 +413,7 @@ function bindSettingsEvents(wrapper) {
     bindCheckbox('#tt-novel-chk-enabled', 'enabled');
     bindCheckbox('#tt-novel-chk-immersive', 'immersiveMode');
     bindCheckbox('#tt-novel-chk-hide-user', 'hideUserFloors');
+    bindCheckbox('#tt-novel-chk-hide-cot', 'hideReasoning');
     bindCheckbox('#tt-novel-chk-autostate', 'enableAutoStateBlock');
     bindCheckbox('#tt-novel-chk-sync-wi', 'syncToWorldInfo');
 
@@ -452,7 +458,11 @@ function handleToggleSetting(key) {
     settings[key] = !settings[key];
     saveExtensionSettings();
     applyReaderBodyClasses(settings);
-    const chkMap = { immersiveMode: '#tt-novel-chk-immersive', hideUserFloors: '#tt-novel-chk-hide-user' };
+    const chkMap = {
+        immersiveMode: '#tt-novel-chk-immersive',
+        hideUserFloors: '#tt-novel-chk-hide-user',
+        hideReasoning: '#tt-novel-chk-hide-cot',
+    };
     const chk = document.querySelector(chkMap[key]);
     if (chk) chk.checked = settings[key];
 }

@@ -1,6 +1,6 @@
 import { extension_settings, getContext } from '/scripts/extensions.js';
 import { extension_prompt_roles, extension_prompt_types } from '/scripts/extension-prompts.js';
-import { resetChatSurfaceView } from '/script.js';
+import { deleteMessage, resetChatSurfaceView } from '/script.js';
 import { escapeHtml } from '/scripts/utils.js';
 import { buildSingleCallContinuationContext, resolveCurrentTargetChapterIndex } from './context-assembler.js';
 import { extractNovelStateBlock, parseNovelTxt, parseSupplementaryDatabase } from './parser.js';
@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     hideUserFloors: true,
     hideReasoning: true,
     authorMode: true,
+    foldUserOutlineFloors: true,
     enableAutoStateBlock: true,
     syncToWorldInfo: true,
     mountAnchorChapters: 3,
@@ -110,6 +111,23 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
             if (settings.authorMode !== false) {
                 // Suppress Tavern Persona Description injection during novel generation
                 context?.setExtensionPrompt?.('PERSONA_DESCRIPTION', '', extension_prompt_types.NONE, 0);
+
+                // If swiping/regenerating a chapter whose preceding user outline floor was folded,
+                // restore its archived `novelAuthorOutline` into the temporary `coreChat` prompt copy!
+                if (Array.isArray(chat) && (type === 'swipe' || type === 'regenerate')) {
+                    const lastInLiveChat = Array.isArray(context?.chat) ? context.chat[context.chat.length - 1] : null;
+                    const archivedOutline = String(lastInLiveChat?.extra?.novelAuthorOutline || '').trim();
+                    const coreEndsWithUser = chat.length > 0 && Boolean(chat[chat.length - 1]?.is_user);
+                    if (archivedOutline && !coreEndsWithUser) {
+                        chat.push({
+                            name: context?.name1 || '作者',
+                            is_user: true,
+                            is_system: false,
+                            mes: archivedOutline,
+                        });
+                    }
+                }
+
                 // Wrap user outline inputs in the temporary `coreChat` copy as Author/Director instructions
                 if (Array.isArray(chat)) {
                     for (const msg of chat) {
@@ -139,6 +157,47 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
 };
 
 /**
+ * After TauriTavern finishes finalizing/saving a newly generated AI chapter floor,
+ * archives the immediately preceding user outline message into `msgRef.extra.novelAuthorOutline`
+ * and removes that temporary user floor via `deleteMessage()` so Floor `#N` remains strictly
+ * 1-to-1 aligned with Chapter `N` even across unlimited AI continuations.
+ *
+ * @param {any} msgRef
+ */
+function scheduleFoldPrecedingUserOutlineFloor(msgRef) {
+    setTimeout(async () => {
+        const settings = getSettings();
+        if (!settings.enabled || settings.authorMode === false || settings.foldUserOutlineFloors === false) return;
+
+        const context = getContext();
+        const chat = context?.chat;
+        if (!Array.isArray(chat)) return;
+
+        const currentIdx = chat.indexOf(msgRef);
+        if (currentIdx < 1) return;
+        if (!String(msgRef?.mes || '').trim()) return;
+
+        const prevMsg = chat[currentIdx - 1];
+        if (!prevMsg?.is_user) return;
+
+        const novelData = await loadNovelData();
+        if (!novelData?.chapters?.length) return;
+
+        msgRef.extra = msgRef.extra || {};
+        if (typeof prevMsg.mes === 'string' && prevMsg.mes.trim()) {
+            msgRef.extra.novelAuthorOutline = prevMsg.mes.trim();
+        }
+
+        try {
+            await deleteMessage(currentIdx - 1, undefined, false);
+            await refreshReaderWidgets();
+        } catch (err) {
+            console.warn('[小说续写阅读器] 自动折叠用户大纲楼层失败：', err);
+        }
+    }, 260);
+}
+
+/**
  * Strips `<novel_state>...</novel_state>` after a single-call chapter generation completes,
  * keeping the visible novel text pure and updating the local timeline ledger + World Info.
  */
@@ -163,10 +222,20 @@ async function onMessageReceived(messageId, type) {
         || Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData, true));
     msg.extra.novelChapterIndex = chapterIndex;
 
+    const shouldFoldUserOutline = Boolean(
+        novelData?.chapters?.length
+        && settings.authorMode !== false
+        && settings.foldUserOutlineFloors !== false
+        && type !== 'continue',
+    );
+
     const extracted = extractNovelStateBlock(msg.mes);
     if (!extracted.hasState) {
         await context.saveChat?.();
         await refreshReaderWidgets();
+        if (shouldFoldUserOutline) {
+            scheduleFoldPrecedingUserOutlineFloor(msg);
+        }
         return;
     }
 
@@ -204,6 +273,10 @@ async function onMessageReceived(messageId, type) {
 
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
+
+    if (shouldFoldUserOutline) {
+        scheduleFoldPrecedingUserOutlineFloor(msg);
+    }
 }
 
 async function onMessageSwiped(messageId) {
@@ -528,6 +601,10 @@ function mountSettingsPanel() {
                 <span>开启「✍️ 作者境界」（屏蔽酒馆玩家 {{user}} 人设与 RP 规则，将输入自动转为导演大纲）</span>
             </label>
             <label class="checkbox_label">
+                <input type="checkbox" id="tt-novel-chk-fold-user" ${settings.foldUserOutlineFloors !== false ? 'checked' : ''} />
+                <span>续写完成后自动折叠「用户大纲楼层」（大纲归档进该章元数据，让楼层号与章节号永远 1:1 严格对应）</span>
+            </label>
+            <label class="checkbox_label">
                 <input type="checkbox" id="tt-novel-chk-autostate" ${settings.enableAutoStateBlock ? 'checked' : ''} />
                 <span>单次生成末尾顺带产出总结、人物状态与伏笔更新（0 额外 API 调用）</span>
             </label>
@@ -621,6 +698,7 @@ function bindSettingsEvents(wrapper) {
     bindCheckbox('#tt-novel-chk-hide-user', 'hideUserFloors');
     bindCheckbox('#tt-novel-chk-hide-cot', 'hideReasoning');
     bindCheckbox('#tt-novel-chk-author-mode', 'authorMode');
+    bindCheckbox('#tt-novel-chk-fold-user', 'foldUserOutlineFloors');
     bindCheckbox('#tt-novel-chk-autostate', 'enableAutoStateBlock');
     bindCheckbox('#tt-novel-chk-sync-wi', 'syncToWorldInfo');
 

@@ -13,7 +13,10 @@ let cachedNovelData = null;
 let cachedLedger = null;
 let onCutoffCallback = null;
 let onViewChapterCallback = null;
+let onUnlockEarlierCallback = null;
+let onUnlockLaterCallback = null;
 let onSettingChangeCallback = null;
+let lastAutoUnlockTime = 0;
 
 /**
  * Applies or removes the body CSS classes for Immersive Novel Mode, Hide User Floors, and Hide Reasoning.
@@ -40,9 +43,18 @@ export function applyReaderBodyClasses(settings) {
 /**
  * Mounts the above-input quick bar and right-edge floating TOC drawer.
  */
-export function mountReaderUi({ settings, onToggleSetting, onCutoffFromChapter, onViewChapter }) {
+export function mountReaderUi({
+    settings,
+    onToggleSetting,
+    onCutoffFromChapter,
+    onViewChapter,
+    onUnlockEarlier,
+    onUnlockLater,
+}) {
     onCutoffCallback = onCutoffFromChapter;
     onViewChapterCallback = onViewChapter;
+    onUnlockEarlierCallback = onUnlockEarlier;
+    onUnlockLaterCallback = onUnlockLater;
     onSettingChangeCallback = onToggleSetting;
 
     mountQuickBar(settings);
@@ -145,9 +157,83 @@ export async function refreshReaderWidgets() {
         }
     }
 
+    syncPullUnlockBanners(novelData);
     renderQuickBarHooks(ledger);
     if (drawerOpen) {
         renderTocDrawerBody();
+    }
+}
+
+/**
+ * Mounts or updates the top ("⬆️ 上滑解锁前序章节") and bottom ("⬇️ 下滑加载后续章节")
+ * unlock banners inside `#chat` so only ~3 chapters are shown initially and earlier
+ * pre-cutoff chapters unlock on scroll-up / pull-down / tap.
+ */
+export function syncPullUnlockBanners(novelData = cachedNovelData) {
+    const chatEl = document.getElementById('chat');
+    if (!chatEl) return;
+
+    document.getElementById('tt-novel-pull-unlock-top')?.remove();
+    document.getElementById('tt-novel-pull-unlock-bottom')?.remove();
+
+    const chat = getContext()?.chat || [];
+    if (!novelData?.chapters?.length || !Array.isArray(chat) || chat.length === 0) return;
+
+    const cutoff = Number(novelData.cutoffChapterIndex || novelData.totalChapters || 1);
+    let minMounted = Infinity;
+    let maxMounted = -Infinity;
+    let lastOrigFloorIdx = -1;
+
+    chat.forEach((msg, idx) => {
+        if (msg?.extra?.novelContinuationOrigin === 'original') {
+            const chIdx = Number(msg.extra?.novelChapterIndex);
+            if (chIdx > 0) {
+                if (chIdx < minMounted) minMounted = chIdx;
+                if (chIdx > maxMounted) maxMounted = chIdx;
+                lastOrigFloorIdx = idx;
+            }
+        }
+    });
+
+    if (!Number.isFinite(minMounted)) return;
+
+    if (minMounted > 1) {
+        const prevStart = Math.max(1, minMounted - 3);
+        const prevEnd = minMounted - 1;
+        const remainCount = minMounted - 1;
+        const topBanner = document.createElement('div');
+        topBanner.id = 'tt-novel-pull-unlock-top';
+        topBanner.className = 'tt-novel-unlock-banner tt-novel-unlock-top';
+        topBanner.innerHTML = `
+            <span class="tt-novel-unlock-icon">⬆️</span>
+            <span>上滑到顶或点此，解锁前序章节（第 <b>${prevStart}${prevStart !== prevEnd ? `~${prevEnd}` : ''}</b> 章 · 前面共 ${remainCount} 章已导入原著）</span>
+        `;
+        topBanner.addEventListener('click', () => {
+            onUnlockEarlierCallback?.(3);
+        });
+        chatEl.prepend(topBanner);
+    }
+
+    if (maxMounted < cutoff) {
+        const nextStart = maxMounted + 1;
+        const nextEnd = Math.min(cutoff, maxMounted + 3);
+        const remainAfter = cutoff - maxMounted;
+        const bottomBanner = document.createElement('div');
+        bottomBanner.id = 'tt-novel-pull-unlock-bottom';
+        bottomBanner.className = 'tt-novel-unlock-banner tt-novel-unlock-bottom';
+        bottomBanner.innerHTML = `
+            <span class="tt-novel-unlock-icon">⬇️</span>
+            <span>下滑或点此，继续展开后续原著章节（第 <b>${nextStart}${nextStart !== nextEnd ? `~${nextEnd}` : ''}</b> 章 · 距夺舍点第 ${cutoff} 章还有 ${remainAfter} 章）</span>
+        `;
+        bottomBanner.addEventListener('click', () => {
+            onUnlockLaterCallback?.(3);
+        });
+        const lastOrigMes = chatEl.querySelector(`.mes[mesid="${lastOrigFloorIdx}"]`);
+        if (lastOrigMes && lastOrigMes.nextSibling) {
+            chatEl.insertBefore(bottomBanner, lastOrigMes.nextSibling);
+        } else {
+            chatEl.appendChild(bottomBanner);
+        }
     }
 }
 
@@ -317,7 +403,11 @@ function renderTocDrawerBody() {
 
     if (novel?.chapters?.length) {
         const cutoff = novel.cutoffChapterIndex || novel.totalChapters;
-        rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（共 ${novel.totalChapters} 章，当前接续自第 ${cutoff} 章）</div>`);
+        const mountedChapters = [...originalFloorByChapter.keys()].sort((a, b) => a - b);
+        const mountedRangeText = mountedChapters.length > 0
+            ? `当前画面展开第 ${mountedChapters[0]}~${mountedChapters[mountedChapters.length - 1]} 章，上滑自动解锁前文`
+            : '点选任意章节即可观看';
+        rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（已导入夺舍点前 1~${cutoff} 章 / 共 ${novel.totalChapters} 章 · ${mountedRangeText}）</div>`);
 
         let visibleChapters = novel.chapters;
         if (filterText) {
@@ -348,18 +438,26 @@ function renderTocDrawerBody() {
 
         for (const ch of visibleChapters) {
             const mountedFloor = originalFloorByChapter.get(ch.index);
+            const isMounted = mountedFloor !== undefined;
             const isCutoff = ch.index === cutoff;
             const isAfterCutoff = ch.index > cutoff;
+            const tagClass = isAfterCutoff ? 'masked' : (isCutoff ? 'cutoff' : (isMounted ? 'mounted' : 'orig'));
+            const tagText = isAfterCutoff ? '已屏蔽' : (isCutoff ? '夺舍点' : (isMounted ? '已展开' : '待解锁'));
             rows.push(`
-                <div class="tt-novel-toc-item ${isCutoff ? 'is-cutoff' : ''} ${isAfterCutoff ? 'is-masked' : ''}" data-orig-index="${ch.index}">
-                    <div class="tt-novel-toc-item-main" data-action="view-orig" data-orig-index="${ch.index}">
-                        <span class="tt-novel-toc-tag ${isAfterCutoff ? 'masked' : 'orig'}">${isAfterCutoff ? '已屏蔽' : (isCutoff ? '断更点' : '原著')}</span>
+                <div class="tt-novel-toc-item ${isCutoff ? 'is-cutoff' : ''} ${isAfterCutoff ? 'is-masked' : ''} ${isMounted ? 'is-mounted' : ''}" data-orig-index="${ch.index}">
+                    <div class="tt-novel-toc-item-main" data-action="view-orig" data-orig-index="${ch.index}" title="点击直接在主屏幕阅读第 ${ch.index} 章">
+                        <span class="tt-novel-toc-tag ${tagClass}">${tagText}</span>
                         <span class="tt-novel-toc-name">${escapeHtml(ch.title)}</span>
-                        <span class="tt-novel-toc-meta">${mountedFloor !== undefined ? `#${mountedFloor}` : `${ch.wordCount}字`}</span>
+                        <span class="tt-novel-toc-meta">${isMounted ? `#${mountedFloor}` : `${ch.wordCount}字`}</span>
                     </div>
-                    <button type="button" class="tt-novel-cutoff-btn" data-action="cutoff-here" data-orig-index="${ch.index}" title="从此章截断重续：将第 ${ch.index} 章设为新的终点并铺入聊天，自动屏蔽第 ${ch.index + 1} 章及之后的原著剧情">
-                        ✂️ 从此重续
-                    </button>
+                    <div class="tt-novel-toc-actions">
+                        <button type="button" class="tt-novel-view-btn" data-action="view-orig" data-orig-index="${ch.index}" title="在主阅读界面观看第 ${ch.index} 章">
+                            👁️ 阅读本章
+                        </button>
+                        <button type="button" class="tt-novel-cutoff-btn" data-action="cutoff-here" data-orig-index="${ch.index}" title="从此章夺舍重续：导入第 1~${ch.index} 章（默认显示最近3章，上滑解锁前文），并自动屏蔽第 ${ch.index + 1} 章及之后的原著剧情">
+                            ✂️ 从此夺舍
+                        </button>
+                    </div>
                 </div>
             `);
         }
@@ -469,6 +567,9 @@ export async function scrollToChatFloor(floorIndex) {
     const chatEl = document.getElementById('chat');
     if (!chatEl || !Number.isFinite(floorIndex) || floorIndex < 0) return;
 
+    // Wait 2 animation frames so TauriTavern's printMessages() requestAnimationFrame scrollChatToBottom finishes first
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
     let guard = 0;
     while (!chatEl.querySelector(`.mes[mesid="${floorIndex}"]`) && guard < 25) {
         const showMoreBtn = document.getElementById('show_more_messages');
@@ -478,13 +579,23 @@ export async function scrollToChatFloor(floorIndex) {
         await new Promise(resolve => setTimeout(resolve, 20));
     }
 
-    const targetMes = chatEl.querySelector(`.mes[mesid="${floorIndex}"]`);
-    if (targetMes) {
-        targetMes.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const alignToFloor = () => {
+        const targetMes = chatEl.querySelector(`.mes[mesid="${floorIndex}"]`);
+        if (!targetMes) return false;
+        const chatRect = chatEl.getBoundingClientRect();
+        const mesRect = targetMes.getBoundingClientRect();
+        // Leave a 44px buffer below the top of #chat so pulling up doesn't immediately trigger top-unlock
+        chatEl.scrollTop = Math.max(20, chatEl.scrollTop + (mesRect.top - chatRect.top) - 36);
         targetMes.classList.add('tt-novel-flash-highlight');
         setTimeout(() => targetMes.classList.remove('tt-novel-flash-highlight'), 1600);
         saveReadingProgress(floorIndex);
-    }
+        return true;
+    };
+
+    lastAutoUnlockTime = Date.now();
+    alignToFloor();
+    // Re-assert after TauriTavern's 200ms scrollOnMediaLoad delay
+    setTimeout(() => alignToFloor(), 240);
 }
 
 async function jumpToCutoffBoundary() {
@@ -544,21 +655,75 @@ function installScrollProgressTracker() {
     if (!chatEl || chatEl.dataset.ttNovelScrollBound === '1') return;
     chatEl.dataset.ttNovelScrollBound = '1';
 
-    const onScroll = debounce(() => {
+    let lastScrollTop = chatEl.scrollTop;
+    let touchStartY = null;
+    let touchStartedAtTop = false;
+
+    const tryAutoUnlockEarlier = () => {
+        if (!document.getElementById('tt-novel-pull-unlock-top')) return;
+        const now = Date.now();
+        if (now - lastAutoUnlockTime < 950) return;
+        lastAutoUnlockTime = now;
+        onUnlockEarlierCallback?.(3);
+    };
+
+    chatEl.addEventListener('scroll', () => {
+        const currTop = chatEl.scrollTop;
+        // User scrolled upward and hit the top edge of #chat
+        if (currTop <= 14 && lastScrollTop > 18 && currTop < lastScrollTop) {
+            tryAutoUnlockEarlier();
+        }
+        lastScrollTop = currTop;
+    }, { passive: true });
+
+    // Mobile pull-down gesture when already at the top of #chat
+    chatEl.addEventListener('touchstart', (e) => {
+        if (chatEl.scrollTop <= 16 && e.touches?.length === 1) {
+            touchStartY = e.touches[0].clientY;
+            touchStartedAtTop = true;
+        } else {
+            touchStartedAtTop = false;
+            touchStartY = null;
+        }
+    }, { passive: true });
+
+    chatEl.addEventListener('touchmove', (e) => {
+        if (!touchStartedAtTop || touchStartY === null || e.touches?.length !== 1) return;
+        const deltaY = e.touches[0].clientY - touchStartY;
+        if (deltaY > 45 && chatEl.scrollTop <= 16) {
+            touchStartedAtTop = false;
+            touchStartY = null;
+            tryAutoUnlockEarlier();
+        }
+    }, { passive: true });
+
+    // Desktop mouse wheel up when already at the top of #chat
+    chatEl.addEventListener('wheel', (e) => {
+        if (e.deltaY < -25 && chatEl.scrollTop <= 14) {
+            tryAutoUnlockEarlier();
+        }
+    }, { passive: true });
+
+    const onScrollDebounced = debounce(() => {
         const rect = chatEl.getBoundingClientRect();
         const midY = rect.top + rect.height * 0.35;
         const blocks = chatEl.querySelectorAll('.mes:not([is_user="true"])');
+        const chat = getContext()?.chat || [];
         for (const block of blocks) {
             const bRect = block.getBoundingClientRect();
             if (bRect.top <= midY && bRect.bottom >= rect.top) {
                 const mesId = Number(block.getAttribute('mesid'));
                 if (Number.isFinite(mesId)) {
                     saveReadingProgress(mesId);
+                    const origIdx = Number(chat[mesId]?.extra?.novelChapterIndex);
+                    if (origIdx > 0 && cachedNovelData) {
+                        cachedNovelData.viewingChapterIndex = origIdx;
+                    }
                 }
                 break;
             }
         }
-    }, 900);
+    }, 600);
 
-    chatEl.addEventListener('scroll', onScroll, { passive: true });
+    chatEl.addEventListener('scroll', onScrollDebounced, { passive: true });
 }

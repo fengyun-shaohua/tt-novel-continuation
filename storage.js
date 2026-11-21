@@ -37,22 +37,23 @@ function getStableChatKey() {
 
 /**
  * Resolves the active chat's TauriTavern store adapter.
+ * Uses `listKeys` before `getJson` / `deleteJson` so Tauri's `safeInvoke` never triggers
+ * a red "后端错误: Chat store entry not found" toast when a chat has no novel data yet.
  */
 function getActiveChatStore() {
     const tt = globalThis.__TAURITAVERN__?.api;
     try {
         const handle = tt?.chat?.current?.handle?.();
-        if (handle?.store) {
+        if (handle?.store && typeof handle.store.listKeys === 'function') {
             return {
                 async get(key) {
                     try {
-                        return await handle.store.getJson({ namespace: EXTENSION_NAMESPACE, key });
-                    } catch (err) {
-                        const msg = String(err?.message || err || '').toLowerCase();
-                        if (msg.includes('not found') || msg.includes('missing') || msg.includes('no such')) {
+                        const keys = await handle.store.listKeys({ namespace: EXTENSION_NAMESPACE });
+                        if (!Array.isArray(keys) || !keys.includes(key)) {
                             return null;
                         }
-                        console.warn(`[小说续写阅读器] 读取聊天存储键 ${key} 失败:`, err);
+                        return await handle.store.getJson({ namespace: EXTENSION_NAMESPACE, key });
+                    } catch {
                         return null;
                     }
                 },
@@ -61,9 +62,12 @@ function getActiveChatStore() {
                 },
                 async remove(key) {
                     try {
-                        await handle.store.deleteJson({ namespace: EXTENSION_NAMESPACE, key });
+                        const keys = await handle.store.listKeys({ namespace: EXTENSION_NAMESPACE });
+                        if (Array.isArray(keys) && keys.includes(key)) {
+                            await handle.store.deleteJson({ namespace: EXTENSION_NAMESPACE, key });
+                        }
                     } catch {
-                        // Ignore missing key on delete
+                        // Ignore
                     }
                 },
             };

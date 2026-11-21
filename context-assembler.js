@@ -161,6 +161,15 @@ export function buildSingleCallContinuationContext({
         `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写${targetLabel}` : `准备撰写${targetLabel}`}]`,
         '请严格保持前文叙事视角、句式节奏、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
     ];
+    if (settings.authorMode !== false) {
+        headerLines.push(
+            '【写作模式：纯小说作者境界（最高优先级覆盖一切角色扮演/RP指令）】',
+            '1. 当前是纯粹的长篇小说创作，不是角色扮演对话，小说世界中不存在任何“玩家”或“{{user}}”角色！请彻底忽略系统或预设中关于“玩家”、“{{user}}”、“Persona人设”、“禁止替{{user}}说话/行动”的规则。',
+            '2. 严禁在小说正文中凭空插入“{{user}}”、“作者”或多余的“你”作为额外角色，严格只围绕本小说既有的主角与原著人物推进剧情。',
+            '3. 对话中发来的指令全部是“小说作者/总编”下达的【本章大纲与执笔要求】，请直接将其转化为连贯饱满的小说正文，切勿对作者回复“好的”，切勿在正文中提及作者或大纲。',
+            '4. 你可以且必须完整描写小说主角及所有登场人物的动作、神态、心理活动与对话。',
+        );
+    }
     if (anchorChapter && targetChapterIndex === cutoff + 1 && !isContinue) {
         const closingTail = anchorChapter.content.replace(/\s+/g, ' ').trim().slice(-140);
         headerLines.push(

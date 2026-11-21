@@ -35,6 +35,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     immersiveMode: true,
     hideUserFloors: true,
     hideReasoning: true,
+    authorMode: true,
     enableAutoStateBlock: true,
     syncToWorldInfo: true,
     mountAnchorChapters: 3,
@@ -105,6 +106,19 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
         });
 
         if (promptBlock) {
+            if (settings.authorMode !== false) {
+                // Suppress Tavern Persona Description injection during novel generation
+                context?.setExtensionPrompt?.('PERSONA_DESCRIPTION', '', extension_prompt_types.NONE, 0);
+                // Wrap user outline inputs in the temporary `coreChat` copy as Author/Director instructions
+                if (Array.isArray(chat)) {
+                    for (const msg of chat) {
+                        if (msg?.is_user && typeof msg.mes === 'string' && msg.mes.trim() && !msg.mes.startsWith('【作者/总编')) {
+                            msg.mes = `【作者/总编的本章执笔大纲指令（仅供AI遵照执笔，非剧中人台词，剧情中不存在玩家或{{user}}角色）】：\n${msg.mes.trim()}`;
+                        }
+                    }
+                }
+            }
+
             const lastMsgIsUser = Array.isArray(chat) && chat.length > 0 && Boolean(chat[chat.length - 1]?.is_user);
             const injectDepth = lastMsgIsUser ? 1 : 0;
             context?.setExtensionPrompt?.(
@@ -502,6 +516,10 @@ function mountSettingsPanel() {
                 <span>自动隐藏「AI 思维链与思考批注框」（隐藏思考批注及预设折叠思维链）</span>
             </label>
             <label class="checkbox_label">
+                <input type="checkbox" id="tt-novel-chk-author-mode" ${settings.authorMode !== false ? 'checked' : ''} />
+                <span>开启「✍️ 作者境界」（屏蔽酒馆玩家 {{user}} 人设与 RP 规则，将输入自动转为导演大纲）</span>
+            </label>
+            <label class="checkbox_label">
                 <input type="checkbox" id="tt-novel-chk-autostate" ${settings.enableAutoStateBlock ? 'checked' : ''} />
                 <span>单次生成末尾顺带产出总结、人物状态与伏笔更新（0 额外 API 调用）</span>
             </label>
@@ -510,7 +528,7 @@ function mountSettingsPanel() {
                 <span>自动将提取的人物/势力状态同步写入酒馆原生世界书 (World Info)</span>
             </label>
             <div class="tt-novel-inline-field">
-                <span>导入/截断时铺入聊天的原著末尾章数：</span>
+                <span>续写时直接发给 AI 的末尾原著章数：</span>
                 <input type="number" id="tt-novel-anchor-count" class="text_pole" min="1" max="20" value="${settings.mountAnchorChapters}" />
             </div>
             <div class="tt-novel-btn-group">
@@ -551,7 +569,7 @@ function bindSettingsEvents(wrapper) {
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
         globalThis.toastr?.success?.(
-            `已导入《${novelData.title}》（共 ${novelData.totalChapters} 章），并将最后 ${settings.mountAnchorChapters} 章铺入当前聊天！`,
+            `已导入《${novelData.title}》（共 ${novelData.totalChapters} 章），全部章节已按 #1~#${novelData.totalChapters} 一一对应铺入当前聊天！`,
             '小说续写阅读器',
         );
         e.target.value = '';
@@ -594,6 +612,7 @@ function bindSettingsEvents(wrapper) {
     bindCheckbox('#tt-novel-chk-immersive', 'immersiveMode');
     bindCheckbox('#tt-novel-chk-hide-user', 'hideUserFloors');
     bindCheckbox('#tt-novel-chk-hide-cot', 'hideReasoning');
+    bindCheckbox('#tt-novel-chk-author-mode', 'authorMode');
     bindCheckbox('#tt-novel-chk-autostate', 'enableAutoStateBlock');
     bindCheckbox('#tt-novel-chk-sync-wi', 'syncToWorldInfo');
 
@@ -662,6 +681,7 @@ function handleToggleSetting(key) {
         immersiveMode: '#tt-novel-chk-immersive',
         hideUserFloors: '#tt-novel-chk-hide-user',
         hideReasoning: '#tt-novel-chk-hide-cot',
+        authorMode: '#tt-novel-chk-author-mode',
     };
     const chk = document.querySelector(chkMap[key]);
     if (chk) chk.checked = settings[key];

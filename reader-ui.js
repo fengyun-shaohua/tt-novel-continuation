@@ -76,6 +76,9 @@ function mountQuickBar(settings) {
             <button type="button" id="tt-novel-btn-hide-cot" class="tt-novel-pill" title="隐藏 AI 思考批注与预设思维链折叠框">
                 <i class="fa-solid fa-brain"></i> <span>隐藏思维链</span>
             </button>
+            <button type="button" id="tt-novel-btn-author-mode" class="tt-novel-pill" title="开启作者境界：屏蔽酒馆玩家 {{user}} 人设与 RP 规则，将输入自动转为导演大纲">
+                <i class="fa-solid fa-feather-pointed"></i> <span>作者境界</span>
+            </button>
             <button type="button" id="tt-novel-btn-prev-ch" class="tt-novel-pill" title="观看上一章">
                 <i class="fa-solid fa-chevron-left"></i> <span>上一章</span>
             </button>
@@ -100,6 +103,9 @@ function mountQuickBar(settings) {
     bar.querySelector('#tt-novel-btn-hide-cot')?.addEventListener('click', () => {
         onSettingChangeCallback?.('hideReasoning');
     });
+    bar.querySelector('#tt-novel-btn-author-mode')?.addEventListener('click', () => {
+        onSettingChangeCallback?.('authorMode');
+    });
     bar.querySelector('#tt-novel-btn-prev-ch')?.addEventListener('click', async () => {
         if (!cachedNovelData?.totalChapters) return;
         const curr = Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
@@ -123,6 +129,7 @@ export function syncQuickBarState(settings) {
     const btnImmersive = document.getElementById('tt-novel-btn-immersive');
     const btnHideUser = document.getElementById('tt-novel-btn-hide-user');
     const btnHideCot = document.getElementById('tt-novel-btn-hide-cot');
+    const btnAuthorMode = document.getElementById('tt-novel-btn-author-mode');
     if (btnImmersive) {
         btnImmersive.classList.toggle('active', Boolean(settings?.immersiveMode));
     }
@@ -131,6 +138,9 @@ export function syncQuickBarState(settings) {
     }
     if (btnHideCot) {
         btnHideCot.classList.toggle('active', settings?.hideReasoning !== false);
+    }
+    if (btnAuthorMode) {
+        btnAuthorMode.classList.toggle('active', settings?.authorMode !== false);
     }
 }
 

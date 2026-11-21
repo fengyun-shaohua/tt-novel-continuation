@@ -40,10 +40,9 @@ const DEFAULT_SETTINGS = Object.freeze({
     foldUserOutlineFloors: true,
     enableAutoStateBlock: true,
     syncToWorldInfo: true,
-    mountAnchorChapters: 1,
-    maxAnchorChars: 5500,
-    maxOriginalHits: 2,
-    maxCanonHits: 3,
+    mountAnchorChapters: 3,
+    maxOriginalHits: 3,
+    maxCanonHits: 4,
     maxRecentSummaries: 6,
     remoteBridgeUrl: '',
 });
@@ -77,13 +76,12 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
     }
 
     try {
-        // Keep only the newest original chapters in `coreChat` within BOTH chapter-count and char budget
-        // (`maxAnchorChars`, default 5500) walking backwards from the cutoff chapter.
-        // This guarantees the cutoff chapter (e.g. 第 4 节) is NEVER pushed past an 8K API input cap
-        // by older chapters like 第 2 节, while all chapters remain visible in `#chat`.
+        // Keep the latest `mountAnchorChapters` (default 3, up to 50) original chapters in `coreChat`
+        // AND merge consecutive original chapter floors into ONE continuous assistant message.
+        // Merging prevents RP preset processors (like Meowssiah/SPreset `foreignArchivedBlocks.slice(0, 180)`)
+        // from mistaking multiple consecutive assistant floors for foreign archive turns and truncating the cutoff chapter!
         if (Array.isArray(chat)) {
-            const anchorLimit = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 1));
-            const charBudget = Math.max(1800, Math.min(30000, Number(settings.maxAnchorChars) || 5500));
+            const anchorLimit = Math.max(1, Math.min(50, Number(settings.mountAnchorChapters) || 3));
             const origPositions = [];
             chat.forEach((m, idx) => {
                 if (m?.extra?.novelContinuationOrigin === 'original') {
@@ -91,30 +89,27 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
                 }
             });
             if (origPositions.length > 0) {
-                const keepPositions = new Set();
-                let usedChars = 0;
-                for (let k = origPositions.length - 1; k >= 0; k -= 1) {
-                    const pos = origPositions[k];
-                    const msgLen = String(chat[pos]?.mes || '').length;
-                    const isLatestOrig = k === origPositions.length - 1;
-                    if (isLatestOrig) {
-                        keepPositions.add(pos);
-                        if (msgLen > charBudget) {
-                            const raw = String(chat[pos].mes || '');
-                            const firstLineEnd = raw.indexOf('\n');
-                            const heading = firstLineEnd > 0 ? raw.slice(0, firstLineEnd + 1) : '';
-                            chat[pos].mes = `${heading}…（本章前段已自动精简以防截断）…\n\n${raw.slice(-(charBudget - heading.length))}`;
-                        }
-                        usedChars += Math.min(msgLen, charBudget);
-                        continue;
-                    }
-                    if (keepPositions.size < anchorLimit && usedChars + msgLen <= charBudget) {
-                        keepPositions.add(pos);
-                        usedChars += msgLen;
-                    }
-                }
+                const keptPositions = origPositions.slice(-anchorLimit);
+                const firstKeptPos = keptPositions[0];
+                const mergedText = keptPositions
+                    .map(pos => String(chat[pos]?.mes || '').trim())
+                    .filter(Boolean)
+                    .join('\n\n---\n\n');
+                const lastKeptMsg = chat[keptPositions[keptPositions.length - 1]];
+                const mergedOrigMsg = {
+                    ...lastKeptMsg,
+                    mes: mergedText,
+                    extra: {
+                        ...(lastKeptMsg?.extra || {}),
+                        novelContinuationOrigin: 'original',
+                        novelMergedChapterCount: keptPositions.length,
+                    },
+                };
+                // Replace firstKeptPos with the merged message and remove all other original positions
+                const removeSet = new Set(origPositions.filter(pos => pos !== firstKeptPos));
+                chat[firstKeptPos] = mergedOrigMsg;
                 for (let i = chat.length - 1; i >= 0; i -= 1) {
-                    if (chat[i]?.extra?.novelContinuationOrigin === 'original' && !keepPositions.has(i)) {
+                    if (removeSet.has(i)) {
                         chat.splice(i, 1);
                     }
                 }
@@ -638,7 +633,7 @@ function mountSettingsPanel() {
             </label>
             <div class="tt-novel-inline-field">
                 <span>续写时直接发给 AI 的末尾原著章数：</span>
-                <input type="number" id="tt-novel-anchor-count" class="text_pole" min="1" max="20" value="${settings.mountAnchorChapters}" />
+                <input type="number" id="tt-novel-anchor-count" class="text_pole" min="1" max="50" value="${settings.mountAnchorChapters}" />
             </div>
             <div class="tt-novel-btn-group">
                 <button type="button" id="tt-novel-clear-canon" class="menu_button">清空补充设定库</button>
@@ -727,7 +722,7 @@ function bindSettingsEvents(wrapper) {
     bindCheckbox('#tt-novel-chk-sync-wi', 'syncToWorldInfo');
 
     wrapper.querySelector('#tt-novel-anchor-count')?.addEventListener('change', (e) => {
-        settings.mountAnchorChapters = Math.max(1, Math.min(20, Number(e.target.value) || 3));
+        settings.mountAnchorChapters = Math.max(1, Math.min(50, Number(e.target.value) || 3));
         saveExtensionSettings();
     });
 

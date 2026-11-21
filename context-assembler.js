@@ -133,7 +133,9 @@ export function buildSingleCallContinuationContext({
         : null;
     const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
     const mountedOriginalCount = Array.isArray(chat)
-        ? chat.filter(m => m?.extra?.novelContinuationOrigin === 'original').length
+        ? chat
+            .filter(m => m?.extra?.novelContinuationOrigin === 'original')
+            .reduce((sum, m) => sum + Math.max(1, Number(m?.extra?.novelMergedChapterCount) || 1), 0)
         : 0;
     const hasOriginalFloorInChat = mountedOriginalCount > 0;
 

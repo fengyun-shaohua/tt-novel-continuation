@@ -1,5 +1,6 @@
 import { extension_settings, getContext } from '/scripts/extensions.js';
 import { extension_prompt_roles, extension_prompt_types } from '/scripts/extension-prompts.js';
+import { oai_settings } from '/scripts/openai.js';
 import { deleteMessage, resetChatSurfaceView } from '/script.js';
 import { escapeHtml } from '/scripts/utils.js';
 import { buildSingleCallContinuationContext, resolveCurrentTargetChapterIndex } from './context-assembler.js';
@@ -42,6 +43,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     enableAutoStateBlock: true,
     syncToWorldInfo: true,
     mountAnchorChapters: 3,
+    distillRounds: 2,
     maxOriginalHits: 3,
     maxCanonHits: 4,
     maxRecentSummaries: 6,
@@ -574,7 +576,32 @@ async function extractCutoffSnapshotSingleCall(btnEl) {
     }
 }
 
-async function distillNovelStyleAdversarial(btnEl) {
+function getActiveApiModelLabel() {
+    try {
+        const src = String(oai_settings?.chat_completion_source || '').trim();
+        const modelMap = {
+            custom: oai_settings?.custom_model,
+            openai: oai_settings?.openai_model,
+            claude: oai_settings?.claude_model,
+            makersuite: oai_settings?.google_model,
+            vertexai: oai_settings?.vertexai_model,
+            openrouter: oai_settings?.openrouter_model,
+            deepseek: oai_settings?.deepseek_model,
+            xai: oai_settings?.xai_model,
+            groq: oai_settings?.groq_model,
+            mistralai: oai_settings?.mistralai_model,
+        };
+        const model = String(modelMap[src] || oai_settings?.custom_model || oai_settings?.openai_model || '').trim();
+        if (src && model) return `${src} / ${model}`;
+        if (model) return model;
+        if (src) return src;
+    } catch {
+        // Ignore if oai_settings unavailable
+    }
+    return '当前酒馆已连接模型';
+}
+
+async function distillNovelStyleAdversarial(btnEl, { incremental = false } = {}) {
     const novelData = await loadNovelData();
     if (!novelData?.chapters?.length) {
         globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件', '小说续写阅读器');
@@ -587,43 +614,58 @@ async function distillNovelStyleAdversarial(btnEl) {
         return;
     }
 
+    const settings = getSettings();
+    const ledger = await loadLedger();
+    if (incremental && !ledger?.styleProfile?.styleCard) {
+        globalThis.toastr?.warning?.('请先执行一次完整文风蒸馏，再追加精炼轮次', '小说续写阅读器');
+        return;
+    }
+
+    const rounds = Math.max(1, Math.min(3, Number(settings.distillRounds) || 2));
+    const modelLabel = getActiveApiModelLabel();
     const origText = btnEl ? btnEl.textContent : '';
     const progressEl = document.getElementById('tt-novel-style-progress');
     if (btnEl) {
         btnEl.disabled = true;
-        btnEl.textContent = '🎨 正在对抗蒸馏原著文风...';
+        btnEl.textContent = incremental ? '🔄 正在追加盲测精炼...' : '🎨 正在多轮对抗蒸馏...';
     }
     if (progressEl) {
         progressEl.classList.remove('displayNone');
-        progressEl.textContent = '⏳ 准备启动 4 步对抗文风蒸馏（严格并发 ≤ 2）...';
+        progressEl.textContent = incremental
+            ? `⏳ 使用 [${modelLabel}] 追加 1 轮全新真迹盲测与对比评分...`
+            : `⏳ 使用 [${modelLabel}] 启动 ${rounds} 轮对抗盲测蒸馏（并发上限 ≤ 2）...`;
     }
 
     try {
         const styleProfile = await runStyleDistillationPipeline({
             novelData,
             maxConcurrency: 2,
+            rounds,
+            existingProfile: incremental ? ledger.styleProfile : null,
             callModel: async ({ prompt, systemPrompt }) => {
                 const reply = await context.generateRaw({ prompt, systemPrompt });
                 return String(reply || '');
             },
             onProgress: ({ step, totalSteps, label }) => {
                 if (progressEl) {
-                    progressEl.textContent = `⏳ [${step}/${totalSteps}] ${label}`;
+                    progressEl.textContent = `⏳ [${modelLabel}] [${step}/${totalSteps}] ${label}`;
                 }
             },
         });
 
-        const ledger = await loadLedger();
         ledger.styleProfile = styleProfile;
         await saveLedger(ledger);
         await refreshSettingsStatusCard();
         await refreshReaderWidgets();
 
+        const scoreChain = (styleProfile.roundHistory || [])
+            .map(r => `第${r.round}轮 ${r.score !== null ? `${r.score}分` : '?'}`)
+            .join(' → ');
         if (progressEl) {
-            progressEl.textContent = `✅ 蒸馏完成！已为《${novelData.title}》生成终版文风 DNA 卡（并发峰值 ≤ 2），后续每章续写自动生效。`;
+            progressEl.textContent = `✅ 蒸馏完成（${String(styleProfile.styleCard).length} 字 · ${scoreChain || '已定稿'}）！后续每章续写自动生效。`;
         }
         globalThis.toastr?.success?.(
-            '原著文风 4 步对抗蒸馏完成！已永久保存并自动用于后续每一章续写！',
+            `原著文风蒸馏完成（${scoreChain || '已定稿'}），已永久绑定到当前对话！`,
             '小说续写阅读器',
         );
     } catch (error) {
@@ -665,18 +707,27 @@ function mountSettingsPanel() {
                 </label>
             </div>
             <div class="tt-novel-btn-group">
-                <button type="button" id="tt-novel-distill-style" class="menu_button">🎨 蒸馏原著文风 (4步对抗 · 并发≤2)</button>
+                <button type="button" id="tt-novel-distill-style" class="menu_button">🎨 深度蒸馏原著文风 (多轮对抗 · 并发≤2)</button>
                 <button type="button" id="tt-novel-extract-cutoff" class="menu_button">⚡ 提炼断更现场状态 (仅调 1 次 API)</button>
                 <button type="button" id="tt-novel-open-toc" class="menu_button">📑 打开章节目录与截断跳转</button>
             </div>
+            <div class="tt-novel-inline-field">
+                <span>文风对抗盲测迭代轮数（每轮换新真迹对比打分，≥92分提前达标）：</span>
+                <select id="tt-novel-distill-rounds" class="text_pole" style="width: 88px;">
+                    <option value="1" ${Number(settings.distillRounds) === 1 ? 'selected' : ''}>1 轮</option>
+                    <option value="2" ${Number(settings.distillRounds || 2) === 2 ? 'selected' : ''}>2 轮 (推荐)</option>
+                    <option value="3" ${Number(settings.distillRounds) === 3 ? 'selected' : ''}>3 轮 (深度)</option>
+                </select>
+            </div>
             <div id="tt-novel-style-progress" class="tt-novel-style-progress displayNone"></div>
             <details id="tt-novel-style-drawer" class="tt-novel-style-drawer">
-                <summary>🧬 查看 / 手动微调《原著文风 DNA 卡》与盲测纠偏报告</summary>
+                <summary>🧬 查看 / 手动微调《原著文风 DNA 圣经》与多轮盲测评分报告</summary>
                 <div class="tt-novel-style-drawer-body">
-                    <div id="tt-novel-style-diff" class="tt-novel-style-diff">尚未执行文风蒸馏。点击上方「🎨 蒸馏原著文风」按钮，插件会以并发上限 2 自动完成：客观指纹分析 → 双路解剖 → 盲测仿写 → 真迹找茬纠偏。</div>
-                    <textarea id="tt-novel-style-editor" class="text_pole tt-novel-style-editor" rows="7" placeholder="蒸馏生成的《原著文风 DNA 执行卡》会显示在这里，你也可以手动微调任意一条规则后保存..."></textarea>
+                    <div id="tt-novel-style-diff" class="tt-novel-style-diff">尚未执行文风蒸馏。蒸馏默认直接调用你当前酒馆顶部 API 连接面板里选中的模型。</div>
+                    <textarea id="tt-novel-style-editor" class="text_pole tt-novel-style-editor" rows="9" placeholder="蒸馏生成的《原著文风 DNA 圣经》（约 1800~2800 字）会显示在这里，你也可以手动微调任意一条规则后保存..."></textarea>
                     <div class="tt-novel-btn-group">
-                        <button type="button" id="tt-novel-save-style" class="menu_button">💾 保存文风卡修改</button>
+                        <button type="button" id="tt-novel-refine-style" class="menu_button">🔄 再追加 1 轮盲测精炼</button>
+                        <button type="button" id="tt-novel-save-style" class="menu_button">💾 保存文风修改</button>
                         <button type="button" id="tt-novel-clear-style" class="menu_button">🗑️ 清空文风卡</button>
                     </div>
                 </div>
@@ -797,7 +848,12 @@ function bindSettingsEvents(wrapper) {
         e.target.value = '';
     });
 
-    wrapper.querySelector('#tt-novel-distill-style')?.addEventListener('click', (e) => distillNovelStyleAdversarial(e.currentTarget));
+    wrapper.querySelector('#tt-novel-distill-style')?.addEventListener('click', (e) => distillNovelStyleAdversarial(e.currentTarget, { incremental: false }));
+    wrapper.querySelector('#tt-novel-refine-style')?.addEventListener('click', (e) => distillNovelStyleAdversarial(e.currentTarget, { incremental: true }));
+    wrapper.querySelector('#tt-novel-distill-rounds')?.addEventListener('change', (e) => {
+        settings.distillRounds = Math.max(1, Math.min(3, Number(e.target.value) || 2));
+        saveExtensionSettings();
+    });
     wrapper.querySelector('#tt-novel-extract-cutoff')?.addEventListener('click', (e) => extractCutoffSnapshotSingleCall(e.currentTarget));
     wrapper.querySelector('#tt-novel-open-toc')?.addEventListener('click', () => toggleTocDrawer(true));
 
@@ -895,16 +951,21 @@ async function refreshSettingsStatusCard() {
     const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
     const openHooksCount = (ledger?.hooks || []).filter(h => h.status !== 'resolved').length;
     const sp = ledger?.styleProfile;
+    const activeModel = getActiveApiModelLabel();
     const novelLine = novelData
         ? `📚 <b>当前原著</b>：《${escapeHtml(novelData.title)}》（共 ${novelData.totalChapters} 章 · 续写锚点：第 ${novelData.cutoffChapterIndex} 章）`
         : '📚 <b>当前原著</b>：尚未导入（可导入 .txt/.md 太监或同人小说）';
+    const scoreChain = Array.isArray(sp?.roundHistory) && sp.roundHistory.length > 0
+        ? ` · 盲测评分：${sp.roundHistory.map(r => `R${r.round} ${r.score !== null ? `${r.score}分` : '?'}`).join(' → ')}`
+        : '';
     const styleLine = sp?.styleCard
-        ? `🎨 <b>原著文风 DNA</b>：已蒸馏定稿（${String(sp.styleCard).length} 字 · 自动注入每章续写）`
-        : '🎨 <b>原著文风 DNA</b>：尚未蒸馏（点击「🎨 蒸馏原著文风」可 4 步对抗提取）';
+        ? `🎨 <b>原著文风 DNA</b>：已定稿（${String(sp.styleCard).length} 字${escapeHtml(scoreChain)}）`
+        : '🎨 <b>原著文风 DNA</b>：尚未蒸馏（点击「🎨 深度蒸馏原著文风」可多轮对抗提取）';
+    const modelLine = `🤖 <b>当前蒸馏/续写模型</b>：<code>${escapeHtml(activeModel)}</code>（跟随酒馆顶部 API 连接设置）`;
     const ledgerLine = `🧠 <b>时间线记忆</b>：${ledger.summaries.length} 章总结 · ${ledger.worldStates.length} 条人物/世界状态 · ${openHooksCount} 条待填伏笔`;
     const canonLine = `🗂️ <b>同人补充数据库</b>：已挂载 ${canonDb.items.length} 个设定词条${canonDb.sources.length ? `（${escapeHtml(canonDb.sources.join(', '))}）` : ''}`;
 
-    card.innerHTML = `<div>${novelLine}</div><div>${styleLine}</div><div>${ledgerLine}</div><div>${canonLine}</div>`;
+    card.innerHTML = `<div>${novelLine}</div><div>${styleLine}</div><div>${modelLine}</div><div>${ledgerLine}</div><div>${canonLine}</div>`;
 
     const diffEl = document.getElementById('tt-novel-style-diff');
     if (diffEl) {

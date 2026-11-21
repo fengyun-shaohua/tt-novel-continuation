@@ -1,13 +1,15 @@
 /**
- * Bounded-Concurrency (max <= 2) Multi-Stage Adversarial Style Distillation Pipeline
+ * Bounded-Concurrency (max <= 2) Multi-Round Iterative Adversarial Style Distillation Pipeline
  * for the Novel Continuation extension.
  *
- * Stages:
- *   Stage 0 (Local, 0 API): Objective statistical fingerprint + non-overlapping train/holdout split
- *   Stage 1 (2-way parallel): 1A Micro-syntax/POV/sensory anatomy || 1B Dialogue/pacing/golden excerpts
- *   Stage 2 (2-way parallel): 2A Merge draft Style DNA card       || 2B Strip holdout truth into dry plot outline
- *   Stage 3 (Serial, 1 call): Blind rewrite of the dry outline using ONLY the draft Style DNA card
- *   Stage 4 (Serial, 1 call): Forensic diff (Original Holdout Truth vs Blind Rewrite) -> Final Anti-AI-Slop Style DNA Card
+ * Architecture:
+ *   Stage 0 (Local, 0 API): Objective statistical fingerprint + non-overlapping train (A/B/C) & 3 unseen holdouts (H1/H2/H3)
+ *   Stage 1 (2-way parallel): 1A Deep syntax/POV/sensory/scale anatomy || 1B Dialogue/character-voice/4 multi-scene Golden Excerpts
+ *   Stage 2 (2-way parallel): 2A Merge Deep Draft Style Bible (1800~2600 chars) || 2B Strip Holdout #1 into dry event outline
+ *   Iterative Adversarial Loop (Round 1 .. N, default 2 rounds, configurable 1~3, early-stop if score >= 92):
+ *     - Blind Rewrite: Rewrite unseen holdout's dry outline using ONLY current Style Bible + Golden Excerpts
+ *     - Forensic Judge & Patch: Compare Original Truth vs Blind Rewrite side-by-side -> 0~100 similarity score + diff report + patched Deep Style Bible
+ *   Also supports 1-click Incremental Refinement (+1 extra blind-test round on an existing/edited Style Bible).
  */
 
 import { stripNonStoryBlocks } from './parser.js';
@@ -89,7 +91,6 @@ export function computeLocalStyleFingerprint(chapters, cutoffChapterIndex) {
         ? Math.round(dialogueCharSum / dialogueMatches.length)
         : 0;
 
-    // Count first-person vs third-person pronouns outside dialogue quotes for POV hint
     const narrationOnly = fullText.replace(/[“「『"][^”」』"\n]{1,300}[”」』"]/g, '');
     const firstPersonHits = (narrationOnly.match(/我/g) || []).length;
     const thirdPersonHits = (narrationOnly.match(/[他她]/g) || []).length;
@@ -148,8 +149,8 @@ export function formatFingerprintText(fp) {
 }
 
 /**
- * Splits chapters `1 .. cutoffChapterIndex` into non-overlapping training samples (A & B)
- * and a holdout ground-truth excerpt for blind adversarial rewrite testing.
+ * Splits chapters `1 .. cutoffChapterIndex` into non-overlapping training samples (A, B, C)
+ * and up to 3 distinct unseen holdout ground-truth excerpts (`holdouts`) for multi-round blind testing.
  *
  * @param {Array<{ index: number, title: string, content: string }>} chapters
  * @param {number} cutoffChapterIndex
@@ -160,7 +161,7 @@ export function selectDistillationSamples(chapters, cutoffChapterIndex) {
         .sort((a, b) => a.index - b.index);
 
     if (allowed.length === 0) {
-        return { sampleA: '', sampleB: '', holdoutTruth: '', holdoutLabel: '' };
+        return { sampleA: '', sampleB: '', sampleC: '', holdouts: [], holdoutTruth: '', holdoutLabel: '' };
     }
 
     const cleanBody = (ch) => String(ch.content || '')
@@ -170,62 +171,104 @@ export function selectDistillationSamples(chapters, cutoffChapterIndex) {
     if (allowed.length === 1) {
         const text = cleanBody(allowed[0]);
         const len = text.length;
-        const cut1 = Math.floor(len * 0.4);
+        const cut1 = Math.floor(len * 0.35);
         const cut2 = Math.floor(len * 0.65);
+        const holdoutText = text.slice(cut1, Math.min(cut2, cut1 + 1100)).trim() || text.slice(0, 900);
+        const holdouts = [{ label: `${allowed[0].title}·中段真迹`, text: holdoutText }];
         return {
-            sampleA: `【${allowed[0].title}·前段】\n${text.slice(0, Math.min(cut1, 2200))}`,
-            sampleB: `【${allowed[0].title}·后段】\n${text.slice(cut2, Math.min(len, cut2 + 2200))}`,
-            holdoutTruth: text.slice(cut1, Math.min(cut2, cut1 + 1000)).trim() || text.slice(0, 800),
-            holdoutLabel: `${allowed[0].title}·中段真迹`,
+            sampleA: `【${allowed[0].title}·前段】\n${text.slice(0, Math.min(cut1, 2400))}`,
+            sampleB: `【${allowed[0].title}·后段】\n${text.slice(cut2, Math.min(len, cut2 + 2400))}`,
+            sampleC: '',
+            holdouts,
+            holdoutTruth: holdouts[0].text,
+            holdoutLabel: holdouts[0].label,
         };
     }
 
     if (allowed.length === 2) {
         const c0 = cleanBody(allowed[0]);
         const c1 = cleanBody(allowed[1]);
-        const midStart = Math.floor(c0.length * 0.55);
+        const mid0 = Math.floor(c0.length * 0.52);
+        const mid1 = Math.floor(c1.length * 0.45);
+        const h1 = c0.slice(mid0, Math.min(c0.length, mid0 + 1050)).trim() || c0.slice(-900);
+        const h2 = c1.slice(0, Math.min(mid1, 1050)).trim() || c1.slice(0, 900);
+        const holdouts = [
+            { label: `${allowed[0].title}·后段真迹`, text: h1 },
+            { label: `${allowed[1].title}·前段真迹`, text: h2 },
+        ];
         return {
-            sampleA: `【${allowed[0].title}·前段】\n${c0.slice(0, Math.min(midStart, 2400))}`,
-            sampleB: `【${allowed[1].title}】\n${c1.slice(-2600)}`,
-            holdoutTruth: c0.slice(midStart, Math.min(c0.length, midStart + 1000)).trim() || c1.slice(0, 900),
-            holdoutLabel: `${allowed[0].title}·后段真迹`,
+            sampleA: `【${allowed[0].title}·前段】\n${c0.slice(0, Math.min(mid0, 2600))}`,
+            sampleB: `【${allowed[1].title}·后段】\n${c1.slice(mid1, Math.min(c1.length, mid1 + 2600))}`,
+            sampleC: '',
+            holdouts,
+            holdoutTruth: holdouts[0].text,
+            holdoutLabel: holdouts[0].label,
         };
     }
 
-    // 3+ chapters: sampleA from early chapter, holdoutTruth from middle chapter, sampleB from cutoff chapter (+ neighbor)
+    // 3+ chapters: reserve 1..3 distinct holdout chapters/slices that do not overlap sampleA/sampleB/sampleC
+    const n = allowed.length;
     const earlyCh = allowed[0];
-    const midIdx = Math.floor(allowed.length / 2);
-    const holdoutCh = allowed[midIdx === allowed.length - 1 ? allowed.length - 2 : midIdx];
-    const latestCh = allowed[allowed.length - 1];
+    const latestCh = allowed[n - 1];
 
-    const earlyText = cleanBody(earlyCh);
-    const holdoutFull = cleanBody(holdoutCh);
-    const latestText = cleanBody(latestCh);
+    const holdoutIndices = new Set();
+    const pickHoldoutIdx = (ratio) => {
+        const idx = Math.max(1, Math.min(n - 2, Math.floor(n * ratio)));
+        holdoutIndices.add(idx);
+        return idx;
+    };
 
-    // Pick a rich middle slice of holdoutCh (avoiding chapter intro boilerplate)
-    const hStart = holdoutFull.length > 1400 ? Math.floor(holdoutFull.length * 0.25) : 0;
-    const holdoutSlice = holdoutFull.slice(hStart, hStart + 1050).trim();
+    const hIdx1 = pickHoldoutIdx(0.5);
+    if (n >= 5) pickHoldoutIdx(0.28);
+    if (n >= 7) pickHoldoutIdx(0.75);
 
-    const sampleAParts = [`【${earlyCh.title}】\n${earlyText.slice(0, 2500)}`];
-    if (allowed.length >= 5) {
-        const secondEarly = allowed[1];
-        sampleAParts.push(`【${secondEarly.title}·节选】\n${cleanBody(secondEarly).slice(0, 1200)}`);
-    }
+    const holdouts = [...holdoutIndices].map((idx, order) => {
+        const ch = allowed[idx];
+        const body = cleanBody(ch);
+        const start = body.length > 1500 ? Math.floor(body.length * 0.25) : 0;
+        return {
+            label: `${ch.title}·盲测真迹 #${order + 1}`,
+            text: body.slice(start, start + 1150).trim(),
+        };
+    });
 
-    const sampleBParts = [];
-    if (allowed.length >= 4) {
-        const prevLatest = allowed[allowed.length - 2];
-        if (prevLatest.index !== holdoutCh.index) {
-            sampleBParts.push(`【${prevLatest.title}·节选】\n${cleanBody(prevLatest).slice(-1200)}`);
+    // Ensure at least 2 distinct holdouts even for a 3-chapter novel by slicing another region of hIdx1
+    if (holdouts.length === 1) {
+        const ch = allowed[hIdx1];
+        const body = cleanBody(ch);
+        if (body.length > 1800) {
+            const start2 = Math.floor(body.length * 0.62);
+            holdouts.push({
+                label: `${ch.title}·盲测真迹 #2`,
+                text: body.slice(start2, start2 + 1100).trim(),
+            });
         }
     }
-    sampleBParts.push(`【${latestCh.title}（夺舍节点）】\n${latestText.slice(-2600)}`);
+
+    const sampleAParts = [`【${earlyCh.title}】\n${cleanBody(earlyCh).slice(0, 2800)}`];
+    const sampleBParts = [`【${latestCh.title}（夺舍节点）】\n${cleanBody(latestCh).slice(-2800)}`];
+    const sampleCParts = [];
+
+    // Pick up to 2 additional non-holdout chapters across the middle of the book for richer coverage
+    const candidateTrainIndices = [
+        Math.floor(n * 0.18),
+        Math.floor(n * 0.62),
+        Math.floor(n * 0.85),
+    ].filter(i => i > 0 && i < n - 1 && !holdoutIndices.has(i));
+
+    const uniqueTrain = [...new Set(candidateTrainIndices)].slice(0, 2);
+    for (const idx of uniqueTrain) {
+        const ch = allowed[idx];
+        sampleCParts.push(`【${ch.title}·节选】\n${cleanBody(ch).slice(0, 2200)}`);
+    }
 
     return {
         sampleA: sampleAParts.join('\n\n'),
         sampleB: sampleBParts.join('\n\n'),
-        holdoutTruth: holdoutSlice,
-        holdoutLabel: `${holdoutCh.title}·真迹片段`,
+        sampleC: sampleCParts.join('\n\n'),
+        holdouts,
+        holdoutTruth: holdouts[0]?.text || '',
+        holdoutLabel: holdouts[0]?.label || '',
     };
 }
 
@@ -248,12 +291,31 @@ export function extractTaggedSection(rawText, tagName) {
 }
 
 /**
- * Executes the 4-stage bounded-concurrency (<= 2) adversarial style distillation pipeline.
+ * Parses a numeric 0..100 fidelity score from `<score>...</score>`.
+ * @param {string} rawText
+ * @returns {number | null}
+ */
+export function extractFidelityScore(rawText) {
+    const cleaned = stripNonStoryBlocks(rawText);
+    const tagMatch = cleaned.match(/<score>([\s\S]*?)<\/score>/i);
+    const source = tagMatch ? tagMatch[1] : cleaned;
+    const numMatch = source.match(/(\d{1,3})\s*(?:\/\s*100|分)?/);
+    if (!numMatch) return null;
+    const val = Number(numMatch[1]);
+    if (!Number.isFinite(val)) return null;
+    return Math.max(0, Math.min(100, val));
+}
+
+/**
+ * Executes the multi-round bounded-concurrency (<= 2) adversarial style distillation pipeline,
+ * or runs +1 incremental blind-test refinement round on an `existingProfile`.
  *
  * @param {{
  *   novelData: { title: string, cutoffChapterIndex: number, totalChapters: number, chapters: Array<{ index: number, title: string, content: string }> },
  *   callModel: (args: { prompt: string, systemPrompt: string, stage: string }) => Promise<string>,
  *   maxConcurrency?: number,
+ *   rounds?: number,
+ *   existingProfile?: any,
  *   onProgress?: (info: { step: number, totalSteps: number, label: string }) => void,
  * }} params
  */
@@ -261,6 +323,8 @@ export async function runStyleDistillationPipeline({
     novelData,
     callModel,
     maxConcurrency = 2,
+    rounds = 2,
+    existingProfile = null,
     onProgress = () => {},
 }) {
     if (!novelData?.chapters?.length) {
@@ -272,191 +336,291 @@ export async function runStyleDistillationPipeline({
 
     const cutoff = Number(novelData.cutoffChapterIndex || novelData.totalChapters);
     const concurrency = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
+    const targetRounds = Math.max(1, Math.min(3, Number(rounds) || 2));
+    const isIncremental = Boolean(existingProfile?.styleCard);
 
-    // Stage 0: Local objective fingerprint + train/holdout split (0 API calls)
-    onProgress({ step: 0, totalSteps: 4, label: '正在计算本地客观文风指纹与切分盲测真迹样本...' });
-    const fingerprint = computeLocalStyleFingerprint(novelData.chapters, cutoff);
-    const fingerprintText = formatFingerprintText(fingerprint);
+    const totalSteps = isIncremental ? 2 : (2 + targetRounds * 2);
+    let currentStep = 0;
+
+    const fingerprint = existingProfile?.fingerprint || computeLocalStyleFingerprint(novelData.chapters, cutoff);
+    const fingerprintText = existingProfile?.fingerprintText || formatFingerprintText(fingerprint);
     const samples = selectDistillationSamples(novelData.chapters, cutoff);
 
-    if (!samples.sampleA || !samples.holdoutTruth) {
-        throw new Error('原著文本过短，无法切分训练样本与盲测样本');
+    if (!samples.sampleA || samples.holdouts.length === 0) {
+        throw new Error('原著文本过短，无法切分训练样本与盲测真迹样本');
     }
 
-    const analystSystem = '你是一位顶尖文学编辑与法医级文风分析师。你严禁输出“文笔细腻、描写生动、节奏紧凑”这类空泛形容词，必须输出具体、可量化、可直接照抄执行的写作硬规则。';
+    const analystSystem = '你是一位顶尖文学编辑与法医级文风分析师。你严禁输出“文笔细腻、描写生动、节奏紧凑”这类空泛形容词，必须输出详尽、具体、可量化、附带原著实句对照的深度写作圣经。';
+    const outlineSystem = '你是剧情梗概提炼员。你的任务是把一段小说原文剥光一切文风、修辞、心理修饰和原句措辞，只还原成 3~5 句极度干瘪、客观、白开水般的“事件清单”，用于后续盲测仿写。';
+    const ghostwriterSystem = '你是一位小说代笔作者。请严格遵照给定的《原著文风 DNA 圣经》和《原著灵魂活样本》的笔触、节奏、标点和尺度，将干瘪事件大纲扩写成 800~1000 字的小说正文。直接输出正文，切勿解释。';
 
-    // Stage 1: Bounded 2-way parallel deep anatomy (1A Syntax/POV/Sensory || 1B Dialogue/Pacing/Excerpts)
-    onProgress({
-        step: 1,
-        totalSteps: 4,
-        label: `步骤 1/4（并发 ${concurrency} 路）：并行解剖句法视角尺度 & 对话节奏与灵魂范例...`,
-    });
+    let currentStyleCard = existingProfile?.styleCard || '';
+    let goldenExcerpts = existingProfile?.goldenExcerpts || '';
+    const roundHistory = Array.isArray(existingProfile?.roundHistory) ? [...existingProfile.roundHistory] : [];
+    const preStrippedOutlines = new Map();
 
-    const [anatomySyntaxRaw, anatomyDialogueRaw] = await runBoundedPool([
-        () => callModel({
-            stage: '1A_syntax_anatomy',
+    if (!isIncremental) {
+        // Stage 1: Bounded 2-way parallel deep anatomy
+        currentStep = 1;
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `步骤 ${currentStep}/${totalSteps}（并发 ${concurrency} 路）：深度解剖多章句法视角尺度 & 筛选多场景灵魂范例...`,
+        });
+
+        const trainTextCombined = [
+            '【原著样本 A（开篇定调）】：\n' + samples.sampleA,
+            samples.sampleC ? '【原著样本 C（中段过渡/对话）】：\n' + samples.sampleC : '',
+            '【原著样本 B（夺舍节点）】：\n' + samples.sampleB,
+        ].filter(Boolean).join('\n\n');
+
+        const [anatomySyntaxRaw, anatomyDialogueRaw] = await runBoundedPool([
+            () => callModel({
+                stage: '1A_syntax_anatomy',
+                systemPrompt: analystSystem,
+                prompt: [
+                    `以下是小说《${novelData.title}》的本地客观统计指纹与多章节原著样本。`,
+                    '请做「法医级微观句法、视角与感官尺度深度解剖」（越具体、越细粒度越好，多引用原著里的真实短句作为依据，不要复述剧情）：',
+                    '1. 叙事视角与心理距离：人称视角如何运作？是否有视角微滑？内心想法是直白写出来、用极短碎片词带过，还是全靠微动作折射？',
+                    '2. 句法骨架与动词/修辞偏好：长短句交替规律、主语省略习惯、高频动作动词类型（急躁暴力 vs 缓慢粘稠？）、比喻习惯（通俗直给还是书面文艺？）。',
+                    '3. 分场景描写策略：日常铺垫、人物对峙、高张力/亲密/感官桥段分别怎么运镜？内容尺度落在哪一档？',
+                    '4. 初步发现的“原著绝不会使用的 AI 味/出版味表达”清单。',
+                    '',
+                    '【本地客观统计指纹】：',
+                    fingerprintText,
+                    '',
+                    trainTextCombined,
+                ].join('\n'),
+            }),
+            () => callModel({
+                stage: '1B_dialogue_excerpts',
+                systemPrompt: analystSystem,
+                prompt: [
+                    `以下是小说《${novelData.title}》的多章节原著样本。`,
+                    '请完成两项任务，严格按 `<dialogue_pacing>` 和 `<excerpts>` 两个标签输出：',
+                    '1. 在 `<dialogue_pacing>` 中深度解剖：',
+                    '   - 台词节奏与口癖：台词长度、口语松散度、引号内外标点习惯（是否经常省略句末标点直接接动作？）、省略号/波浪号/感叹号/特殊符号的实际用法。',
+                    '   - 角色声线反差：核心登场角色说话风格、情绪温度和反应方式有什么鲜明反差？',
+                    '   - 场景推进与转场：一节之内如何切镜、如何制造压迫感或悬念？',
+                    '2. 在 `<excerpts>` 中，从下方样本里**一字不改原样摘录 3~4 段**不同场景（例如：日常氛围、对话交锋、微观感官/张力描写）最具作者灵魂辨识度的原文片段（每段 200~300 字，标注代表什么笔法特征），供后续 Few-Shot 语感锚定。',
+                    '',
+                    trainTextCombined,
+                ].join('\n'),
+            }),
+        ], concurrency);
+
+        const syntaxNotes = stripNonStoryBlocks(anatomySyntaxRaw);
+        const dialogueNotes = extractTaggedSection(anatomyDialogueRaw, 'dialogue_pacing');
+        goldenExcerpts = extractTaggedSection(anatomyDialogueRaw, 'excerpts');
+
+        // Stage 2: Bounded 2-way parallel (Merge Deep Draft Style Bible || Strip Holdout #1 dry outline)
+        currentStep = 2;
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `步骤 ${currentStep}/${totalSteps}（并发 ${concurrency} 路）：合成初版深度文风圣经 & 剥离第 1 轮盲测事件大纲...`,
+        });
+
+        const [draftCardRaw, dryOutline1Raw] = await runBoundedPool([
+            () => callModel({
+                stage: '2A_merge_draft',
+                systemPrompt: analystSystem,
+                prompt: [
+                    `请将以下关于《${novelData.title}》的本地统计指纹与两份深度文风剖析，去噪融合成一份详尽、可落地执行的【初版原著文风 DNA 圣经】（目标 **1,600 ~ 2,400 字**，宁要细致实操规则与原著短句示例，不要空泛浓缩！）。`,
+                    '必须分模块写清：',
+                    '一、叙事视角与心理表达铁律（含正反例句）',
+                    '二、句式、段长、排版与标点口癖（含具体数值锚点与标点示例）',
+                    '三、对话结构与核心人物声线反差',
+                    '四、分场景节奏推进与内容尺度定位',
+                    '五、原作者招牌动词/感官描写抓手（附原著实句拆解）',
+                    '六、初步反 AI 味禁忌清单',
+                    '请用 `<style_dna>...</style_dna>` 包裹输出。',
+                    '',
+                    '【本地客观统计指纹】：',
+                    fingerprintText,
+                    '',
+                    '【微观句法与尺度剖析】：',
+                    syntaxNotes,
+                    '',
+                    '【对话与角色声线剖析】：',
+                    dialogueNotes,
+                ].join('\n'),
+            }),
+            () => callModel({
+                stage: '2B_extract_dry_outline_1',
+                systemPrompt: outlineSystem,
+                prompt: [
+                    '请将下面这段小说原文压缩成 3~5 句极度干瘪客观的事件大纲（只写时间地点、人物、动作顺序与客观结果，严禁照抄原句修辞与台词）：',
+                    '',
+                    samples.holdouts[0].text,
+                ].join('\n'),
+            }),
+        ], concurrency);
+
+        currentStyleCard = extractTaggedSection(draftCardRaw, 'style_dna');
+        preStrippedOutlines.set(0, stripNonStoryBlocks(dryOutline1Raw));
+    }
+
+    // Iterative Adversarial Blind-Test & Forensic Calibration Loop
+    const startRoundIdx = isIncremental ? roundHistory.length : 0;
+    const loopCount = isIncremental ? 1 : targetRounds;
+
+    for (let offset = 0; offset < loopCount; offset += 1) {
+        const roundNum = startRoundIdx + offset + 1;
+        const holdoutIdx = (startRoundIdx + offset) % samples.holdouts.length;
+        const holdout = samples.holdouts[holdoutIdx];
+
+        let dryOutline = preStrippedOutlines.get(holdoutIdx);
+        if (!dryOutline) {
+            const rawOutline = await callModel({
+                stage: `outline_round_${roundNum}`,
+                systemPrompt: outlineSystem,
+                prompt: [
+                    '请将下面这段小说原文压缩成 3~5 句极度干瘪客观的事件大纲（只写时间地点、人物、动作顺序与客观结果，严禁照抄原句修辞与台词）：',
+                    '',
+                    holdout.text,
+                ].join('\n'),
+            });
+            dryOutline = stripNonStoryBlocks(rawOutline);
+            preStrippedOutlines.set(holdoutIdx, dryOutline);
+        }
+
+        // Step A of Round: Blind Rewrite (optionally prefetch next round's dry outline in parallel, concurrency <= 2!)
+        currentStep += 1;
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮盲测考试）：不看「${holdout.label}」原文，仅凭当前文风圣经蒙眼仿写...`,
+        });
+
+        const nextHoldoutIdx = (startRoundIdx + offset + 1) % samples.holdouts.length;
+        const shouldPrefetchNextOutline = (offset + 1 < loopCount) && !preStrippedOutlines.has(nextHoldoutIdx);
+
+        const roundTasks = [
+            () => callModel({
+                stage: `3_round${roundNum}_blind_rewrite`,
+                systemPrompt: ghostwriterSystem,
+                prompt: [
+                    `【目标作品】：《${novelData.title}》`,
+                    '【本地硬指标】：',
+                    fingerprintText,
+                    '',
+                    '【当前版原著文风 DNA 圣经】：',
+                    currentStyleCard,
+                    '',
+                    '【原著灵魂原文范例】：',
+                    goldenExcerpts,
+                    '',
+                    '【本次盲测事件大纲（请严格按上述文风圣经扩写成 800~1000 字连续正文）】：',
+                    dryOutline,
+                ].join('\n'),
+            }),
+        ];
+
+        if (shouldPrefetchNextOutline) {
+            const nextHoldout = samples.holdouts[nextHoldoutIdx];
+            roundTasks.push(() => callModel({
+                stage: `outline_round_${roundNum + 1}`,
+                systemPrompt: outlineSystem,
+                prompt: [
+                    '请将下面这段小说原文压缩成 3~5 句极度干瘪客观的事件大纲（只写时间地点、人物、动作顺序与客观结果，严禁照抄原句修辞与台词）：',
+                    '',
+                    nextHoldout.text,
+                ].join('\n'),
+            }));
+        }
+
+        const [blindRewriteRaw, prefetchedOutlineRaw] = await runBoundedPool(roundTasks, concurrency);
+        const blindRewrite = stripNonStoryBlocks(blindRewriteRaw);
+        if (shouldPrefetchNextOutline && prefetchedOutlineRaw) {
+            preStrippedOutlines.set(nextHoldoutIdx, stripNonStoryBlocks(prefetchedOutlineRaw));
+        }
+
+        // Step B of Round: Forensic Diff, Fidelity Scoring (0~100), & Style Bible Patching
+        currentStep += 1;
+        onProgress({
+            step: currentStep,
+            totalSteps,
+            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮真迹对比评分）：左右对照原著真迹与盲测仿写，打分并迭代强化文风圣经...`,
+        });
+
+        const prevScoresText = roundHistory.length > 0
+            ? `此前轮次得分记录：${roundHistory.map(r => `第${r.round}轮 ${r.score ?? '?'}分`).join(' → ')}`
+            : '这是第 1 轮对抗盲测。';
+
+        const calibrationRaw = await callModel({
+            stage: `4_round${roundNum}_forensic_diff`,
             systemPrompt: analystSystem,
             prompt: [
-                `以下是小说《${novelData.title}》的本地客观统计指纹与两段不同进度的原著样本。`,
-                '请做「法医级微观句法与感官尺度解剖」，严格围绕以下 4 点输出具体可执行的分析（不要复述剧情）：',
-                '1. 叙事视角与心理距离：紧贴谁的感官？内心想法是直白写出（包括破折号/内心独白），还是全靠微动作折射？',
-                '2. 句式骨架与修辞密度：长短句交替规律、动词/形容词使用习惯、比喻风格（直白通俗还是华丽书面？）。',
-                '3. 感官描写与内容尺度：写高张力/亲密/冲突桥段时，笔触是直白直接还是含蓄隐晦？用词尺度落在哪一档？',
-                '4. 初步发现的“原著绝不会用的 AI 味表达”清单。',
+                `现在进行第 ${roundNum} 轮「原著真迹 vs AI 盲测仿写」法医级盲评对比与文风圣经迭代升级——目标作品：《${novelData.title}》。`,
+                prevScoresText,
+                '请把下面两段写同一件事的文本逐句对比，客观评估 AI 仿写与原作者真迹的文风相似度（0~100分，严格打分，有明显 AI 味不得超过 75 分，极度逼近真迹才给 90+ 分），揪出所有残留破绽，并升级【原著文风 DNA 圣经】！',
                 '',
-                '【本地客观统计指纹】：',
-                fingerprintText,
+                '严格按以下三个标签输出：',
+                '<score>',
+                '（仅输出 0~100 的整数总分，例如：86）',
+                '</score>',
+                '<diff_notes>',
+                '（先给出一行分项评分：句式节奏 X/20 | 视角心理 X/20 | 对话口癖 X/20 | 尺度氛围 X/20 | 去AI味纯度 X/20；再用 3~5 条具体要点列出本轮揪出的残留破绽及原著真迹对比）',
+                '</diff_notes>',
+                '<style_dna>',
+                '（升级后的深度版《原著文风 DNA 圣经》，**必须保持 1,800 ~ 2,800 字的详尽实操体量**，严禁把之前已经验证有效的铁律删减或浓缩成空话！必须保留并持续扩充：',
+                '  一、叙事视角与心理表达铁律（附实句示例）',
+                '  二、句式、段长、排版与对话标点口癖（附实句示例）',
+                '  三、核心人物声线反差与互动动力学',
+                '  四、分场景推进节奏与内容尺度边界',
+                '  五、原作者招牌动词、感官抓手与高频语感库',
+                '  六、【经多轮盲测累积的反 AI 味纠偏黑名单】（每条采用“❌ AI常见错误写法 → ✅ 原著真实写法”的实句对照））',
+                '</style_dna>',
                 '',
-                '【原著样本 A】：',
-                samples.sampleA,
+                '【当前版文风圣经（请在此基础上吸收新发现并强化，不要丢失旧铁律）】：',
+                currentStyleCard,
                 '',
-                '【原著样本 B】：',
-                samples.sampleB,
+                `【原作者真实原文（${holdout.label}）】：`,
+                holdout.text,
+                '',
+                '【AI 本轮盲测仿写稿】：',
+                blindRewrite,
             ].join('\n'),
-        }),
-        () => callModel({
-            stage: '1B_dialogue_excerpts',
-            systemPrompt: analystSystem,
-            prompt: [
-                `以下是小说《${novelData.title}》的两段原著样本。`,
-                '请完成两项任务，严格按 `<dialogue_pacing>` 和 `<excerpts>` 两个标签输出：',
-                '1. 在 `<dialogue_pacing>` 中解剖：',
-                '   - 对话风格：台词长度、口语化程度、断句停顿与标点习惯（省略号、波浪号、感叹号、特殊语气词）。',
-                '   - 动作夹杂方式：台词前后怎么配动作神态？',
-                '   - 场景推进节奏：铺垫长度、转场速度、情绪爆发频率。',
-                '2. 在 `<excerpts>` 中，从下方样本里**一字不改原样摘录** 2 段最具作者灵魂辨识度的原文片段（每段 150~240 字，标注代表什么风格特征），供后续 Few-Shot 语感锚定。',
-                '',
-                '【原著样本 A】：',
-                samples.sampleA,
-                '',
-                '【原著样本 B】：',
-                samples.sampleB,
-            ].join('\n'),
-        }),
-    ], concurrency);
+        });
 
-    const syntaxNotes = stripNonStoryBlocks(anatomySyntaxRaw);
-    const dialogueNotes = extractTaggedSection(anatomyDialogueRaw, 'dialogue_pacing');
-    const goldenExcerpts = extractTaggedSection(anatomyDialogueRaw, 'excerpts');
+        const roundScore = extractFidelityScore(calibrationRaw);
+        const roundDiffNotes = extractTaggedSection(calibrationRaw, 'diff_notes');
+        const nextStyleCard = extractTaggedSection(calibrationRaw, 'style_dna');
+        if (nextStyleCard && nextStyleCard.length >= 200) {
+            currentStyleCard = nextStyleCard;
+        }
 
-    // Stage 2: Bounded 2-way parallel (2A Merge Draft Style DNA || 2B Strip Holdout Truth into dry event outline)
-    onProgress({
-        step: 2,
-        totalSteps: 4,
-        label: `步骤 2/4（并发 ${concurrency} 路）：融合初版文风 DNA 卡 & 剥离盲测事件大纲...`,
-    });
+        roundHistory.push({
+            round: roundNum,
+            holdoutLabel: holdout.label,
+            score: roundScore,
+            diffNotes: roundDiffNotes,
+        });
 
-    const [draftCardRaw, dryOutlineRaw] = await runBoundedPool([
-        () => callModel({
-            stage: '2A_merge_draft',
-            systemPrompt: analystSystem,
-            prompt: [
-                `请将以下关于《${novelData.title}》的本地统计指纹与两份微观文风剖析，去噪融合成一份精炼、可直接下发给续写 AI 执行的【初版原著文风 DNA 执行卡】（严格控制在 500~750 字内）。`,
-                '要求：剔除只属于单个情节的细节，只保留跨章稳定的作者笔法、节奏、对话习惯、尺度要求与初步禁忌。',
-                '请用 `<style_dna>...</style_dna>` 包裹输出。',
-                '',
-                '【本地客观统计指纹】：',
-                fingerprintText,
-                '',
-                '【微观句法与尺度剖析】：',
-                syntaxNotes,
-                '',
-                '【对话与节奏剖析】：',
-                dialogueNotes,
-            ].join('\n'),
-        }),
-        () => callModel({
-            stage: '2B_extract_dry_outline',
-            systemPrompt: '你是剧情梗概提炼员。你的任务是把一段小说原文剥光一切文风、修辞、心理修饰和原句措辞，只还原成 3~4 句极度干瘪、客观、白开水般的“事件清单”，用于后续盲测仿写。',
-            prompt: [
-                '请将下面这段小说原文压缩成 3~4 句干瘪客观的事件大纲（说明时间地点、出场人物、依次发生的具体动作/结果，严禁照抄原句修辞与台词）：',
-                '',
-                samples.holdoutTruth,
-            ].join('\n'),
-        }),
-    ], concurrency);
+        // Early convergence if >= 2 rounds completed and score already reached 92+
+        if (!isIncremental && roundNum >= 2 && roundScore !== null && roundScore >= 92) {
+            break;
+        }
+    }
 
-    const draftStyleCard = extractTaggedSection(draftCardRaw, 'style_dna');
-    const dryOutline = stripNonStoryBlocks(dryOutlineRaw);
-
-    // Stage 3: Serial Blind Rewrite Test (1 API call)
-    onProgress({
-        step: 3,
-        totalSteps: 4,
-        label: '步骤 3/4（盲测考试）：不看原著真迹，仅凭初版文风卡蒙眼仿写测试段...',
-    });
-
-    const blindRewriteRaw = await callModel({
-        stage: '3_blind_rewrite',
-        systemPrompt: '你是一位小说代笔作者。请严格遵照给定的《原著文风 DNA 执行卡》和《灵魂原文范例》的笔触、节奏、标点和尺度，将给定的干瘪事件大纲扩写成一段 700~900 字的小说正文。直接输出正文，切勿解释。',
-        prompt: [
-            `【目标作品】：《${novelData.title}》`,
-            '【本地硬指标】：',
-            fingerprintText,
-            '',
-            '【初版原著文风 DNA 执行卡】：',
-            draftStyleCard,
-            '',
-            '【原著灵魂原文范例】：',
-            goldenExcerpts,
-            '',
-            '【本次盲测事件大纲（请按上述文风扩写成 700~900 字连续正文）】：',
-            dryOutline,
-        ].join('\n'),
-    });
-    const blindRewrite = stripNonStoryBlocks(blindRewriteRaw);
-
-    // Stage 4: Serial Forensic Diff & Final Calibration (1 API call)
-    onProgress({
-        step: 4,
-        totalSteps: 4,
-        label: '步骤 4/4（真迹找茬纠偏）：左右对比原著真迹 vs 盲测仿写，锻造终版文风 DNA 卡...',
-    });
-
-    const finalCalibrationRaw = await callModel({
-        stage: '4_forensic_diff',
-        systemPrompt: analystSystem,
-        prompt: [
-            `现在进行最关键的「对抗找茬与终版文风校准」——目标作品：《${novelData.title}》。`,
-            '下面左边（真迹）是原作者真实写的原文，右边（盲测稿）是 AI 仅凭【初版文风卡】写出来的仿写稿。',
-            '请你做残酷、逐句的法医级盲评对比，找出所有暴露“AI 味”或偏离原作者味道的破绽（例如：是不是比喻太文艺/太书面？是不是多写了多余心理剖析或说教？是不是节奏拖慢了、对话太端着、情绪温度不对、或者内容尺度缩水/变形？），并据此修正【初版文风卡】！',
-            '',
-            '严格按以下两个标签输出：',
-            '<diff_notes>',
-            '（用 3~5 条精简要点列出本次盲测揪出的最大 AI 味破绽与修正方向，供作者审阅）',
-            '</diff_notes>',
-            '<style_dna>',
-            '（最终定稿版《原著文风 DNA 执行卡》，650~900 字，必须包含：',
-            '  1. 叙事视角与心理表达铁律',
-            '  2. 句式、段长与对话标点口癖',
-            '  3. 剧情推进节奏与内容尺度定位（明确贴合原著尺度）',
-            '  4. 招牌描写抓手与高频语感',
-            '  5. 【经盲测揪出的反 AI 味纠偏黑名单】（用“❌ 禁止…… → ✅ 改为……”的实操写法））',
-            '</style_dna>',
-            '',
-            '【初版文风卡】：',
-            draftStyleCard,
-            '',
-            `【原作者真实原文（${samples.holdoutLabel}）】：`,
-            samples.holdoutTruth,
-            '',
-            '【AI 盲测仿写稿】：',
-            blindRewrite,
-        ].join('\n'),
-    });
-
-    const diffFindings = extractTaggedSection(finalCalibrationRaw, 'diff_notes');
-    const finalStyleCard = extractTaggedSection(finalCalibrationRaw, 'style_dna');
+    const latestScore = roundHistory.length > 0 ? roundHistory[roundHistory.length - 1].score : null;
+    const summaryDiffFindings = roundHistory
+        .map(r => `【第 ${r.round} 轮盲测 · ${r.holdoutLabel} · 相似度：${r.score !== null ? `${r.score}/100` : '已评估'}】\n${r.diffNotes}`)
+        .join('\n\n');
 
     return {
-        version: 1,
+        version: 2,
         title: novelData.title,
         cutoffChapterIndex: cutoff,
         distilledAt: Date.now(),
+        roundsCompleted: roundHistory.length,
+        latestScore,
+        roundHistory,
         fingerprint,
         fingerprintText,
-        styleCard: finalStyleCard || draftStyleCard,
+        styleCard: currentStyleCard,
         goldenExcerpts,
-        diffFindings,
+        diffFindings: summaryDiffFindings,
     };
 }

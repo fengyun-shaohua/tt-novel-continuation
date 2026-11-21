@@ -1019,3 +1019,31 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     max-height: 150px;
     overflow-y: auto;
 }
+
+.tt-novel-row-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+}
+
+@media (max-width: 640px) {
+    .tt-novel-row-3 {
+        grid-template-columns: 1fr;
+    }
+}
+
+.tt-novel-outline-card > summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.tt-novel-outline-card.is-sent {
+    opacity: 0.72;
+}
+
+.tt-novel-outline-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 6px;
+}

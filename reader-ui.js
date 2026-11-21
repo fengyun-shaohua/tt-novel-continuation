@@ -23,6 +23,7 @@ let handlers = {};
 
 const outlineDraftUiState = {
     userBrief: '',
+    chapterCount: 3,
     sceneCount: 4,
     paceMode: 'slow',
     selectedHookIds: null, // null = auto-inherit pinned hooks
@@ -250,6 +251,7 @@ export async function refreshReaderWidgets() {
         outlineDraftUiState.initializedForScope = currentChatKey;
         const saved = ledger?.draftOutline;
         outlineDraftUiState.userBrief = saved?.userBrief || '';
+        outlineDraftUiState.chapterCount = Number(saved?.chapterCount || 3);
         outlineDraftUiState.sceneCount = Number(saved?.sceneCount || 4);
         outlineDraftUiState.paceMode = saved?.paceMode || 'slow';
         outlineDraftUiState.selectedHookIds = Array.isArray(saved?.selectedHookIds) ? [...saved.selectedHookIds] : null;
@@ -364,6 +366,47 @@ function renderOutlineTab(bodyEl) {
             </div>
         `;
 
+    const savedChapters = Array.isArray(savedDraft?.chapters) && savedDraft.chapters.length > 0
+        ? savedDraft.chapters
+        : (savedDraft?.outlineText
+            ? [{
+                id: 'outline_ch_legacy_1',
+                chapterIndex: Number(savedDraft.targetChapterIndex || cachedAnchorInfo?.nextChapterIndex || 1),
+                title: `第 ${Number(savedDraft.targetChapterIndex || cachedAnchorInfo?.nextChapterIndex || 1)} ${cachedAnchorInfo?.chapterUnit || '章'}`,
+                text: savedDraft.outlineText,
+                sent: false,
+            }]
+            : []);
+
+    const chapterCardsHtml = savedChapters.length === 0
+        ? '<div class="tt-novel-empty">尚未生成分章导演大纲。在上方写 1~3 句简略过程与结果，选好规划章数（1~8 章），点「🎬 生成原味导演大纲」即可自动拆分出逐章分镜队列！</div>'
+        : savedChapters.map((ch, idx) => `
+            <details class="tt-novel-card tt-novel-outline-card ${ch.sent ? 'is-sent' : ''}" data-outline-id="${escapeHtml(ch.id)}" ${(!ch.sent || savedChapters.length <= 2) ? 'open' : ''}>
+                <summary class="tt-novel-card-head">
+                    <div class="tt-novel-timeline-meta">
+                        <span class="tt-novel-chip ${ch.sent ? 'is-ok' : 'is-gold'}">${ch.sent ? '✅ 已发' : `待写 #${idx + 1}`}</span>
+                        <strong>${escapeHtml(ch.title || `第 ${ch.chapterIndex} 章`)}</strong>
+                    </div>
+                    <span class="tt-novel-muted">${String(ch.text || '').length} 字</span>
+                </summary>
+                <div class="tt-novel-outline-card-body">
+                    <textarea class="text_pole tt-novel-style-editor" rows="7" data-outline-text="${escapeHtml(ch.id)}">${escapeHtml(ch.text || '')}</textarea>
+                    <div class="tt-novel-action-bar">
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="fill-outline-ch" data-id="${escapeHtml(ch.id)}">
+                            📋 填入此章
+                        </button>
+                        <button type="button" class="menu_button tt-novel-btn-sm tt-novel-btn-primary" data-action="send-outline-ch" data-id="${escapeHtml(ch.id)}">
+                            🚀 续写此章
+                        </button>
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="toggle-outline-sent" data-id="${escapeHtml(ch.id)}">
+                            ${ch.sent ? '↩️ 标为待写' : '✅ 标为已写'}
+                        </button>
+                        <button type="button" class="tt-novel-mini-icon-btn" data-action="del-outline-ch" data-id="${escapeHtml(ch.id)}" title="删除此章大纲">🗑️</button>
+                    </div>
+                </div>
+            </details>
+        `).join('');
+
     bodyEl.innerHTML = `
         <div class="tt-novel-banner">
             <div><b>📍 ${escapeHtml(anchorText)}</b></div>
@@ -371,64 +414,69 @@ function renderOutlineTab(bodyEl) {
         </div>
 
         <section class="tt-novel-section tt-novel-card">
-            <div class="tt-novel-section-title">📝 输入你的简略过程与结果（只需 1~3 句大白话，AI 帮你扩成原著风多切镜导演大纲）</div>
-            <textarea id="tt-novel-outline-brief" class="text_pole" rows="3" placeholder="例如：次日清晨设备改造收尾，博士来探口风试探昨晚吃饭的事但没挑破照片，贪鼬顺手碰一下帘子后门的伏笔并再次试探凯尔希，结尾定下明天出海。&#10;（也可以留空，点下方「🎲 留空自动构思下一章」让 AI 顺着当前伏笔直接给方案！）">${escapeHtml(outlineDraftUiState.userBrief || '')}</textarea>
-            <div class="tt-novel-row-2">
-                <label class="tt-novel-muted">切镜数量：
-                    <select id="tt-novel-outline-scenes" class="text_pole">
-                        <option value="3" ${Number(outlineDraftUiState.sceneCount) === 3 ? 'selected' : ''}>3 镜头（紧凑）</option>
-                        <option value="4" ${Number(outlineDraftUiState.sceneCount || 4) === 4 ? 'selected' : ''}>4 镜头（原著标准·推荐）</option>
-                        <option value="5" ${Number(outlineDraftUiState.sceneCount) === 5 ? 'selected' : ''}>5 镜头（多线冷热交替）</option>
+            <div class="tt-novel-section-title">📝 输入简略过程与结果（可一次规划 1~8 章连贯卷纲，逐章点击续写）</div>
+            <textarea id="tt-novel-outline-brief" class="text_pole" rows="3" placeholder="例如：出海前博士来试探但没挑破照片，设备修好顺手碰一下帘子后门的伏笔；随后登船出海遇远海黑雾白光，凯尔希察觉秘宝漏洞但暂时稳住，最后抵达核心海域。&#10;（也可以留空，点下方「🎲 留空自动构思」让 AI 顺着当前伏笔直接给方案！）">${escapeHtml(outlineDraftUiState.userBrief || '')}</textarea>
+            <div class="tt-novel-row-3">
+                <label class="tt-novel-muted">规划章数：
+                    <select id="tt-novel-outline-chapters" class="text_pole">
+                        <option value="1" ${Number(outlineDraftUiState.chapterCount) === 1 ? 'selected' : ''}>1 章（单章精细）</option>
+                        <option value="2" ${Number(outlineDraftUiState.chapterCount) === 2 ? 'selected' : ''}>2 章（上下连篇）</option>
+                        <option value="3" ${Number(outlineDraftUiState.chapterCount || 3) === 3 ? 'selected' : ''}>3 章（小高潮篇·推荐）</option>
+                        <option value="5" ${Number(outlineDraftUiState.chapterCount) === 5 ? 'selected' : ''}>5 章（完整卷纲）</option>
+                        <option value="8" ${Number(outlineDraftUiState.chapterCount) === 8 ? 'selected' : ''}>8 章（长线规划）</option>
                     </select>
                 </label>
-                <label class="tt-novel-muted">剧情推进步幅：
+                <label class="tt-novel-muted">每章切镜：
+                    <select id="tt-novel-outline-scenes" class="text_pole">
+                        <option value="3" ${Number(outlineDraftUiState.sceneCount) === 3 ? 'selected' : ''}>3 镜头（紧凑）</option>
+                        <option value="4" ${Number(outlineDraftUiState.sceneCount || 4) === 4 ? 'selected' : ''}>4 镜头（原著标准）</option>
+                        <option value="5" ${Number(outlineDraftUiState.sceneCount) === 5 ? 'selected' : ''}>5 镜头（多线交替）</option>
+                    </select>
+                </label>
+                <label class="tt-novel-muted">推进步幅：
                     <select id="tt-novel-outline-pace" class="text_pole">
-                        <option value="slow" ${outlineDraftUiState.paceMode === 'slow' ? 'selected' : ''}>温水煮青蛙（稳步铺垫·不急摊牌）</option>
-                        <option value="medium" ${outlineDraftUiState.paceMode === 'medium' ? 'selected' : ''}>中速推进（小冲突/试探升级）</option>
-                        <option value="climax" ${outlineDraftUiState.paceMode === 'climax' ? 'selected' : ''}>高潮爆点（重点回收伏笔）</option>
+                        <option value="slow" ${outlineDraftUiState.paceMode === 'slow' ? 'selected' : ''}>温水煮青蛙（稳步铺垫）</option>
+                        <option value="medium" ${outlineDraftUiState.paceMode === 'medium' ? 'selected' : ''}>中速推进（小冲突升级）</option>
+                        <option value="climax" ${outlineDraftUiState.paceMode === 'climax' ? 'selected' : ''}>高潮爆点（回收关键伏笔）</option>
                     </select>
                 </label>
             </div>
             <details class="tt-novel-fold-card" ${openHooks.length <= 8 ? 'open' : ''}>
-                <summary>🎯 勾选本章想顺手沾边或推进的伏笔（已选 ${selectedHookSet.size} / ${openHooks.length}，建议每次只选 1~2 条）</summary>
+                <summary>🎯 勾选本次规划想沾边或推进的伏笔（已选 ${selectedHookSet.size} / ${openHooks.length}，多章规划会自动均摊到各章）</summary>
                 <div style="margin-top: 6px;">${hookPickerHtml}</div>
             </details>
             <div class="tt-novel-action-bar">
                 <button type="button" id="tt-novel-outline-generate" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
-                    🎬 生成原味导演大纲 (1次API · 套预设)
+                    🎬 生成 ${Number(outlineDraftUiState.chapterCount || 3)} 章原味导演大纲 (1次API · 套预设)
                 </button>
                 <button type="button" id="tt-novel-outline-auto" class="menu_button" ${task.running ? 'disabled' : ''}>
-                    🎲 留空自动构思下一章
+                    🎲 留空自动构思 ${Number(outlineDraftUiState.chapterCount || 3)} 章
                 </button>
             </div>
         </section>
 
         ${progressHtml}
 
-        <section class="tt-novel-section tt-novel-card">
-            <div class="tt-novel-section-title">📋 生成结果（可直接手动微调，确认后一键送入聊天框续写）</div>
-            <textarea id="tt-novel-outline-output" class="text_pole tt-novel-style-editor" rows="10" placeholder="点击上方「🎬 生成原味导演大纲」后，严格贴合原著节奏、零网文八股的分镜导演大纲会显示在这里...">${escapeHtml(savedDraft?.outlineText || '')}</textarea>
-            <div class="tt-novel-action-bar">
-                <button type="button" id="tt-novel-outline-fill" class="menu_button" ${!savedDraft?.outlineText ? '' : ''}>
-                    📋 一键填入聊天输入框
-                </button>
-                <button type="button" id="tt-novel-outline-send" class="menu_button tt-novel-btn-primary">
-                    🚀 填入并直接续写本章
-                </button>
-                <button type="button" id="tt-novel-outline-save" class="menu_button tt-novel-btn-sm">
-                    💾 暂存修改
-                </button>
+        <section class="tt-novel-section">
+            <div class="tt-novel-card-head">
+                <div class="tt-novel-section-title">📋 分章导演大纲队列（共 ${savedChapters.length} 章 · 可逐章微调并一键续写）</div>
+                ${savedChapters.length > 0 ? '<button type="button" id="tt-novel-outline-save-all" class="menu_button tt-novel-btn-sm">💾 保存全部修改</button>' : ''}
             </div>
+            <div class="tt-novel-card-stack">${chapterCardsHtml}</div>
         </section>
     `;
 
     const briefEl = bodyEl.querySelector('#tt-novel-outline-brief');
+    const chaptersEl = bodyEl.querySelector('#tt-novel-outline-chapters');
     const scenesEl = bodyEl.querySelector('#tt-novel-outline-scenes');
     const paceEl = bodyEl.querySelector('#tt-novel-outline-pace');
-    const outputEl = bodyEl.querySelector('#tt-novel-outline-output');
 
     briefEl?.addEventListener('input', (e) => {
         outlineDraftUiState.userBrief = String(e.target.value || '');
+    });
+    chaptersEl?.addEventListener('change', (e) => {
+        outlineDraftUiState.chapterCount = Math.max(1, Math.min(8, Number(e.target.value) || 3));
+        renderWorkbench();
     });
     scenesEl?.addEventListener('change', (e) => {
         outlineDraftUiState.sceneCount = Math.max(2, Math.min(6, Number(e.target.value) || 4));
@@ -456,6 +504,7 @@ function renderOutlineTab(bodyEl) {
             userBrief: brief,
             selectedHookIds: outlineDraftUiState.selectedHookIds || [],
             sceneCount: outlineDraftUiState.sceneCount,
+            chapterCount: outlineDraftUiState.chapterCount,
             paceMode: outlineDraftUiState.paceMode,
         });
     });
@@ -465,16 +514,27 @@ function renderOutlineTab(bodyEl) {
             userBrief: '',
             selectedHookIds: outlineDraftUiState.selectedHookIds || [],
             sceneCount: outlineDraftUiState.sceneCount,
+            chapterCount: outlineDraftUiState.chapterCount,
             paceMode: outlineDraftUiState.paceMode,
         });
     });
 
-    const saveCurrentDraft = async () => {
+    const collectEditedChapters = () => savedChapters.map(ch => {
+        const ta = bodyEl.querySelector(`textarea[data-outline-text="${CSS.escape(ch.id)}"]`);
+        return {
+            ...ch,
+            text: ta ? String(ta.value || '').trim() : ch.text,
+        };
+    });
+
+    const persistDraftChapters = async (updatedChapters) => {
         const cur = await loadLedger();
         cur.draftOutline = {
             ...(cur.draftOutline || {}),
             userBrief: String(briefEl?.value || '').trim(),
-            outlineText: String(outputEl?.value || '').trim(),
+            chapters: updatedChapters,
+            outlineText: updatedChapters.map(c => c.text).join('\n\n---\n\n'),
+            chapterCount: outlineDraftUiState.chapterCount,
             sceneCount: outlineDraftUiState.sceneCount,
             paceMode: outlineDraftUiState.paceMode,
             selectedHookIds: [...(outlineDraftUiState.selectedHookIds || [])],
@@ -484,19 +544,47 @@ function renderOutlineTab(bodyEl) {
         cachedLedger = cur;
     };
 
-    bodyEl.querySelector('#tt-novel-outline-save')?.addEventListener('click', async () => {
-        await saveCurrentDraft();
-        globalThis.toastr?.success?.('已暂存当前导演大纲草稿！', '小说续写阅读器');
+    bodyEl.querySelector('#tt-novel-outline-save-all')?.addEventListener('click', async () => {
+        await persistDraftChapters(collectEditedChapters());
+        globalThis.toastr?.success?.('已保存全部章节大纲修改！', '小说续写阅读器');
     });
 
-    bodyEl.querySelector('#tt-novel-outline-fill')?.addEventListener('click', async () => {
-        await saveCurrentDraft();
-        handlers.onApplyOutlineToChat?.(String(outputEl?.value || '').trim(), { autoSend: false });
+    bodyEl.querySelectorAll('[data-action="fill-outline-ch"], [data-action="send-outline-ch"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const autoSend = btn.getAttribute('data-action') === 'send-outline-ch';
+            const edited = collectEditedChapters();
+            const target = edited.find(c => c.id === id);
+            if (!target || !target.text) {
+                globalThis.toastr?.warning?.('该章大纲为空', '小说续写阅读器');
+                return;
+            }
+            target.sent = true;
+            await persistDraftChapters(edited);
+            handlers.onApplyOutlineToChat?.(target.text, { autoSend });
+        });
     });
 
-    bodyEl.querySelector('#tt-novel-outline-send')?.addEventListener('click', async () => {
-        await saveCurrentDraft();
-        handlers.onApplyOutlineToChat?.(String(outputEl?.value || '').trim(), { autoSend: true });
+    bodyEl.querySelectorAll('[data-action="toggle-outline-sent"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const edited = collectEditedChapters();
+            const target = edited.find(c => c.id === id);
+            if (target) {
+                target.sent = !target.sent;
+                await persistDraftChapters(edited);
+                renderWorkbench();
+            }
+        });
+    });
+
+    bodyEl.querySelectorAll('[data-action="del-outline-ch"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const edited = collectEditedChapters().filter(c => c.id !== id);
+            await persistDraftChapters(edited);
+            renderWorkbench();
+        });
     });
 }
 

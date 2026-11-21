@@ -1193,6 +1193,7 @@ async function runGenerateDirectorOutlineTask({
     userBrief = '',
     selectedHookIds = [],
     sceneCount = 4,
+    chapterCount = 1,
     paceMode = 'slow',
 } = {}) {
     const novelData = await loadNovelData();
@@ -1210,11 +1211,12 @@ async function runGenerateDirectorOutlineTask({
         return;
     }
 
+    const count = Math.max(1, Math.min(8, Number(chapterCount) || 1));
     const ledger = await loadLedger();
     updateLiveProgress('outline', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡与所选伏笔策划原味分镜大纲...`,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡与所选伏笔策划连续 ${count} 章原味分镜大纲...`,
     });
 
     try {
@@ -1225,6 +1227,7 @@ async function runGenerateDirectorOutlineTask({
             userBrief,
             selectedHookIds,
             sceneCount,
+            chapterCount: count,
             paceMode,
             callModel: caller.callModel,
         });
@@ -1232,19 +1235,24 @@ async function runGenerateDirectorOutlineTask({
         ledger.draftOutline = {
             userBrief: String(userBrief || '').trim(),
             outlineText: res.outlineText,
+            chapters: res.chapters,
             sceneCount: Number(sceneCount) || 4,
+            chapterCount: count,
             paceMode: paceMode || 'slow',
             selectedHookIds: [...(selectedHookIds || [])],
             targetChapterIndex: res.targetChapterIndex,
             updatedAt: res.generatedAt,
         };
         await saveLedger(ledger);
+        const rangeLabel = res.chapters.length > 1
+            ? `第 ${res.targetChapterIndex}~${res.endChapterIndex} 章（共 ${res.chapters.length} 章分镜队列）`
+            : `第 ${res.targetChapterIndex} 章`;
         updateLiveProgress('outline', {
             isRunning: false,
-            text: `✅ 第 ${res.targetChapterIndex} 章原味导演大纲已生成（${res.outlineText.length} 字），可直接微调后点「📋 一键填入聊天输入框」或「🚀 填入并直接续写」！`,
+            text: `✅ ${rangeLabel}原味导演大纲已生成！可逐章微调后直接点「📋 填入此章」或「🚀 续写此章」。`,
         });
         await refreshReaderWidgets();
-        globalThis.toastr?.success?.(`第 ${res.targetChapterIndex} 章原味导演大纲已就绪！`, '小说续写阅读器');
+        globalThis.toastr?.success?.(`${rangeLabel}原味导演大纲已就绪！`, '小说续写阅读器');
     } catch (error) {
         updateLiveProgress('outline', {
             isRunning: false,

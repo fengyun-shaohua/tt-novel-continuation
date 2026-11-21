@@ -1,0 +1,13 @@
+{
+    "display_name": "小说续写阅读器",
+    "loading_order": 26,
+    "generate_interceptor": "novelContinuation_interceptGeneration",
+    "js": "index.js",
+    "css": "style.css",
+    "author": "TauriTavern",
+    "version": "1.0.0",
+    "homePage": "https://github.com/Darkatse/TauriTavern",
+    "hooks": {
+        "activate": "init"
+    }
+}

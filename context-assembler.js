@@ -117,8 +117,9 @@ export function buildSingleCallContinuationContext({
 
     const hasNovel = Boolean(novelData && Array.isArray(novelData.chapters) && novelData.chapters.length > 0);
     const hasCanon = Boolean(canonDb && Array.isArray(canonDb.items) && canonDb.items.length > 0);
+    const hasStyleProfile = Boolean(ledger?.styleProfile?.styleCard && String(ledger.styleProfile.styleCard).trim());
     const hasLedger = Boolean(
-        ledger && (ledger.summaries?.length || ledger.worldStates?.length || ledger.hooks?.length),
+        ledger && (ledger.summaries?.length || ledger.worldStates?.length || ledger.hooks?.length || hasStyleProfile),
     );
 
     if (!hasNovel && !hasCanon && !hasLedger) {
@@ -180,6 +181,20 @@ export function buildSingleCallContinuationContext({
         );
     }
     sections.push(headerLines.join('\n'));
+
+    // 1.5 Distilled Original Author Style DNA Card (Highest Stylistic Authority)
+    if (hasStyleProfile) {
+        const sp = ledger.styleProfile;
+        const styleLines = ['【原著文风 DNA 执行卡（经盲测对抗蒸馏，最高文风权威——严格按此笔触、节奏与尺度执笔）】'];
+        if (sp.fingerprintText) {
+            styleLines.push('▸ 原著客观统计锚点：', sp.fingerprintText);
+        }
+        styleLines.push('▸ 终版文风铁律与反 AI 味纠偏：', String(sp.styleCard).trim());
+        if (sp.goldenExcerpts && String(sp.goldenExcerpts).trim()) {
+            styleLines.push('▸ 原著灵魂语感活样本（请模仿其行文节奏、断句与对话口癖，勿照抄情节）：', String(sp.goldenExcerpts).trim());
+        }
+        sections.push(styleLines.join('\n'));
+    }
 
     // 2. Tier 1: Active Timeline World States & Recent Summaries (Highest Priority)
     const activeStates = resolveTimelineWorldStates(ledger?.worldStates || [], targetChapterIndex - 1);

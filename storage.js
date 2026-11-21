@@ -22,6 +22,7 @@ export function createEmptyLedger() {
         summaries: [],
         worldStates: [],
         hooks: [],
+        styleProfile: null,
     };
 }
 
@@ -187,6 +188,7 @@ export async function loadLedger() {
         summaries: Array.isArray(raw.summaries) ? raw.summaries : [],
         worldStates: Array.isArray(raw.worldStates) ? raw.worldStates : [],
         hooks: Array.isArray(raw.hooks) ? raw.hooks : [],
+        styleProfile: raw.styleProfile && typeof raw.styleProfile === 'object' ? raw.styleProfile : null,
     };
 }
 

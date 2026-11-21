@@ -27,6 +27,7 @@ import {
     saveNovelData,
     syncWorldUpdatesToTavernLorebook,
 } from './storage.js';
+import { runStyleDistillationPipeline } from './style-distiller.js';
 
 const SETTINGS_KEY = 'novel_continuation';
 const EXTENSION_PROMPT_TAG = 'novel_continuation_golden_context';
@@ -76,12 +77,12 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
     }
 
     try {
-        // Keep the latest `mountAnchorChapters` (default 3, up to 50) original chapters in `coreChat`
+        // Keep the latest `mountAnchorChapters` (default 3, up to 20) original chapters in `coreChat`
         // AND merge consecutive original chapter floors into ONE continuous assistant message.
         // Merging prevents RP preset processors (like Meowssiah/SPreset `foreignArchivedBlocks.slice(0, 180)`)
         // from mistaking multiple consecutive assistant floors for foreign archive turns and truncating the cutoff chapter!
         if (Array.isArray(chat)) {
-            const anchorLimit = Math.max(1, Math.min(50, Number(settings.mountAnchorChapters) || 3));
+            const anchorLimit = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 3));
             const origPositions = [];
             chat.forEach((m, idx) => {
                 if (m?.extra?.novelContinuationOrigin === 'original') {
@@ -569,6 +570,71 @@ async function extractCutoffSnapshotSingleCall(btnEl) {
     }
 }
 
+async function distillNovelStyleAdversarial(btnEl) {
+    const novelData = await loadNovelData();
+    if (!novelData?.chapters?.length) {
+        globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件', '小说续写阅读器');
+        return;
+    }
+
+    const context = getContext();
+    if (typeof context?.generateRaw !== 'function') {
+        globalThis.toastr?.error?.('当前环境不支持 generateRaw 模型调用', '小说续写阅读器');
+        return;
+    }
+
+    const origText = btnEl ? btnEl.textContent : '';
+    const progressEl = document.getElementById('tt-novel-style-progress');
+    if (btnEl) {
+        btnEl.disabled = true;
+        btnEl.textContent = '🎨 正在对抗蒸馏原著文风...';
+    }
+    if (progressEl) {
+        progressEl.classList.remove('displayNone');
+        progressEl.textContent = '⏳ 准备启动 4 步对抗文风蒸馏（严格并发 ≤ 2）...';
+    }
+
+    try {
+        const styleProfile = await runStyleDistillationPipeline({
+            novelData,
+            maxConcurrency: 2,
+            callModel: async ({ prompt, systemPrompt }) => {
+                const reply = await context.generateRaw({ prompt, systemPrompt });
+                return String(reply || '');
+            },
+            onProgress: ({ step, totalSteps, label }) => {
+                if (progressEl) {
+                    progressEl.textContent = `⏳ [${step}/${totalSteps}] ${label}`;
+                }
+            },
+        });
+
+        const ledger = await loadLedger();
+        ledger.styleProfile = styleProfile;
+        await saveLedger(ledger);
+        await refreshSettingsStatusCard();
+        await refreshReaderWidgets();
+
+        if (progressEl) {
+            progressEl.textContent = `✅ 蒸馏完成！已为《${novelData.title}》生成终版文风 DNA 卡（并发峰值 ≤ 2），后续每章续写自动生效。`;
+        }
+        globalThis.toastr?.success?.(
+            '原著文风 4 步对抗蒸馏完成！已永久保存并自动用于后续每一章续写！',
+            '小说续写阅读器',
+        );
+    } catch (error) {
+        if (progressEl) {
+            progressEl.textContent = `❌ 蒸馏失败：${error?.message || error}`;
+        }
+        globalThis.toastr?.error?.(`文风蒸馏失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        if (btnEl) {
+            btnEl.disabled = false;
+            btnEl.textContent = origText;
+        }
+    }
+}
+
 function mountSettingsPanel() {
     const container = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
     if (!container || document.getElementById('tt_novel_continuation_panel')) return;
@@ -595,9 +661,22 @@ function mountSettingsPanel() {
                 </label>
             </div>
             <div class="tt-novel-btn-group">
+                <button type="button" id="tt-novel-distill-style" class="menu_button">🎨 蒸馏原著文风 (4步对抗 · 并发≤2)</button>
                 <button type="button" id="tt-novel-extract-cutoff" class="menu_button">⚡ 提炼断更现场状态 (仅调 1 次 API)</button>
                 <button type="button" id="tt-novel-open-toc" class="menu_button">📑 打开章节目录与截断跳转</button>
             </div>
+            <div id="tt-novel-style-progress" class="tt-novel-style-progress displayNone"></div>
+            <details id="tt-novel-style-drawer" class="tt-novel-style-drawer">
+                <summary>🧬 查看 / 手动微调《原著文风 DNA 卡》与盲测纠偏报告</summary>
+                <div class="tt-novel-style-drawer-body">
+                    <div id="tt-novel-style-diff" class="tt-novel-style-diff">尚未执行文风蒸馏。点击上方「🎨 蒸馏原著文风」按钮，插件会以并发上限 2 自动完成：客观指纹分析 → 双路解剖 → 盲测仿写 → 真迹找茬纠偏。</div>
+                    <textarea id="tt-novel-style-editor" class="text_pole tt-novel-style-editor" rows="7" placeholder="蒸馏生成的《原著文风 DNA 执行卡》会显示在这里，你也可以手动微调任意一条规则后保存..."></textarea>
+                    <div class="tt-novel-btn-group">
+                        <button type="button" id="tt-novel-save-style" class="menu_button">💾 保存文风卡修改</button>
+                        <button type="button" id="tt-novel-clear-style" class="menu_button">🗑️ 清空文风卡</button>
+                    </div>
+                </div>
+            </details>
             <hr />
             <label class="checkbox_label">
                 <input type="checkbox" id="tt-novel-chk-enabled" ${settings.enabled ? 'checked' : ''} />
@@ -633,7 +712,7 @@ function mountSettingsPanel() {
             </label>
             <div class="tt-novel-inline-field">
                 <span>续写时直接发给 AI 的末尾原著章数：</span>
-                <input type="number" id="tt-novel-anchor-count" class="text_pole" min="1" max="50" value="${settings.mountAnchorChapters}" />
+                <input type="number" id="tt-novel-anchor-count" class="text_pole" min="1" max="20" value="${settings.mountAnchorChapters}" />
             </div>
             <div class="tt-novel-btn-group">
                 <button type="button" id="tt-novel-clear-canon" class="menu_button">清空补充设定库</button>
@@ -698,8 +777,35 @@ function bindSettingsEvents(wrapper) {
         e.target.value = '';
     });
 
+    wrapper.querySelector('#tt-novel-distill-style')?.addEventListener('click', (e) => distillNovelStyleAdversarial(e.currentTarget));
     wrapper.querySelector('#tt-novel-extract-cutoff')?.addEventListener('click', (e) => extractCutoffSnapshotSingleCall(e.currentTarget));
     wrapper.querySelector('#tt-novel-open-toc')?.addEventListener('click', () => toggleTocDrawer(true));
+
+    wrapper.querySelector('#tt-novel-save-style')?.addEventListener('click', async () => {
+        const editorEl = /** @type {HTMLTextAreaElement | null} */ (document.getElementById('tt-novel-style-editor'));
+        const text = String(editorEl?.value || '').trim();
+        const ledger = await loadLedger();
+        if (!text) {
+            ledger.styleProfile = null;
+        } else {
+            ledger.styleProfile = {
+                ...(ledger.styleProfile || { version: 1, fingerprintText: '', goldenExcerpts: '', diffFindings: '' }),
+                styleCard: text,
+                distilledAt: Date.now(),
+            };
+        }
+        await saveLedger(ledger);
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(text ? '已保存修改后的《原著文风 DNA 卡》！' : '已清空文风卡', '小说续写阅读器');
+    });
+
+    wrapper.querySelector('#tt-novel-clear-style')?.addEventListener('click', async () => {
+        const ledger = await loadLedger();
+        ledger.styleProfile = null;
+        await saveLedger(ledger);
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.info?.('已清空当前书籍的原著文风 DNA 卡', '小说续写阅读器');
+    });
 
     const bindCheckbox = (selector, key) => {
         wrapper.querySelector(selector)?.addEventListener('change', (e) => {
@@ -722,7 +828,7 @@ function bindSettingsEvents(wrapper) {
     bindCheckbox('#tt-novel-chk-sync-wi', 'syncToWorldInfo');
 
     wrapper.querySelector('#tt-novel-anchor-count')?.addEventListener('change', (e) => {
-        settings.mountAnchorChapters = Math.max(1, Math.min(50, Number(e.target.value) || 3));
+        settings.mountAnchorChapters = Math.max(1, Math.min(20, Number(e.target.value) || 3));
         saveExtensionSettings();
     });
 
@@ -768,13 +874,38 @@ async function refreshSettingsStatusCard() {
 
     const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
     const openHooksCount = (ledger?.hooks || []).filter(h => h.status !== 'resolved').length;
+    const sp = ledger?.styleProfile;
     const novelLine = novelData
         ? `📚 <b>当前原著</b>：《${escapeHtml(novelData.title)}》（共 ${novelData.totalChapters} 章 · 续写锚点：第 ${novelData.cutoffChapterIndex} 章）`
         : '📚 <b>当前原著</b>：尚未导入（可导入 .txt/.md 太监或同人小说）';
+    const styleLine = sp?.styleCard
+        ? `🎨 <b>原著文风 DNA</b>：已蒸馏定稿（${String(sp.styleCard).length} 字 · 自动注入每章续写）`
+        : '🎨 <b>原著文风 DNA</b>：尚未蒸馏（点击「🎨 蒸馏原著文风」可 4 步对抗提取）';
     const ledgerLine = `🧠 <b>时间线记忆</b>：${ledger.summaries.length} 章总结 · ${ledger.worldStates.length} 条人物/世界状态 · ${openHooksCount} 条待填伏笔`;
     const canonLine = `🗂️ <b>同人补充数据库</b>：已挂载 ${canonDb.items.length} 个设定词条${canonDb.sources.length ? `（${escapeHtml(canonDb.sources.join(', '))}）` : ''}`;
 
-    card.innerHTML = `<div>${novelLine}</div><div>${ledgerLine}</div><div>${canonLine}</div>`;
+    card.innerHTML = `<div>${novelLine}</div><div>${styleLine}</div><div>${ledgerLine}</div><div>${canonLine}</div>`;
+
+    const diffEl = document.getElementById('tt-novel-style-diff');
+    if (diffEl) {
+        if (sp?.styleCard) {
+            const parts = [];
+            if (sp.fingerprintText) {
+                parts.push(`<b>📊 本地客观指纹：</b><br>${escapeHtml(sp.fingerprintText).replace(/\n/g, '<br>')}`);
+            }
+            if (sp.diffFindings) {
+                parts.push(`<b>🔍 盲测对抗揪出的 AI 味破绽与纠偏：</b><br>${escapeHtml(sp.diffFindings).replace(/\n/g, '<br>')}`);
+            }
+            diffEl.innerHTML = parts.join('<hr style="margin:6px 0;opacity:0.25;" />') || '已加载手动编辑的文风 DNA 卡。';
+        } else {
+            diffEl.textContent = '尚未执行文风蒸馏。点击上方「🎨 蒸馏原著文风」按钮，插件会以并发上限 2 自动完成：客观指纹分析 → 双路解剖 → 盲测仿写 → 真迹找茬纠偏。';
+        }
+    }
+
+    const editorEl = /** @type {HTMLTextAreaElement | null} */ (document.getElementById('tt-novel-style-editor'));
+    if (editorEl && document.activeElement !== editorEl) {
+        editorEl.value = sp?.styleCard || '';
+    }
 }
 
 function handleToggleSetting(key) {

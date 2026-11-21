@@ -481,3 +481,52 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     opacity: 0.85;
     font-size: 0.78rem;
 }
+
+/* 6. Style Distillation Progress & Editable DNA Drawer */
+.tt-novel-style-progress {
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(56, 152, 142, 0.16);
+    border: 1px solid rgba(74, 196, 183, 0.45);
+    color: #b4f5ec;
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+.tt-novel-style-drawer {
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
+    border-radius: 8px;
+    padding: 6px 10px;
+    background: rgba(0, 0, 0, 0.16);
+    font-size: 0.82rem;
+}
+
+.tt-novel-style-drawer summary {
+    cursor: pointer;
+    font-weight: 600;
+    user-select: none;
+}
+
+.tt-novel-style-drawer-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.tt-novel-style-diff {
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px dashed rgba(255, 255, 255, 0.14);
+    font-size: 0.78rem;
+    line-height: 1.6;
+}
+
+.tt-novel-style-editor {
+    width: 100%;
+    min-height: 130px;
+    font-size: 0.8rem;
+    line-height: 1.55;
+    resize: vertical;
+}

@@ -1,6 +1,7 @@
 import { extension_settings, getContext } from '/scripts/extensions.js';
 import { extension_prompt_roles, extension_prompt_types } from '/scripts/extension-prompts.js';
 import { oai_settings } from '/scripts/openai.js';
+import { getPresetManager } from '/scripts/preset-manager.js';
 import { deleteMessage, resetChatSurfaceView } from '/script.js';
 import { escapeHtml } from '/scripts/utils.js';
 import { buildSingleCallContinuationContext, resolveCurrentTargetChapterIndex } from './context-assembler.js';
@@ -28,7 +29,7 @@ import {
     saveNovelData,
     syncWorldUpdatesToTavernLorebook,
 } from './storage.js';
-import { runStyleDistillationPipeline } from './style-distiller.js';
+import { buildDistillationPresetMessages, runStyleDistillationPipeline } from './style-distiller.js';
 
 const SETTINGS_KEY = 'novel_continuation';
 const EXTENSION_PROMPT_TAG = 'novel_continuation_golden_context';
@@ -44,6 +45,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     syncToWorldInfo: true,
     mountAnchorChapters: 3,
     distillRounds: 2,
+    distillPresetName: '__current__',
     maxOriginalHits: 3,
     maxCanonHits: 4,
     maxRecentSummaries: 6,
@@ -601,6 +603,89 @@ function getActiveApiModelLabel() {
     return '当前酒馆已连接模型';
 }
 
+function getAvailableOpenAiPresetNames() {
+    try {
+        const pm = getPresetManager('openai');
+        const names = pm?.getAllPresets?.();
+        return Array.isArray(names) ? names.filter(n => typeof n === 'string' && n.trim()) : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Resolves the user-chosen Chat Completion preset for style distillation.
+ * - `''`: pure direct `generateRaw` without preset wrapping
+ * - `'__current__'`: live `oai_settings` (active Tavern preset including live toggles)
+ * - `<presetName>`: named saved preset from `getPresetManager('openai')` (fails fast if missing)
+ */
+function resolveSelectedDistillationPreset(presetSelection) {
+    const selected = String(presetSelection ?? '').trim();
+    if (!selected) {
+        return { presetObj: null, label: '不使用预设（纯净直连）' };
+    }
+
+    const pm = getPresetManager('openai');
+    if (selected === '__current__') {
+        const activeName = String(pm?.getSelectedPresetName?.() || oai_settings?.preset_settings_openai || '').trim();
+        if (Array.isArray(oai_settings?.prompts) && oai_settings.prompts.length > 0) {
+            return {
+                presetObj: oai_settings,
+                label: activeName ? `当前酒馆预设：${activeName}` : '当前酒馆预设',
+            };
+        }
+        return { presetObj: null, label: '不使用预设（当前非对话补全预设）' };
+    }
+
+    let rawPreset = pm?.getCompletionPresetByName?.(selected);
+    if (typeof rawPreset === 'string') {
+        try {
+            rawPreset = JSON.parse(rawPreset);
+        } catch {
+            rawPreset = null;
+        }
+    }
+    if (!rawPreset || !Array.isArray(rawPreset.prompts)) {
+        throw new Error(`未找到所选蒸馏预设「${selected}」，请重新选择一个已保存的酒馆对话补全预设`);
+    }
+    return { presetObj: rawPreset, label: selected };
+}
+
+function populateDistillPresetSelect(selectEl, selectedValue) {
+    if (!selectEl) return;
+    const saved = String(selectedValue ?? '__current__');
+    const names = getAvailableOpenAiPresetNames();
+    const activeName = String(getPresetManager('openai')?.getSelectedPresetName?.() || oai_settings?.preset_settings_openai || '').trim();
+
+    selectEl.innerHTML = '';
+    const optCurrent = document.createElement('option');
+    optCurrent.value = '__current__';
+    optCurrent.textContent = activeName
+        ? `使用当前酒馆预设（${activeName}）`
+        : '使用当前酒馆预设（自动跟随顶部预设）';
+    selectEl.appendChild(optCurrent);
+
+    const optNone = document.createElement('option');
+    optNone.value = '';
+    optNone.textContent = '不使用预设（纯净直连）';
+    selectEl.appendChild(optNone);
+
+    for (const name of names) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        selectEl.appendChild(opt);
+    }
+
+    if (saved && saved !== '__current__' && !names.includes(saved)) {
+        const optMissing = document.createElement('option');
+        optMissing.value = saved;
+        optMissing.textContent = `${saved}（未找到）`;
+        selectEl.appendChild(optMissing);
+    }
+    selectEl.value = saved;
+}
+
 async function distillNovelStyleAdversarial(btnEl, { incremental = false } = {}) {
     const novelData = await loadNovelData();
     if (!novelData?.chapters?.length) {
@@ -621,8 +706,17 @@ async function distillNovelStyleAdversarial(btnEl, { incremental = false } = {})
         return;
     }
 
+    let resolvedPreset;
+    try {
+        resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
+    } catch (err) {
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
     const rounds = Math.max(1, Math.min(3, Number(settings.distillRounds) || 2));
     const modelLabel = getActiveApiModelLabel();
+    const presetLabel = resolvedPreset.label;
     const origText = btnEl ? btnEl.textContent : '';
     const progressEl = document.getElementById('tt-novel-style-progress');
     if (btnEl) {
@@ -632,8 +726,8 @@ async function distillNovelStyleAdversarial(btnEl, { incremental = false } = {})
     if (progressEl) {
         progressEl.classList.remove('displayNone');
         progressEl.textContent = incremental
-            ? `⏳ 使用 [${modelLabel}] 追加 1 轮全新真迹盲测与对比评分...`
-            : `⏳ 使用 [${modelLabel}] 启动 ${rounds} 轮对抗盲测蒸馏（并发上限 ≤ 2）...`;
+            ? `⏳ 使用 [${modelLabel}] · 预设 [${presetLabel}] 追加 1 轮全新真迹盲测与对比评分...`
+            : `⏳ 使用 [${modelLabel}] · 预设 [${presetLabel}] 启动 ${rounds} 轮对抗盲测蒸馏（并发上限 ≤ 2）...`;
     }
 
     try {
@@ -643,6 +737,14 @@ async function distillNovelStyleAdversarial(btnEl, { incremental = false } = {})
             rounds,
             existingProfile: incremental ? ledger.styleProfile : null,
             callModel: async ({ prompt, systemPrompt }) => {
+                if (resolvedPreset.presetObj) {
+                    const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
+                        systemPrompt,
+                        userPrompt: prompt,
+                    });
+                    const reply = await context.generateRaw({ prompt: messages });
+                    return String(reply || '');
+                }
                 const reply = await context.generateRaw({ prompt, systemPrompt });
                 return String(reply || '');
             },
@@ -712,12 +814,16 @@ function mountSettingsPanel() {
                 <button type="button" id="tt-novel-open-toc" class="menu_button">📑 打开章节目录与截断跳转</button>
             </div>
             <div class="tt-novel-inline-field">
-                <span>文风对抗盲测迭代轮数（每轮换新真迹对比打分，≥92分提前达标）：</span>
+                <span>文风对抗盲测迭代轮数（&lt;85分自动同题重考，≥92分提前达标）：</span>
                 <select id="tt-novel-distill-rounds" class="text_pole" style="width: 88px;">
                     <option value="1" ${Number(settings.distillRounds) === 1 ? 'selected' : ''}>1 轮</option>
                     <option value="2" ${Number(settings.distillRounds || 2) === 2 ? 'selected' : ''}>2 轮 (推荐)</option>
                     <option value="3" ${Number(settings.distillRounds) === 3 ? 'selected' : ''}>3 轮 (深度)</option>
                 </select>
+            </div>
+            <div class="tt-novel-inline-field">
+                <span>🎛️ 蒸馏所用酒馆预设（自动剥离角色卡/聊天记录与脚本标记）：</span>
+                <select id="tt-novel-distill-preset" class="text_pole" style="max-width: 240px;"></select>
             </div>
             <div id="tt-novel-style-progress" class="tt-novel-style-progress displayNone"></div>
             <details id="tt-novel-style-drawer" class="tt-novel-style-drawer">
@@ -854,6 +960,16 @@ function bindSettingsEvents(wrapper) {
         settings.distillRounds = Math.max(1, Math.min(3, Number(e.target.value) || 2));
         saveExtensionSettings();
     });
+    const presetSelectEl = wrapper.querySelector('#tt-novel-distill-preset');
+    populateDistillPresetSelect(presetSelectEl, settings.distillPresetName);
+    presetSelectEl?.addEventListener('focus', () => {
+        populateDistillPresetSelect(presetSelectEl, settings.distillPresetName);
+    });
+    presetSelectEl?.addEventListener('change', (e) => {
+        settings.distillPresetName = String(e.target.value ?? '');
+        saveExtensionSettings();
+        void refreshSettingsStatusCard();
+    });
     wrapper.querySelector('#tt-novel-extract-cutoff')?.addEventListener('click', (e) => extractCutoffSnapshotSingleCall(e.currentTarget));
     wrapper.querySelector('#tt-novel-open-toc')?.addEventListener('click', () => toggleTocDrawer(true));
 
@@ -949,6 +1065,18 @@ async function refreshSettingsStatusCard() {
     if (!card) return;
 
     const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
+    const settings = getSettings();
+    const presetSelectEl = document.getElementById('tt-novel-distill-preset');
+    if (presetSelectEl && document.activeElement !== presetSelectEl) {
+        populateDistillPresetSelect(presetSelectEl, settings.distillPresetName);
+    }
+    let distillPresetLabel = '不使用预设（纯净直连）';
+    try {
+        distillPresetLabel = resolveSelectedDistillationPreset(settings.distillPresetName).label;
+    } catch {
+        distillPresetLabel = `${settings.distillPresetName}（未找到）`;
+    }
+
     const openHooksCount = (ledger?.hooks || []).filter(h => h.status !== 'resolved').length;
     const sp = ledger?.styleProfile;
     const activeModel = getActiveApiModelLabel();
@@ -961,7 +1089,7 @@ async function refreshSettingsStatusCard() {
     const styleLine = sp?.styleCard
         ? `🎨 <b>原著文风 DNA</b>：已定稿（${String(sp.styleCard).length} 字${escapeHtml(scoreChain)}）`
         : '🎨 <b>原著文风 DNA</b>：尚未蒸馏（点击「🎨 深度蒸馏原著文风」可多轮对抗提取）';
-    const modelLine = `🤖 <b>当前蒸馏/续写模型</b>：<code>${escapeHtml(activeModel)}</code>（跟随酒馆顶部 API 连接设置）`;
+    const modelLine = `🤖 <b>当前蒸馏/续写模型</b>：<code>${escapeHtml(activeModel)}</code> · 🎛️ <b>蒸馏预设</b>：<code>${escapeHtml(distillPresetLabel)}</code>`;
     const ledgerLine = `🧠 <b>时间线记忆</b>：${ledger.summaries.length} 章总结 · ${ledger.worldStates.length} 条人物/世界状态 · ${openHooksCount} 条待填伏笔`;
     const canonLine = `🗂️ <b>同人补充数据库</b>：已挂载 ${canonDb.items.length} 个设定词条${canonDb.sources.length ? `（${escapeHtml(canonDb.sources.join(', '))}）` : ''}`;
 

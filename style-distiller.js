@@ -290,6 +290,99 @@ export function extractTaggedSection(rawText, tagName) {
     return cleaned.trim();
 }
 
+const PRESET_SKIP_IDENTIFIERS = new Set([
+    'chatHistory',
+    'worldInfoBefore',
+    'worldInfoAfter',
+    'personaDescription',
+    'charDescription',
+    'charPersonality',
+    'scenario',
+    'dialogueExamples',
+    'SPresetSettings',
+    'agentSystemPrompt',
+    'agentTask',
+    'agentResults',
+]);
+
+/**
+ * Compiles a user-selected TauriTavern OpenAI/Chat Completion preset object (`prompts` + `prompt_order`)
+ * into a clean `[{ role, content }, ...]` message array for `generateRaw`, placing the distillation
+ * system + user task at the preset's `chatHistory` slot while stripping chat/card markers and CatGodML hooks.
+ *
+ * @param {any} presetObj
+ * @param {{ systemPrompt: string, userPrompt: string, customPrefix?: string }} task
+ * @returns {Array<{ role: string, content: string }>}
+ */
+export function buildDistillationPresetMessages(presetObj, { systemPrompt, userPrompt, customPrefix = '' }) {
+    const cleanPromptEntry = (raw) => String(raw ?? '')
+        .replace(/\{\{\/\/[\s\S]*?\}\}/g, '')
+        .replace(/<<<\|catgodml\|[\s\S]*?>>>/gi, '')
+        .replace(/<run_tool_replacement>/gi, '')
+        .replace(/<\|(?:sep|merge)\|>/gi, '')
+        .trim();
+
+    const taskMessages = [];
+    if (customPrefix && customPrefix.trim()) {
+        taskMessages.push({ role: 'system', content: customPrefix.trim() });
+    }
+    if (systemPrompt && systemPrompt.trim()) {
+        taskMessages.push({ role: 'system', content: systemPrompt.trim() });
+    }
+    taskMessages.push({ role: 'user', content: String(userPrompt || '').trim() });
+
+    if (!presetObj || !Array.isArray(presetObj.prompts)) {
+        return taskMessages;
+    }
+
+    const promptMap = new Map(presetObj.prompts.map(p => [p?.identifier, p]));
+    const orderBucket = Array.isArray(presetObj.prompt_order)
+        ? (presetObj.prompt_order.find(o => o?.character_id === 100001)
+            || presetObj.prompt_order.find(o => o?.character_id === 100000)
+            || presetObj.prompt_order[0])
+        : null;
+
+    const orderList = Array.isArray(orderBucket?.order)
+        ? orderBucket.order
+        : presetObj.prompts.map(p => ({ identifier: p?.identifier, enabled: p?.enabled !== false }));
+
+    const beforeHistory = [];
+    const afterHistory = [];
+    let passedChatHistory = false;
+
+    for (const item of orderList) {
+        if (!item?.identifier) continue;
+        if (item.identifier === 'chatHistory') {
+            passedChatHistory = true;
+            continue;
+        }
+        if (item.enabled === false || PRESET_SKIP_IDENTIFIERS.has(item.identifier)) {
+            continue;
+        }
+        const entry = promptMap.get(item.identifier);
+        if (!entry || entry.marker) continue;
+        const text = cleanPromptEntry(entry.content);
+        if (!text) continue;
+        const role = ['system', 'user', 'assistant'].includes(entry.role) ? entry.role : 'system';
+        if (passedChatHistory) {
+            afterHistory.push({ role, content: text });
+        } else {
+            beforeHistory.push({ role, content: text });
+        }
+    }
+
+    if (beforeHistory.length === 0 && afterHistory.length === 0) {
+        return taskMessages;
+    }
+
+    const scopeGuard = {
+        role: 'system',
+        content: '【当前后台任务说明】本次请求正在执行《原著小说文风分析与对抗蒸馏》后台任务，而非互动角色扮演对话。请严格遵循下方任务指令与要求的标签结构输出，忽略任何角色扮演状态栏、互动选项或特定开场格式要求。',
+    };
+
+    return [...beforeHistory, scopeGuard, ...taskMessages, ...afterHistory];
+}
+
 /**
  * Parses a numeric 0..100 fidelity score from `<score>...</score>`.
  * @param {string} rawText
@@ -464,11 +557,14 @@ export async function runStyleDistillationPipeline({
     // Iterative Adversarial Blind-Test & Forensic Calibration Loop
     const startRoundIdx = isIncremental ? roundHistory.length : 0;
     const loopCount = isIncremental ? 1 : targetRounds;
+    let activeHoldoutCursor = startRoundIdx % samples.holdouts.length;
+    let retestedHoldoutIdx = -1;
 
     for (let offset = 0; offset < loopCount; offset += 1) {
         const roundNum = startRoundIdx + offset + 1;
-        const holdoutIdx = (startRoundIdx + offset) % samples.holdouts.length;
+        const holdoutIdx = activeHoldoutCursor % samples.holdouts.length;
         const holdout = samples.holdouts[holdoutIdx];
+        const isRetest = retestedHoldoutIdx === holdoutIdx && offset > 0;
 
         let dryOutline = preStrippedOutlines.get(holdoutIdx);
         if (!dryOutline) {
@@ -476,7 +572,7 @@ export async function runStyleDistillationPipeline({
                 stage: `outline_round_${roundNum}`,
                 systemPrompt: outlineSystem,
                 prompt: [
-                    '请将下面这段小说原文压缩成 3~5 句极度干瘪客观的事件大纲（只写时间地点、人物、动作顺序与客观结果，严禁照抄原句修辞与台词）：',
+                    '请将下面这段小说原文压缩成 4~6 句客观的“场景与节拍清单”（按顺序列出时间地点、出场人物、每个动作与情绪转折节拍、结果，严禁照抄原句修辞与原话）：',
                     '',
                     holdout.text,
                 ].join('\n'),
@@ -485,15 +581,15 @@ export async function runStyleDistillationPipeline({
             preStrippedOutlines.set(holdoutIdx, dryOutline);
         }
 
-        // Step A of Round: Blind Rewrite (optionally prefetch next round's dry outline in parallel, concurrency <= 2!)
+        // Step A of Round: Blind Rewrite (optionally prefetch next unseen holdout's dry outline in parallel, concurrency <= 2!)
         currentStep += 1;
         onProgress({
             step: currentStep,
             totalSteps,
-            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮盲测考试）：不看「${holdout.label}」原文，仅凭当前文风圣经蒙眼仿写...`,
+            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮${isRetest ? '错题重考' : '盲测考试'}）：不看「${holdout.label}」原文，仅凭当前文风圣经蒙眼仿写...`,
         });
 
-        const nextHoldoutIdx = (startRoundIdx + offset + 1) % samples.holdouts.length;
+        const nextHoldoutIdx = (holdoutIdx + 1) % samples.holdouts.length;
         const shouldPrefetchNextOutline = (offset + 1 < loopCount) && !preStrippedOutlines.has(nextHoldoutIdx);
 
         const roundTasks = [
@@ -505,13 +601,13 @@ export async function runStyleDistillationPipeline({
                     '【本地硬指标】：',
                     fingerprintText,
                     '',
-                    '【当前版原著文风 DNA 圣经】：',
+                    '【当前版原著文风 DNA 圣经（请逐条严格执行，特别遵守反 AI 味黑名单）】：',
                     currentStyleCard,
                     '',
                     '【原著灵魂原文范例】：',
                     goldenExcerpts,
                     '',
-                    '【本次盲测事件大纲（请严格按上述文风圣经扩写成 800~1000 字连续正文）】：',
+                    '【本次盲测事件节拍大纲（请严格按上述文风圣经扩写成 750~950 字连续正文）】：',
                     dryOutline,
                 ].join('\n'),
             }),
@@ -523,7 +619,7 @@ export async function runStyleDistillationPipeline({
                 stage: `outline_round_${roundNum + 1}`,
                 systemPrompt: outlineSystem,
                 prompt: [
-                    '请将下面这段小说原文压缩成 3~5 句极度干瘪客观的事件大纲（只写时间地点、人物、动作顺序与客观结果，严禁照抄原句修辞与台词）：',
+                    '请将下面这段小说原文压缩成 4~6 句客观的“场景与节拍清单”（按顺序列出时间地点、出场人物、每个动作与情绪转折节拍、结果，严禁照抄原句修辞与原话）：',
                     '',
                     nextHoldout.text,
                 ].join('\n'),
@@ -536,12 +632,12 @@ export async function runStyleDistillationPipeline({
             preStrippedOutlines.set(nextHoldoutIdx, stripNonStoryBlocks(prefetchedOutlineRaw));
         }
 
-        // Step B of Round: Forensic Diff, Fidelity Scoring (0~100), & Style Bible Patching
+        // Step B of Round: Forensic Diff, Pure-Style Fidelity Scoring (0~100), & Style Bible Patching
         currentStep += 1;
         onProgress({
             step: currentStep,
             totalSteps,
-            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮真迹对比评分）：左右对照原著真迹与盲测仿写，打分并迭代强化文风圣经...`,
+            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮纯文风对比评分）：左右对照原著真迹与盲测仿写，打分并迭代强化文风圣经...`,
         });
 
         const prevScoresText = roundHistory.length > 0
@@ -554,17 +650,19 @@ export async function runStyleDistillationPipeline({
             prompt: [
                 `现在进行第 ${roundNum} 轮「原著真迹 vs AI 盲测仿写」法医级盲评对比与文风圣经迭代升级——目标作品：《${novelData.title}》。`,
                 prevScoresText,
-                '请把下面两段写同一件事的文本逐句对比，客观评估 AI 仿写与原作者真迹的文风相似度（0~100分，严格打分，有明显 AI 味不得超过 75 分，极度逼近真迹才给 90+ 分），揪出所有残留破绽，并升级【原著文风 DNA 圣经】！',
+                '【重要评分纪律】：因为 AI 盲写时只看过干瘪事件大纲、没看过原文，**严禁因为具体台词措辞不同或大纲未提及的情节细节差异而扣分！**',
+                '请严格只针对 **5 个纯文风维度** 客观打分（满分 100）：句式段长节奏(20) + 叙事视角与心理克制度(20) + 对话口癖与标点质感(20) + 氛围推进与原著尺度贴合度(20) + 反AI味纯度(20)。',
+                '如果 AI 仿写已经很贴近原作者的笔触、节奏、标点和尺度且基本无 AI 套话，应公正给出 85~95 分；有明显 AI 味或节奏/尺度跑偏则如实扣分并揪出破绽！',
                 '',
                 '严格按以下三个标签输出：',
                 '<score>',
-                '（仅输出 0~100 的整数总分，例如：86）',
+                '（仅输出 0~100 的整数总分，例如：88）',
                 '</score>',
                 '<diff_notes>',
-                '（先给出一行分项评分：句式节奏 X/20 | 视角心理 X/20 | 对话口癖 X/20 | 尺度氛围 X/20 | 去AI味纯度 X/20；再用 3~5 条具体要点列出本轮揪出的残留破绽及原著真迹对比）',
+                '（先给出一行分项评分：句式节奏 X/20 | 视角心理 X/20 | 对话口癖 X/20 | 尺度氛围 X/20 | 去AI味纯度 X/20；再用 3~5 条具体要点列出本轮揪出的残留文风破绽及原著真迹对比）',
                 '</diff_notes>',
                 '<style_dna>',
-                '（升级后的深度版《原著文风 DNA 圣经》，**必须保持 1,800 ~ 2,800 字的详尽实操体量**，严禁把之前已经验证有效的铁律删减或浓缩成空话！必须保留并持续扩充：',
+                '（升级后的深度版《原著文风 DNA 圣经》，**必须保持 1,800 ~ 2,800 字的详尽实操体量**，**严格增量强化——严禁删减或概括丢弃上一轮已经验证有效的铁律和反 AI 味黑名单条目！** 必须包含：',
                 '  一、叙事视角与心理表达铁律（附实句示例）',
                 '  二、句式、段长、排版与对话标点口癖（附实句示例）',
                 '  三、核心人物声线反差与互动动力学',
@@ -573,7 +671,7 @@ export async function runStyleDistillationPipeline({
                 '  六、【经多轮盲测累积的反 AI 味纠偏黑名单】（每条采用“❌ AI常见错误写法 → ✅ 原著真实写法”的实句对照））',
                 '</style_dna>',
                 '',
-                '【当前版文风圣经（请在此基础上吸收新发现并强化，不要丢失旧铁律）】：',
+                '【当前版文风圣经（请在此基础上做增量补丁与强化，绝不丢失旧铁律）】：',
                 currentStyleCard,
                 '',
                 `【原作者真实原文（${holdout.label}）】：`,
@@ -593,7 +691,7 @@ export async function runStyleDistillationPipeline({
 
         roundHistory.push({
             round: roundNum,
-            holdoutLabel: holdout.label,
+            holdoutLabel: `${holdout.label}${isRetest ? ' (错题重考)' : ''}`,
             score: roundScore,
             diffNotes: roundDiffNotes,
         });
@@ -601,6 +699,13 @@ export async function runStyleDistillationPipeline({
         // Early convergence if >= 2 rounds completed and score already reached 92+
         if (!isIncremental && roundNum >= 2 && roundScore !== null && roundScore >= 92) {
             break;
+        }
+
+        // Same-holdout re-test if score < 85 and this holdout hasn't been re-tested yet; otherwise advance to next unseen holdout
+        if (!isIncremental && roundScore !== null && roundScore < 85 && retestedHoldoutIdx !== holdoutIdx) {
+            retestedHoldoutIdx = holdoutIdx;
+        } else {
+            activeHoldoutCursor = (holdoutIdx + 1) % samples.holdouts.length;
         }
     }
 

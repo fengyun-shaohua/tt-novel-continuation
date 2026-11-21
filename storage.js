@@ -30,6 +30,7 @@ export function createEmptyLedger() {
         archiveBatches: [],
         archiveNeedsResynth: false,
         archiveProcessLog: [],
+        draftOutline: null,
     };
 }
 
@@ -253,6 +254,7 @@ export async function loadLedger() {
         archiveBatches,
         archiveNeedsResynth: Boolean(raw.archiveNeedsResynth),
         archiveProcessLog: rawLog,
+        draftOutline: raw.draftOutline && typeof raw.draftOutline === 'object' ? raw.draftOutline : null,
     };
 }
 

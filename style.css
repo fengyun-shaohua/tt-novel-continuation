@@ -1011,3 +1011,11 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     background: rgba(0, 0, 0, 0.22);
     border: 1px dashed rgba(212, 163, 89, 0.35);
 }
+
+.tt-novel-hook-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    max-height: 150px;
+    overflow-y: auto;
+}

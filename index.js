@@ -12,9 +12,11 @@ import {
     resolveCurrentTargetChapterIndex,
 } from './context-assembler.js';
 import { extractNovelStateBlock, parseNovelTxt, parseSupplementaryDatabase, stripNonStoryBlocks } from './parser.js';
+import { generateDirectorOutline, resolveLatestChapterAnchor } from './outline-director.js';
 import {
     applyReaderBodyClasses,
     clearReadingProgress,
+    closeWorkbench,
     mountReaderUi,
     openWorkbench,
     refreshReaderWidgets,
@@ -1187,6 +1189,109 @@ async function runCompressStyleCardTask() {
     }
 }
 
+async function runGenerateDirectorOutlineTask({
+    userBrief = '',
+    selectedHookIds = [],
+    sceneCount = 4,
+    paceMode = 'slow',
+} = {}) {
+    const novelData = await loadNovelData();
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    if (!novelData?.chapters?.length && continuedChapters.length === 0) {
+        globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件后再生成导演大纲', '小说续写阅读器');
+        return;
+    }
+
+    let caller;
+    try {
+        caller = createPresetModelCaller();
+    } catch (err) {
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const ledger = await loadLedger();
+    updateLiveProgress('outline', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡与所选伏笔策划原味分镜大纲...`,
+    });
+
+    try {
+        const res = await generateDirectorOutline({
+            novelData,
+            continuedChapters,
+            ledger,
+            userBrief,
+            selectedHookIds,
+            sceneCount,
+            paceMode,
+            callModel: caller.callModel,
+        });
+
+        ledger.draftOutline = {
+            userBrief: String(userBrief || '').trim(),
+            outlineText: res.outlineText,
+            sceneCount: Number(sceneCount) || 4,
+            paceMode: paceMode || 'slow',
+            selectedHookIds: [...(selectedHookIds || [])],
+            targetChapterIndex: res.targetChapterIndex,
+            updatedAt: res.generatedAt,
+        };
+        await saveLedger(ledger);
+        updateLiveProgress('outline', {
+            isRunning: false,
+            text: `✅ 第 ${res.targetChapterIndex} 章原味导演大纲已生成（${res.outlineText.length} 字），可直接微调后点「📋 一键填入聊天输入框」或「🚀 填入并直接续写」！`,
+        });
+        await refreshReaderWidgets();
+        globalThis.toastr?.success?.(`第 ${res.targetChapterIndex} 章原味导演大纲已就绪！`, '小说续写阅读器');
+    } catch (error) {
+        updateLiveProgress('outline', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 生成大纲失败：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`生成导演大纲失败：${error?.message || error}`, '小说续写阅读器');
+    }
+}
+
+function applyDirectorOutlineToChatInput(outlineText, { autoSend = false } = {}) {
+    const text = String(outlineText || '').trim();
+    if (!text) {
+        globalThis.toastr?.warning?.('当前大纲内容为空，请先生成或输入大纲', '小说续写阅读器');
+        return;
+    }
+    const textarea = /** @type {HTMLTextAreaElement | null} */ (document.getElementById('send_textarea'));
+    if (!textarea) {
+        globalThis.toastr?.error?.('未找到聊天输入框 #send_textarea', '小说续写阅读器');
+        return;
+    }
+    textarea.value = text;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    closeWorkbench();
+    textarea.focus();
+
+    if (autoSend) {
+        requestAnimationFrame(() => {
+            const sendBtn = document.getElementById('send_but');
+            if (sendBtn && !sendBtn.classList.contains('displayNone')) {
+                sendBtn.click();
+            } else {
+                globalThis.toastr?.info?.('大纲已填入底部输入框，请点击发送按钮开始续写！', '小说续写阅读器');
+            }
+        });
+    } else {
+        globalThis.toastr?.success?.('原味导演大纲已填入底部聊天输入框，确认无误后直接点发送即可续写！', '小说续写阅读器');
+    }
+}
+
+async function getLatestChapterAnchorInfo() {
+    const novelData = await loadNovelData();
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    return resolveLatestChapterAnchor(novelData, continuedChapters);
+}
+
 async function runSurgicalDeclicheLatestTask() {
     const status = getLatestClicheStatus();
     if (!status.hasContinuedFloor) {
@@ -1455,6 +1560,9 @@ export async function init() {
         onFetchCustomModels: fetchCustomApiModels,
         onRunStyleDistill: runStyleDistillTask,
         onCompressStyleCard: runCompressStyleCardTask,
+        onGenerateDirectorOutline: runGenerateDirectorOutlineTask,
+        onApplyOutlineToChat: applyDirectorOutlineToChatInput,
+        getLatestChapterAnchorInfo,
         onRunDeclicheLatest: runSurgicalDeclicheLatestTask,
         onConnectBridge: (url) => {
             settings.remoteBridgeUrl = url;

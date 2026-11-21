@@ -18,10 +18,20 @@ let editingEventId = null;
 let cachedNovelData = null;
 let cachedLedger = null;
 let cachedCanonDb = null;
+let cachedAnchorInfo = null;
 let handlers = {};
+
+const outlineDraftUiState = {
+    userBrief: '',
+    sceneCount: 4,
+    paceMode: 'slow',
+    selectedHookIds: null, // null = auto-inherit pinned hooks
+    initializedForScope: null,
+};
 
 const liveTaskState = {
     memory: { running: false, text: '', error: false, logs: [] },
+    outline: { running: false, text: '', error: false },
     style: { running: false, text: '', error: false, logs: [] },
     cliche: { running: false, text: '', error: false },
 };
@@ -139,6 +149,7 @@ function mountWorkbenchModal() {
             </header>
             <nav class="tt-novel-wb-tabs" id="tt-novel-wb-tabs">
                 <button type="button" class="tt-novel-wb-tab" data-tab="memory">📚 剧情与人物</button>
+                <button type="button" class="tt-novel-wb-tab" data-tab="outline">🎬 导演大纲</button>
                 <button type="button" class="tt-novel-wb-tab" data-tab="style">🎨 文风蒸馏</button>
                 <button type="button" class="tt-novel-wb-tab" data-tab="cliche">🧹 反八股<span id="tt-novel-tab-cliche-dot" class="tt-novel-tab-dot displayNone"></span></button>
                 <button type="button" class="tt-novel-wb-tab" data-tab="toc">📑 目录</button>
@@ -223,10 +234,26 @@ export function updateBridgeStatusUi({ state, detail }) {
  * Refreshes cached book/ledger/canon data, updates the mini bar badge, and re-renders Workbench if open.
  */
 export async function refreshReaderWidgets() {
-    const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
+    const [novelData, ledger, canonDb, anchorInfo] = await Promise.all([
+        loadNovelData(),
+        loadLedger(),
+        loadCanonDb(),
+        handlers.getLatestChapterAnchorInfo?.() ?? null,
+    ]);
     cachedNovelData = novelData;
     cachedLedger = ledger;
     cachedCanonDb = canonDb;
+    cachedAnchorInfo = anchorInfo;
+
+    const currentChatKey = String(getContext()?.chatId || novelData?.title || '');
+    if (outlineDraftUiState.initializedForScope !== currentChatKey) {
+        outlineDraftUiState.initializedForScope = currentChatKey;
+        const saved = ledger?.draftOutline;
+        outlineDraftUiState.userBrief = saved?.userBrief || '';
+        outlineDraftUiState.sceneCount = Number(saved?.sceneCount || 4);
+        outlineDraftUiState.paceMode = saved?.paceMode || 'slow';
+        outlineDraftUiState.selectedHookIds = Array.isArray(saved?.selectedHookIds) ? [...saved.selectedHookIds] : null;
+    }
 
     const badge = document.getElementById('tt-novel-toc-badge');
     if (badge) {
@@ -290,10 +317,187 @@ function renderWorkbench() {
     });
 
     if (activeTab === 'memory') renderMemoryTab(bodyEl);
+    else if (activeTab === 'outline') renderOutlineTab(bodyEl);
     else if (activeTab === 'style') renderStyleTab(bodyEl);
     else if (activeTab === 'cliche') renderClicheTab(bodyEl);
     else if (activeTab === 'toc') renderTocTab(bodyEl);
     else if (activeTab === 'settings') renderSettingsTab(bodyEl);
+}
+
+/* ==========================================================================
+   TAB 1.5: 🎬 导演大纲 (Author-Authentic Multi-Cut Chapter Beat Director)
+   ========================================================================== */
+function renderOutlineTab(bodyEl) {
+    const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], styleProfile: null, draftOutline: null };
+    const openHooks = (ledger.hooks || []).filter(h => h && h.status !== 'resolved');
+    const task = liveTaskState.outline;
+    const savedDraft = ledger.draftOutline || null;
+
+    if (outlineDraftUiState.selectedHookIds === null) {
+        outlineDraftUiState.selectedHookIds = openHooks.filter(h => h.status === 'pinned').map(h => h.id);
+    }
+    const selectedHookSet = new Set(outlineDraftUiState.selectedHookIds);
+
+    const anchorText = cachedAnchorInfo?.anchorTitle
+        ? `自动承接【${cachedAnchorInfo.anchorTitle}】结尾${cachedAnchorInfo.shortClosing ? `（“……${cachedAnchorInfo.shortClosing.slice(-36)}”）` : ''} → 策划第 ${cachedAnchorInfo.nextChapterIndex} ${cachedAnchorInfo.chapterUnit}`
+        : '请先导入原著小说';
+
+    const readyMeta = `已自动挂载：${ledger.characters?.length || 0} 人物防 OOC 档案 · ${ledger.chronicle?.length || 0} 条编年史 · ${openHooks.length} 条待填伏笔 · ${ledger.styleProfile?.styleCard ? `文风圣经(${String(ledger.styleProfile.styleCard).length}字)` : '未蒸馏文风'}`;
+
+    const progressHtml = task.text
+        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
+        : '';
+
+    const hookPickerHtml = openHooks.length === 0
+        ? '<div class="tt-novel-muted">当前暂无待填伏笔（可去「📚 剧情与人物」全本归档或手动添加伏笔）。</div>'
+        : `
+            <div class="tt-novel-hook-picker">
+                ${openHooks.map(h => {
+                    const active = selectedHookSet.has(h.id);
+                    const shortLabel = h.content.length > 34 ? `${h.content.slice(0, 34)}…` : h.content;
+                    return `
+                        <button type="button" class="tt-novel-filter-pill ${active ? 'active' : ''}" data-action="toggle-outline-hook" data-id="${escapeHtml(h.id)}" title="${escapeHtml(h.content)}">
+                            ${active ? '🎯' : '🔮'} #${Number(h.plantedChapter || 1)} ${escapeHtml(shortLabel)}
+                        </button>
+                    `;
+                }).join('')}
+            </div>
+        `;
+
+    bodyEl.innerHTML = `
+        <div class="tt-novel-banner">
+            <div><b>📍 ${escapeHtml(anchorText)}</b></div>
+            <div class="tt-novel-muted">${escapeHtml(readyMeta)}</div>
+        </div>
+
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">📝 输入你的简略过程与结果（只需 1~3 句大白话，AI 帮你扩成原著风多切镜导演大纲）</div>
+            <textarea id="tt-novel-outline-brief" class="text_pole" rows="3" placeholder="例如：次日清晨设备改造收尾，博士来探口风试探昨晚吃饭的事但没挑破照片，贪鼬顺手碰一下帘子后门的伏笔并再次试探凯尔希，结尾定下明天出海。&#10;（也可以留空，点下方「🎲 留空自动构思下一章」让 AI 顺着当前伏笔直接给方案！）">${escapeHtml(outlineDraftUiState.userBrief || '')}</textarea>
+            <div class="tt-novel-row-2">
+                <label class="tt-novel-muted">切镜数量：
+                    <select id="tt-novel-outline-scenes" class="text_pole">
+                        <option value="3" ${Number(outlineDraftUiState.sceneCount) === 3 ? 'selected' : ''}>3 镜头（紧凑）</option>
+                        <option value="4" ${Number(outlineDraftUiState.sceneCount || 4) === 4 ? 'selected' : ''}>4 镜头（原著标准·推荐）</option>
+                        <option value="5" ${Number(outlineDraftUiState.sceneCount) === 5 ? 'selected' : ''}>5 镜头（多线冷热交替）</option>
+                    </select>
+                </label>
+                <label class="tt-novel-muted">剧情推进步幅：
+                    <select id="tt-novel-outline-pace" class="text_pole">
+                        <option value="slow" ${outlineDraftUiState.paceMode === 'slow' ? 'selected' : ''}>温水煮青蛙（稳步铺垫·不急摊牌）</option>
+                        <option value="medium" ${outlineDraftUiState.paceMode === 'medium' ? 'selected' : ''}>中速推进（小冲突/试探升级）</option>
+                        <option value="climax" ${outlineDraftUiState.paceMode === 'climax' ? 'selected' : ''}>高潮爆点（重点回收伏笔）</option>
+                    </select>
+                </label>
+            </div>
+            <details class="tt-novel-fold-card" ${openHooks.length <= 8 ? 'open' : ''}>
+                <summary>🎯 勾选本章想顺手沾边或推进的伏笔（已选 ${selectedHookSet.size} / ${openHooks.length}，建议每次只选 1~2 条）</summary>
+                <div style="margin-top: 6px;">${hookPickerHtml}</div>
+            </details>
+            <div class="tt-novel-action-bar">
+                <button type="button" id="tt-novel-outline-generate" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
+                    🎬 生成原味导演大纲 (1次API · 套预设)
+                </button>
+                <button type="button" id="tt-novel-outline-auto" class="menu_button" ${task.running ? 'disabled' : ''}>
+                    🎲 留空自动构思下一章
+                </button>
+            </div>
+        </section>
+
+        ${progressHtml}
+
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">📋 生成结果（可直接手动微调，确认后一键送入聊天框续写）</div>
+            <textarea id="tt-novel-outline-output" class="text_pole tt-novel-style-editor" rows="10" placeholder="点击上方「🎬 生成原味导演大纲」后，严格贴合原著节奏、零网文八股的分镜导演大纲会显示在这里...">${escapeHtml(savedDraft?.outlineText || '')}</textarea>
+            <div class="tt-novel-action-bar">
+                <button type="button" id="tt-novel-outline-fill" class="menu_button" ${!savedDraft?.outlineText ? '' : ''}>
+                    📋 一键填入聊天输入框
+                </button>
+                <button type="button" id="tt-novel-outline-send" class="menu_button tt-novel-btn-primary">
+                    🚀 填入并直接续写本章
+                </button>
+                <button type="button" id="tt-novel-outline-save" class="menu_button tt-novel-btn-sm">
+                    💾 暂存修改
+                </button>
+            </div>
+        </section>
+    `;
+
+    const briefEl = bodyEl.querySelector('#tt-novel-outline-brief');
+    const scenesEl = bodyEl.querySelector('#tt-novel-outline-scenes');
+    const paceEl = bodyEl.querySelector('#tt-novel-outline-pace');
+    const outputEl = bodyEl.querySelector('#tt-novel-outline-output');
+
+    briefEl?.addEventListener('input', (e) => {
+        outlineDraftUiState.userBrief = String(e.target.value || '');
+    });
+    scenesEl?.addEventListener('change', (e) => {
+        outlineDraftUiState.sceneCount = Math.max(2, Math.min(6, Number(e.target.value) || 4));
+    });
+    paceEl?.addEventListener('change', (e) => {
+        outlineDraftUiState.paceMode = String(e.target.value || 'slow');
+    });
+
+    bodyEl.querySelectorAll('[data-action="toggle-outline-hook"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const id = btn.getAttribute('data-id');
+            if (!id) return;
+            const curSet = new Set(outlineDraftUiState.selectedHookIds || []);
+            if (curSet.has(id)) curSet.delete(id);
+            else curSet.add(id);
+            outlineDraftUiState.selectedHookIds = [...curSet];
+            renderWorkbench();
+        });
+    });
+
+    bodyEl.querySelector('#tt-novel-outline-generate')?.addEventListener('click', () => {
+        const brief = String(briefEl?.value || '').trim();
+        outlineDraftUiState.userBrief = brief;
+        handlers.onGenerateDirectorOutline?.({
+            userBrief: brief,
+            selectedHookIds: outlineDraftUiState.selectedHookIds || [],
+            sceneCount: outlineDraftUiState.sceneCount,
+            paceMode: outlineDraftUiState.paceMode,
+        });
+    });
+
+    bodyEl.querySelector('#tt-novel-outline-auto')?.addEventListener('click', () => {
+        handlers.onGenerateDirectorOutline?.({
+            userBrief: '',
+            selectedHookIds: outlineDraftUiState.selectedHookIds || [],
+            sceneCount: outlineDraftUiState.sceneCount,
+            paceMode: outlineDraftUiState.paceMode,
+        });
+    });
+
+    const saveCurrentDraft = async () => {
+        const cur = await loadLedger();
+        cur.draftOutline = {
+            ...(cur.draftOutline || {}),
+            userBrief: String(briefEl?.value || '').trim(),
+            outlineText: String(outputEl?.value || '').trim(),
+            sceneCount: outlineDraftUiState.sceneCount,
+            paceMode: outlineDraftUiState.paceMode,
+            selectedHookIds: [...(outlineDraftUiState.selectedHookIds || [])],
+            updatedAt: Date.now(),
+        };
+        await saveLedger(cur);
+        cachedLedger = cur;
+    };
+
+    bodyEl.querySelector('#tt-novel-outline-save')?.addEventListener('click', async () => {
+        await saveCurrentDraft();
+        globalThis.toastr?.success?.('已暂存当前导演大纲草稿！', '小说续写阅读器');
+    });
+
+    bodyEl.querySelector('#tt-novel-outline-fill')?.addEventListener('click', async () => {
+        await saveCurrentDraft();
+        handlers.onApplyOutlineToChat?.(String(outputEl?.value || '').trim(), { autoSend: false });
+    });
+
+    bodyEl.querySelector('#tt-novel-outline-send')?.addEventListener('click', async () => {
+        await saveCurrentDraft();
+        handlers.onApplyOutlineToChat?.(String(outputEl?.value || '').trim(), { autoSend: true });
+    });
 }
 
 /* ==========================================================================

@@ -12,6 +12,7 @@ let previewChapterIndex = null;
 let cachedNovelData = null;
 let cachedLedger = null;
 let onCutoffCallback = null;
+let onViewChapterCallback = null;
 let onSettingChangeCallback = null;
 
 /**
@@ -39,8 +40,9 @@ export function applyReaderBodyClasses(settings) {
 /**
  * Mounts the above-input quick bar and right-edge floating TOC drawer.
  */
-export function mountReaderUi({ settings, onToggleSetting, onCutoffFromChapter }) {
+export function mountReaderUi({ settings, onToggleSetting, onCutoffFromChapter, onViewChapter }) {
     onCutoffCallback = onCutoffFromChapter;
+    onViewChapterCallback = onViewChapter;
     onSettingChangeCallback = onToggleSetting;
 
     mountQuickBar(settings);
@@ -68,6 +70,12 @@ function mountQuickBar(settings) {
             <button type="button" id="tt-novel-btn-hide-cot" class="tt-novel-pill" title="隐藏 AI 思考批注与预设思维链折叠框">
                 <i class="fa-solid fa-brain"></i> <span>隐藏思维链</span>
             </button>
+            <button type="button" id="tt-novel-btn-prev-ch" class="tt-novel-pill" title="观看上一章">
+                <i class="fa-solid fa-chevron-left"></i> <span>上一章</span>
+            </button>
+            <button type="button" id="tt-novel-btn-next-ch" class="tt-novel-pill" title="观看下一章">
+                <span>下一章</span> <i class="fa-solid fa-chevron-right"></i>
+            </button>
             <button type="button" id="tt-novel-btn-toc" class="tt-novel-pill tt-novel-pill-accent" title="打开章节目录、进度跳转与截断重续抽屉">
                 <i class="fa-solid fa-list-ul"></i> <span id="tt-novel-toc-badge">章节目录</span>
             </button>
@@ -85,6 +93,18 @@ function mountQuickBar(settings) {
     });
     bar.querySelector('#tt-novel-btn-hide-cot')?.addEventListener('click', () => {
         onSettingChangeCallback?.('hideReasoning');
+    });
+    bar.querySelector('#tt-novel-btn-prev-ch')?.addEventListener('click', async () => {
+        if (!cachedNovelData?.totalChapters) return;
+        const curr = Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
+        const target = Math.max(1, curr - 1);
+        await onViewChapterCallback?.(target);
+    });
+    bar.querySelector('#tt-novel-btn-next-ch')?.addEventListener('click', async () => {
+        if (!cachedNovelData?.totalChapters) return;
+        const curr = Number(cachedNovelData.viewingChapterIndex || cachedNovelData.cutoffChapterIndex || 1);
+        const target = Math.min(cachedNovelData.totalChapters, curr + 1);
+        await onViewChapterCallback?.(target);
     });
     bar.querySelector('#tt-novel-btn-toc')?.addEventListener('click', () => {
         toggleTocDrawer();
@@ -221,9 +241,22 @@ function mountFloatingTocDrawer() {
     document.body.appendChild(drawer);
 
     drawer.querySelector('#tt-novel-toc-close')?.addEventListener('click', () => toggleTocDrawer(false));
-    drawer.querySelector('#tt-novel-jump-cutoff')?.addEventListener('click', () => { void jumpToCutoffBoundary(); });
-    drawer.querySelector('#tt-novel-jump-latest')?.addEventListener('click', () => { void jumpToLatestFloor(); });
-    drawer.querySelector('#tt-novel-jump-saved')?.addEventListener('click', () => { void jumpToSavedProgress(); });
+    drawer.querySelector('#tt-novel-jump-cutoff')?.addEventListener('click', async () => {
+        await toggleTocDrawer(false);
+        if (cachedNovelData && onViewChapterCallback) {
+            await onViewChapterCallback(cachedNovelData.cutoffChapterIndex || cachedNovelData.totalChapters);
+        } else {
+            await jumpToCutoffBoundary();
+        }
+    });
+    drawer.querySelector('#tt-novel-jump-latest')?.addEventListener('click', async () => {
+        await toggleTocDrawer(false);
+        await jumpToLatestFloor();
+    });
+    drawer.querySelector('#tt-novel-jump-saved')?.addEventListener('click', async () => {
+        await toggleTocDrawer(false);
+        await jumpToSavedProgress();
+    });
     drawer.querySelector('#tt-novel-toc-search')?.addEventListener(
         'input',
         debounce(() => renderTocDrawerBody(), 250),
@@ -358,18 +391,25 @@ function renderTocDrawerBody() {
     });
 
     listEl.querySelectorAll('[data-action="jump-floor"]').forEach(el => {
-        el.addEventListener('click', () => {
+        el.addEventListener('click', async () => {
             const floor = Number(el.getAttribute('data-floor'));
-            void scrollToChatFloor(floor);
+            await toggleTocDrawer(false);
+            await scrollToChatFloor(floor);
         });
     });
 
     listEl.querySelectorAll('[data-action="view-orig"]').forEach(el => {
-        el.addEventListener('click', () => {
+        el.addEventListener('click', async () => {
             const idx = Number(el.getAttribute('data-orig-index'));
+            await toggleTocDrawer(false);
             const mountedFloor = originalFloorByChapter.get(idx);
             if (mountedFloor !== undefined) {
-                void scrollToChatFloor(mountedFloor);
+                if (cachedNovelData) {
+                    cachedNovelData.viewingChapterIndex = idx;
+                }
+                await scrollToChatFloor(mountedFloor);
+            } else if (onViewChapterCallback) {
+                await onViewChapterCallback(idx);
             } else {
                 openOriginalChapterPreview(idx);
             }
@@ -380,6 +420,7 @@ function renderTocDrawerBody() {
         btn.addEventListener('click', async (e) => {
             e.stopPropagation();
             const idx = Number(btn.getAttribute('data-orig-index'));
+            await toggleTocDrawer(false);
             if (onCutoffCallback) {
                 await onCutoffCallback(idx);
                 await refreshReaderWidgets();

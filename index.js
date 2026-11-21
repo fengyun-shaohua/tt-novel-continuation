@@ -193,19 +193,24 @@ async function onMessageSwiped(messageId) {
 }
 
 /**
- * Mounts the last N original chapters up to `cutoffChapterIndex` directly into `#chat`.
+ * Mounts original chapters around `focusChapterIndex` directly into `#chat`
+ * and scrolls right to `focusChapterIndex` so the user can read any chapter in the main screen.
  */
-async function mountOriginalAnchorChaptersToChat(novelData, cutoffChapterIndex) {
+async function mountOriginalAnchorChaptersToChat(novelData, focusChapterIndex, { focusAtStart = false } = {}) {
     const context = getContext();
     if (!context || !Array.isArray(context.chat) || !novelData?.chapters?.length) return;
 
     const settings = getSettings();
     const anchorCount = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 3));
-    const cutoff = Math.min(novelData.chapters.length, Math.max(1, cutoffChapterIndex));
-    const startIdx = Math.max(1, cutoff - anchorCount + 1);
-    const selectedChapters = novelData.chapters.filter(c => c.index >= startIdx && c.index <= cutoff);
+    const target = Math.min(novelData.chapters.length, Math.max(1, focusChapterIndex));
+    const startIdx = focusAtStart
+        ? target
+        : Math.max(1, target - anchorCount + 1);
+    const endIdx = focusAtStart
+        ? Math.min(novelData.chapters.length, target + anchorCount - 1)
+        : target;
+    const selectedChapters = novelData.chapters.filter(c => c.index >= startIdx && c.index <= endIdx);
 
-    // Keep only actual continued novel floors (drop standard card greeting chat[0] when importing a novel)
     const continuedTail = context.chat.filter(
         (m, idx) => m?.extra?.novelContinuationOrigin === 'continued' || (idx > 0 && m?.is_user),
     );
@@ -234,12 +239,60 @@ async function mountOriginalAnchorChaptersToChat(novelData, cutoffChapterIndex) 
         context.chat.push(floor);
     }
 
-    await context.saveChat?.();
+    try {
+        await context.saveChat?.();
+    } catch {
+        // Ignore save errors on temporary welcome screen
+    }
     await context.printMessages?.();
     applyReaderBodyClasses(settings);
-    if (originalFloors.length > 0) {
-        await scrollToChatFloor(originalFloors.length - 1);
+
+    const targetFloorIdx = originalFloors.findIndex(f => f.extra?.novelChapterIndex === target);
+    if (targetFloorIdx >= 0) {
+        await scrollToChatFloor(targetFloorIdx);
+    } else if (originalFloors.length > 0) {
+        await scrollToChatFloor(0);
     }
+}
+
+/**
+ * Loads and displays any user-selected chapter `targetChapterIndex` directly in the main `#chat` reader.
+ */
+async function handleViewOriginalChapter(targetChapterIndex) {
+    const novelData = await loadNovelData();
+    if (!novelData) return;
+
+    novelData.viewingChapterIndex = targetChapterIndex;
+    await saveNovelData(novelData);
+    await mountOriginalAnchorChaptersToChat(novelData, targetChapterIndex, { focusAtStart: true });
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+}
+
+/**
+ * Automatically restores the imported novel chapters into `#chat` when re-entering a blank character card
+ * or reopening the app if `#chat` was reset to empty/greeting-only.
+ */
+async function restoreNovelFloorsIfNeeded() {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    const context = getContext();
+    if (!Array.isArray(context?.chat)) return;
+
+    const hasOriginalFloors = context.chat.some(m => m?.extra?.novelContinuationOrigin === 'original');
+    if (hasOriginalFloors) return;
+
+    // Only auto-mount into blank or greeting-only chats (<= 1 message and no user messages yet)
+    const hasUserMessages = context.chat.some(m => m?.is_user);
+    if (context.chat.length > 1 || hasUserMessages) return;
+
+    const novelData = await loadNovelData();
+    if (!novelData?.chapters?.length) return;
+
+    const resumeChapter = novelData.viewingChapterIndex || novelData.cutoffChapterIndex || novelData.totalChapters;
+    await mountOriginalAnchorChaptersToChat(novelData, resumeChapter, {
+        focusAtStart: resumeChapter !== novelData.cutoffChapterIndex,
+    });
 }
 
 async function handleCutoffFromChapter(targetChapterIndex) {
@@ -263,6 +316,7 @@ async function handleCutoffFromChapter(targetChapterIndex) {
     }
 
     novelData.cutoffChapterIndex = targetChapterIndex;
+    novelData.viewingChapterIndex = targetChapterIndex;
     await saveNovelData(novelData);
     await pruneLedgerAfterChapter(targetChapterIndex);
     clearReadingProgress();
@@ -565,7 +619,13 @@ export async function init() {
     const settings = getSettings();
 
     mountSettingsPanel();
-    mountReaderUi({ settings, onToggleSetting: handleToggleSetting, onCutoffFromChapter: handleCutoffFromChapter });
+    mountReaderUi({
+        settings,
+        onToggleSetting: handleToggleSetting,
+        onCutoffFromChapter: handleCutoffFromChapter,
+        onViewChapter: handleViewOriginalChapter,
+    });
+    await restoreNovelFloorsIfNeeded();
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
 
@@ -587,6 +647,7 @@ export async function init() {
         }
         eventSource.on(eventTypes.CHAT_CHANGED, async () => {
             applyReaderBodyClasses(getSettings());
+            await restoreNovelFloorsIfNeeded();
             await refreshReaderWidgets();
             await refreshSettingsStatusCard();
         });

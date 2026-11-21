@@ -13,8 +13,8 @@ export const EXTENSION_NAMESPACE = 'novel-continuation';
 const KEY_NOVEL_DATA = 'novel_data_v1';
 const KEY_LEDGER = 'timeline_ledger_v1';
 const KEY_CANON_DB = 'canon_db_v1';
+const GLOBAL_FALLBACK_SCOPE = 'global_default_scope';
 
-// In-memory cache keyed by scopedKey to avoid redundant IPC calls during scroll/render
 const memoryStoreCache = new Map();
 
 export function createEmptyLedger() {
@@ -33,121 +33,153 @@ export function createEmptyCanonDb() {
 }
 
 /**
- * Computes a stable, filesystem-safe storage key prefix for the active chat.
- * Never calls `handle.store.getJson` (which triggers Tauri safeInvoke red error toasts on missing files).
+ * Resolves a persistent scope identifier that survives exiting/re-entering a blank character card.
+ * Prioritizes the character's stable `avatar` filename (or `groupId`), falling back to `GLOBAL_FALLBACK_SCOPE`
+ * so importing on a blank character card or welcome screen never loses data when chat filenames change.
  */
-function getStableChatKey() {
+export function getPersistentScopeKey() {
     const context = getContext();
-    const rawId = String(
-        context?.getCurrentChatId?.()
-        || context?.chatId
-        || context?.chatMetadata?.integrity
-        || '',
+    const chid = context?.characterId;
+    const character = (chid !== undefined && chid !== null && Array.isArray(context?.characters))
+        ? context.characters[chid]
+        : null;
+
+    const rawScope = String(
+        character?.avatar
+        || context?.groupId
+        || (context?.name2 && context.name2 !== 'SillyTavern System' ? context.name2 : '')
+        || GLOBAL_FALLBACK_SCOPE,
     ).trim();
-    if (!rawId) return null;
-    return rawId.replace(/[^a-zA-Z0-9._\-\u4e00-\u9fa5]/g, '_').slice(0, 96);
+
+    let hash = 2166136261;
+    for (let i = 0; i < rawScope.length; i += 1) {
+        hash ^= rawScope.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    const hex = (hash >>> 0).toString(16).padStart(8, '0');
+    const asciiPrefix = rawScope.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'scope';
+    return `${asciiPrefix}_${hex}`;
 }
 
 /**
- * Resolves the TauriTavern `api.extension.store` adapter scoped to the current chat.
- * Uses `tryGetJson` (`open_extension_store_entry`), which returns `{ found: false }`
- * cleanly in Rust without ever throwing a NotFound error or popping up a red toast.
+ * Resolves the TauriTavern `api.extension.store` adapter.
+ * Also supports falling back to the global scope if the user imported a novel on the welcome screen
+ * and then switched into a blank character card.
  */
-function getActiveChatStore() {
+function getExtensionStoreAdapter() {
     const extStore = globalThis.__TAURITAVERN__?.api?.extension?.store;
-    const chatId = getStableChatKey();
-    if (!extStore || !chatId) {
-        return null;
-    }
+    if (!extStore) return null;
 
-    const toSafeKey = (key) => {
-        // Ensure key only uses safe ASCII/hash characters required by extension.store
-        let hash = 2166136261;
-        for (let i = 0; i < chatId.length; i += 1) {
-            hash ^= chatId.charCodeAt(i);
-            hash = Math.imul(hash, 16777619);
-        }
-        const hex = (hash >>> 0).toString(16).padStart(8, '0');
-        const asciiPrefix = chatId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'chat';
-        return `${asciiPrefix}_${hex}_${key}`;
-    };
+    const makeKey = (scope, key) => `${scope}__${key}`;
 
     return {
         async get(key) {
-            const safeKey = toSafeKey(key);
-            if (memoryStoreCache.has(safeKey)) {
-                return memoryStoreCache.get(safeKey);
+            const scope = getPersistentScopeKey();
+            const primaryKey = makeKey(scope, key);
+            if (memoryStoreCache.has(primaryKey)) {
+                return memoryStoreCache.get(primaryKey);
             }
             try {
                 const res = await extStore.tryGetJson({
                     namespace: EXTENSION_NAMESPACE,
                     table: 'chat_scoped',
-                    key: safeKey,
+                    key: primaryKey,
                 });
-                const val = res?.found ? res.value : null;
-                memoryStoreCache.set(safeKey, val);
-                return val;
+                if (res?.found && res.value !== null && res.value !== undefined) {
+                    memoryStoreCache.set(primaryKey, res.value);
+                    return res.value;
+                }
+                // Fallback: check global latest novel if current blank character has none yet
+                const fallbackKey = makeKey(GLOBAL_FALLBACK_SCOPE, key);
+                if (scope !== GLOBAL_FALLBACK_SCOPE) {
+                    const fallbackRes = await extStore.tryGetJson({
+                        namespace: EXTENSION_NAMESPACE,
+                        table: 'chat_scoped',
+                        key: fallbackKey,
+                    });
+                    if (fallbackRes?.found && fallbackRes.value) {
+                        memoryStoreCache.set(primaryKey, fallbackRes.value);
+                        return fallbackRes.value;
+                    }
+                }
+                return null;
             } catch {
                 return null;
             }
         },
         async set(key, value) {
-            const safeKey = toSafeKey(key);
-            memoryStoreCache.set(safeKey, value);
+            const scope = getPersistentScopeKey();
+            const primaryKey = makeKey(scope, key);
+            memoryStoreCache.set(primaryKey, value);
             await extStore.setJson({
                 namespace: EXTENSION_NAMESPACE,
                 table: 'chat_scoped',
-                key: safeKey,
+                key: primaryKey,
+                value,
+            });
+            // Also mirror to global fallback scope so switching from welcome screen or blank card keeps it accessible
+            const fallbackKey = makeKey(GLOBAL_FALLBACK_SCOPE, key);
+            memoryStoreCache.set(fallbackKey, value);
+            await extStore.setJson({
+                namespace: EXTENSION_NAMESPACE,
+                table: 'chat_scoped',
+                key: fallbackKey,
                 value,
             });
         },
         async remove(key) {
-            const safeKey = toSafeKey(key);
-            memoryStoreCache.set(safeKey, null);
-            try {
-                await extStore.deleteJson({
-                    namespace: EXTENSION_NAMESPACE,
-                    table: 'chat_scoped',
-                    key: safeKey,
-                });
-            } catch {
-                // Ignore
+            const scope = getPersistentScopeKey();
+            for (const s of new Set([scope, GLOBAL_FALLBACK_SCOPE])) {
+                const k = makeKey(s, key);
+                memoryStoreCache.delete(k);
+                try {
+                    await extStore.deleteJson({
+                        namespace: EXTENSION_NAMESPACE,
+                        table: 'chat_scoped',
+                        key: k,
+                    });
+                } catch {
+                    // Ignore
+                }
             }
         },
     };
 }
 
 /**
- * Loads the imported original novel for the current chat.
+ * Loads the imported original novel for the current character/chat.
  */
 export async function loadNovelData() {
-    const store = getActiveChatStore();
+    const store = getExtensionStoreAdapter();
     if (!store) return null;
     const data = await store.get(KEY_NOVEL_DATA);
-    if (!data || !Array.isArray(data.chapters)) return null;
+    if (!data || !Array.isArray(data.chapters) || data.chapters.length === 0) return null;
     return {
         title: data.title || '未命名小说',
         totalChapters: data.totalChapters || data.chapters.length,
         cutoffChapterIndex: Number.isFinite(data.cutoffChapterIndex) && data.cutoffChapterIndex > 0
             ? data.cutoffChapterIndex
             : data.chapters.length,
+        viewingChapterIndex: Number.isFinite(data.viewingChapterIndex) && data.viewingChapterIndex > 0
+            ? data.viewingChapterIndex
+            : (data.cutoffChapterIndex || data.chapters.length),
         chapters: data.chapters,
     };
 }
 
 export async function saveNovelData(novelData) {
-    const store = getActiveChatStore();
-    if (!store) throw new Error('请先打开一个角色聊天后再导入小说数据');
+    const store = getExtensionStoreAdapter();
+    if (!store) throw new Error('TauriTavern 扩展存储未就绪');
     await store.set(KEY_NOVEL_DATA, novelData);
 }
 
 export async function clearNovelData() {
-    const store = getActiveChatStore();
+    const store = getExtensionStoreAdapter();
     if (store) await store.remove(KEY_NOVEL_DATA);
 }
 
 export async function loadLedger() {
-    const store = getActiveChatStore();
+    const store = getExtensionStoreAdapter();
     if (!store) return createEmptyLedger();
     const raw = await store.get(KEY_LEDGER);
     if (!raw || typeof raw !== 'object') return createEmptyLedger();
@@ -159,13 +191,13 @@ export async function loadLedger() {
 }
 
 export async function saveLedger(ledger) {
-    const store = getActiveChatStore();
+    const store = getExtensionStoreAdapter();
     if (!store) return;
     await store.set(KEY_LEDGER, ledger);
 }
 
 export async function loadCanonDb() {
-    const store = getActiveChatStore();
+    const store = getExtensionStoreAdapter();
     if (!store) return createEmptyCanonDb();
     const raw = await store.get(KEY_CANON_DB);
     if (!raw || typeof raw !== 'object') return createEmptyCanonDb();
@@ -176,8 +208,8 @@ export async function loadCanonDb() {
 }
 
 export async function saveCanonDb(canonDb) {
-    const store = getActiveChatStore();
-    if (!store) throw new Error('请先打开一个角色聊天后再挂载补充设定库');
+    const store = getExtensionStoreAdapter();
+    if (!store) throw new Error('TauriTavern 扩展存储未就绪');
     await store.set(KEY_CANON_DB, canonDb);
 }
 
@@ -201,8 +233,7 @@ export async function pruneLedgerAfterChapter(maxChapterIndex) {
 
 /**
  * Applies `<novel_state>` updates extracted from a single-call AI chapter generation
- * into the timeline ledger. Automatically replaces any prior records from the same
- * `chapterIndex` or `floorIndex` so Regenerate / Swipe never leaves stale branch state.
+ * into the timeline ledger.
  */
 export async function applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle, floorIndex = null) {
     const ledger = await loadLedger();
@@ -278,8 +309,7 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
 }
 
 /**
- * Synchronizes extracted character/world state updates directly into SillyTavern's native World Info
- * lorebook bound to the current chat (`chat_metadata.world_info`), replacing same-chapter lines on regenerate.
+ * Synchronizes extracted character/world state updates directly into SillyTavern's native World Info.
  */
 export async function syncWorldUpdatesToTavernLorebook(novelTitle, worldUpdates, chapterIndex) {
     if (!Array.isArray(worldUpdates) || worldUpdates.length === 0) return null;
@@ -291,10 +321,8 @@ export async function syncWorldUpdatesToTavernLorebook(novelTitle, worldUpdates,
         const sanitizedTitle = String(novelTitle || '小说续写')
             .replace(/[\\/:*?"<>|\s]+/g, '_')
             .slice(0, 24);
-        const chatSuffix = String(getStableChatKey() || 'chat')
-            .replace(/[^a-zA-Z0-9\u4e00-\u9fa5]+/g, '')
-            .slice(-8) || 'default';
-        bookName = `续写_${sanitizedTitle}_${chatSuffix}`;
+        const scopeSuffix = getPersistentScopeKey().slice(-8);
+        bookName = `续写_${sanitizedTitle}_${scopeSuffix}`;
         if (!Array.isArray(world_names) || !world_names.includes(bookName)) {
             const created = await createNewWorldInfo(bookName, { interactive: false });
             if (!created) return null;

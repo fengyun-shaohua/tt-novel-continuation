@@ -105,11 +105,13 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
         });
 
         if (promptBlock) {
+            const lastMsgIsUser = Array.isArray(chat) && chat.length > 0 && Boolean(chat[chat.length - 1]?.is_user);
+            const injectDepth = lastMsgIsUser ? 1 : 0;
             context?.setExtensionPrompt?.(
                 EXTENSION_PROMPT_TAG,
                 promptBlock,
                 extension_prompt_types.IN_CHAT,
-                1,
+                injectDepth,
                 false,
                 extension_prompt_roles.SYSTEM,
             );
@@ -231,9 +233,29 @@ function createOriginalChapterFloor(ch, charName) {
     };
 }
 
+function createBookCoverFloor(novelData, maxChapter, charName) {
+    const sampleTitle = novelData.chapters?.[0]?.title || '';
+    const unit = /节\s*$/.test(sampleTitle.trim()) ? '节' : '章';
+    const text = `📖 **《${novelData.title}》**\n\n共 ${novelData.totalChapters} ${unit} · 当前夺舍节点：第 ${maxChapter} ${unit}（楼层 #1 ~ #${maxChapter} 与原著第 1 ~ ${maxChapter} ${unit} 一一对应）`;
+    return {
+        name: charName,
+        is_user: false,
+        is_system: true,
+        send_date: Date.now(),
+        mes: text,
+        swipes: [text],
+        swipe_id: 0,
+        extra: {
+            novelContinuationOrigin: 'cover',
+            isSmallSys: true,
+        },
+    };
+}
+
 /**
- * Mounts all original chapters `1 .. upToChapterIndex` directly into `context.chat`
- * and relies on TauriTavern's native `BoundedChatSurface` virtualization to hide/manage high floor counts.
+ * Mounts `#0` book cover (`is_system: true`, 0 LLM tokens) + all original chapters `1 .. upToChapterIndex`
+ * into `context.chat[1 .. upToChapterIndex]` so Floor `#N` strictly equals Chapter `N`,
+ * relying on TauriTavern's native `BoundedChatSurface` virtualization to manage high floor counts.
  */
 async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { focusChapterIndex = null } = {}) {
     const context = getContext();
@@ -250,9 +272,11 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
         (m, idx) => m?.extra?.novelContinuationOrigin === 'continued' || (idx > 0 && m?.is_user),
     );
     const charName = context.name2 || novelData.title || '原著';
+    const coverFloor = createBookCoverFloor(novelData, maxChapter, charName);
     const originalFloors = selectedChapters.map(ch => createOriginalChapterFloor(ch, charName));
 
     context.chat.length = 0;
+    context.chat.push(coverFloor);
     for (const floor of [...originalFloors, ...continuedTail]) {
         context.chat.push(floor);
     }
@@ -265,11 +289,13 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
     await context.printMessages?.();
     applyReaderBodyClasses(settings);
 
-    const targetFloorIdx = originalFloors.findIndex(f => f.extra?.novelChapterIndex === focusTarget);
+    const targetFloorIdx = context.chat.findIndex(
+        f => f?.extra?.novelContinuationOrigin === 'original' && f?.extra?.novelChapterIndex === focusTarget,
+    );
     if (targetFloorIdx >= 0) {
         await scrollToChatFloor(targetFloorIdx);
-    } else if (originalFloors.length > 0) {
-        await scrollToChatFloor(originalFloors.length - 1);
+    } else if (context.chat.length > 1) {
+        await scrollToChatFloor(context.chat.length - 1);
     }
 }
 

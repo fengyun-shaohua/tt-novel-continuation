@@ -128,6 +128,14 @@ export function buildSingleCallContinuationContext({
     const isContinue = generationType === 'continue';
     const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue);
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
+    const anchorChapter = (hasNovel && cutoff > 0)
+        ? novelData.chapters.find(c => c.index === cutoff)
+        : null;
+    const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
+    const mountedOriginalCount = Array.isArray(chat)
+        ? chat.filter(m => m?.extra?.novelContinuationOrigin === 'original').length
+        : 0;
+    const hasOriginalFloorInChat = mountedOriginalCount > 0;
 
     // 1. Gather pure story query text (stripping <think>, <think_nya>, <UpdateVariable>, etc.)
     const recentTexts = [];
@@ -140,20 +148,26 @@ export function buildSingleCallContinuationContext({
             }
         }
     }
-    if (hasNovel && cutoff > 0) {
-        const anchorChapter = novelData.chapters.find(c => c.index === cutoff);
-        if (anchorChapter?.content) {
-            recentTexts.push(anchorChapter.content.slice(-700));
-        }
+    if (anchorChapter?.content) {
+        recentTexts.push(anchorChapter.content.slice(-700));
     }
     const queryText = recentTexts.join('\n');
 
     const sections = [];
     const novelTitle = novelData?.title ? `《${novelData.title}》` : '当前长篇小说';
-    sections.push(
-        `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写第 ${targetChapterIndex} 章` : `准备撰写第 ${targetChapterIndex} 章`}]`,
+    const anchorLabel = anchorChapter?.title || `第 ${cutoff} ${chapterUnit}`;
+    const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
+    const headerLines = [
+        `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写${targetLabel}` : `准备撰写${targetLabel}`}]`,
         '请严格保持前文叙事视角、句式节奏、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
-    );
+    ];
+    if (anchorChapter && targetChapterIndex === cutoff + 1 && !isContinue) {
+        const closingTail = anchorChapter.content.replace(/\s+/g, ' ').trim().slice(-140);
+        headerLines.push(
+            `【严格续写锚点】：前文原著已完整演进至【${anchorLabel}】结尾（末尾句：“……${closingTail}”）。严禁回退或重写第 1~${cutoff} ${chapterUnit}已发生的剧情！请直接紧接【${anchorLabel}】结尾处无缝向下推进，撰写【${targetLabel}】。`,
+        );
+    }
+    sections.push(headerLines.join('\n'));
 
     // 2. Tier 1: Active Timeline World States & Recent Summaries (Highest Priority)
     const activeStates = resolveTimelineWorldStates(ledger?.worldStates || [], targetChapterIndex - 1);
@@ -167,13 +181,13 @@ export function buildSingleCallContinuationContext({
         if (activeStates.length > 0) {
             tier1Lines.push('▸ 当前人物/势力/物品最新状态：');
             for (const st of activeStates.slice(-18)) {
-                tier1Lines.push(`  - [${st.category}] ${st.name}（第${st.effectiveChapter}章起）：${st.state}`);
+                tier1Lines.push(`  - [${st.category}] ${st.name}（第${st.effectiveChapter}${chapterUnit}起）：${st.state}`);
             }
         }
         if (activeSummaries.length > 0) {
             tier1Lines.push('▸ 近期章节剧情摘要：');
             for (const sum of activeSummaries) {
-                tier1Lines.push(`  - 第${sum.chapterIndex}章《${sum.title || ''}》：${sum.summary}`);
+                tier1Lines.push(`  - 第${sum.chapterIndex}${chapterUnit}《${sum.title || ''}》：${sum.summary}`);
             }
         }
         sections.push(tier1Lines.join('\n'));
@@ -201,19 +215,21 @@ export function buildSingleCallContinuationContext({
     }
 
     // 4. Tier 2: Local CJK Flashback Retrieval from Imported Original Novel (<= cutoffChapterIndex)
+    // Exclude all trailing chapters already present in `coreChat` so earlier mounted chapters (e.g. ch 3)
+    // are never re-injected after the cutoff chapter (e.g. ch 4) and cause the LLM to rewind.
     if (hasNovel && queryText.trim()) {
         const hits = searchOriginalChaptersCjk(queryText, novelData.chapters, {
             cutoffChapterIndex: cutoff,
-            excludeTailCount: 1,
+            excludeTailCount: hasOriginalFloorInChat ? Math.max(1, mountedOriginalCount) : 1,
             topK: Number(settings.maxOriginalHits) || 3,
             maxSnippetChars: 420,
         });
         if (hits.length > 0) {
             const tier2Lines = [
-                `【第二优先级：本作品前文原著闪回检索（时间线截止至第 ${cutoff} 章，后续章节已屏蔽防剧透）】`,
+                `【第二优先级：本作品早期原著闪回检索（仅供回忆背景设定，时间线已推进至第 ${cutoff} ${chapterUnit}，切勿回退重写以下早期片段）】`,
             ];
             for (const hit of hits) {
-                tier2Lines.push(`  - 原著第${hit.chapterIndex}章《${hit.title}》原文片段：\n    “${hit.snippet}”`);
+                tier2Lines.push(`  - 原著第${hit.chapterIndex}${chapterUnit}《${hit.title}》历史片段：\n    “${hit.snippet}”`);
             }
             sections.push(tier2Lines.join('\n'));
         }
@@ -237,17 +253,10 @@ export function buildSingleCallContinuationContext({
     }
 
     // 6. Fallback Style & Cliffhanger Anchor when no original chapter floor is mounted in chat
-    if (hasNovel && cutoff > 0) {
-        const hasOriginalFloorInChat = Array.isArray(chat)
-            && chat.some(m => m?.extra?.novelContinuationOrigin === 'original');
-        if (!hasOriginalFloorInChat) {
-            const lastOriginal = novelData.chapters.find(c => c.index === cutoff);
-            if (lastOriginal) {
-                sections.push(
-                    `【原著断更处锚点 · 第 ${lastOriginal.index} 章《${lastOriginal.title}》结尾原文（请严格模仿其文风笔触紧接着往下写）】\n${lastOriginal.content.slice(-1500)}`,
-                );
-            }
-        }
+    if (anchorChapter && !hasOriginalFloorInChat) {
+        sections.push(
+            `【原著断更处锚点 · 第 ${anchorChapter.index} ${chapterUnit}《${anchorChapter.title}》结尾原文（请严格模仿其文风笔触紧接着往下写）】\n${anchorChapter.content.slice(-1500)}`,
+        );
     }
 
     // 7. Single-Call Zero-Extra-Cost <novel_state> Trailer Instruction (skip on mid-message continue)
@@ -257,7 +266,7 @@ export function buildSingleCallContinuationContext({
                 '【单次调用自动归档指令（重要）】',
                 '请在完整写完本章小说正文之后，在回复的最末尾单独附带如下格式的 `<novel_state>` 标签块（前端会自动隐藏该块并入库，请勿省略）：',
                 '<novel_state>',
-                `<summary>第${targetChapterIndex}章的一句话核心剧情总结（80字以内）</summary>`,
+                `<summary>${targetLabel}的一句话核心剧情总结（80字以内）</summary>`,
                 '<worldbook>',
                 '- 人物|角色名：本章结束时的最新状态/修为/持有物/关系变化（仅写本章有变动的条目）',
                 '</worldbook>',

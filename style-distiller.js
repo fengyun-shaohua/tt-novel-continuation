@@ -500,6 +500,7 @@ export async function runStyleDistillationPipeline({
     maxConcurrency = 2,
     rounds = 2,
     existingProfile = null,
+    evaluateOnly = false,
     onProgress = () => {},
 }) {
     if (!novelData?.chapters?.length) {
@@ -508,11 +509,14 @@ export async function runStyleDistillationPipeline({
     if (typeof callModel !== 'function') {
         throw new Error('缺少可用的模型调用函数 callModel');
     }
+    if (evaluateOnly && !existingProfile?.styleCard) {
+        throw new Error('当前还没有已生成的文风圣经可供纯跑分验收');
+    }
 
     const cutoff = Number(novelData.cutoffChapterIndex || novelData.totalChapters);
     const concurrency = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
     const targetRounds = Math.max(1, Math.min(3, Number(rounds) || 2));
-    const isIncremental = Boolean(existingProfile?.styleCard);
+    const isIncremental = Boolean(existingProfile?.styleCard) || evaluateOnly;
 
     const totalSteps = isIncremental ? 2 : (2 + targetRounds * 2);
     let currentStep = 0;
@@ -788,33 +792,48 @@ export async function runStyleDistillationPipeline({
         const driftReport = computeStyleDriftReport(holdout.text, blindRewrite);
         prevDriftWarnings = driftReport.warnings;
 
-        // Step B of Round: Forensic Diff, Pure-Style Fidelity Scoring (0~100), & Anti-Overfitting Style Bible Refinement
+        // Step B of Round: Forensic Diff, Pure-Style Fidelity Scoring (0~100), & Optional Style Bible Refinement
         currentStep += 1;
         onProgress({
             step: currentStep,
             totalSteps,
-            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮客观+法医对比评分）：对照物理指标与真迹打分，提纯升级圣经...`,
+            label: evaluateOnly
+                ? `步骤 ${currentStep}/${totalSteps}（纯跑分验收 · 不改圣经）：对照物理指标与真迹盲评打分...`
+                : `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮客观+法医对比评分）：对照物理指标与真迹打分，提纯升级圣经...`,
         });
 
         const prevScoresText = roundHistory.length > 0
             ? `此前轮次得分记录：${roundHistory.map(r => `第${r.round}轮 ${r.score ?? '?'}分`).join(' → ')}`
             : '这是第 1 轮对抗盲测。';
 
-        const calibrationRaw = await callModel({
-            stage: `4_round${roundNum}_forensic_diff`,
-            systemPrompt: analystSystem,
-            prompt: [
-                `现在进行第 ${roundNum} 轮「原著真迹 vs AI 盲测仿写」法医级盲评对比与文风圣经提纯升级——目标作品：《${novelData.title}》。`,
-                prevScoresText,
-                '',
-                '【本地 0-API 客观物理指标比对（真迹 vs 本轮仿写）】：',
-                driftReport.summary,
-                '',
-                '【重要评分纪律（严禁伪扣分）】：',
-                '1. 因为 AI 盲写时只看过干瘪事件大纲、从未看过本段原文，**严禁因为 AI 没猜中原文里特有的道具细节、具体比喻意象（例如某种具体颜色烤漆/怀表比喻/特定台词字眼）而扣分！** 只要 AI 写出了同等级别、符合原作者思维方式的细节白描，该项即为高分。',
-                '2. 请结合上方客观物理指标表，严格只针对 **5 个可泛化的纯文风维度** 客观打分（满分 100）：句式段长节奏(20) + 叙事视角与心理克制度(20) + 对话口癖与标点质感(20) + 氛围推进与原著尺度贴合度(20) + 反AI味纯度(20)。',
-                '3. 若仿写不仅物理指标贴合、且抓住了原作者的神韵与去AI味纯度，应公正给出 90~96 分；若存在跨场景机械拼贴（Overfitting）、长段注水或 AI 八股则如实扣分。',
-                '',
+        const judgePromptLines = [
+            evaluateOnly
+                ? `现在对《${novelData.title}》当前版文风圣经（${cardUsedThisRound.length} 字）执行「纯跑分盲测验收」（只对比打分与找茬，不改写圣经）。`
+                : `现在进行第 ${roundNum} 轮「原著真迹 vs AI 盲测仿写」法医级盲评对比与文风圣经提纯升级——目标作品：《${novelData.title}》。`,
+            prevScoresText,
+            '',
+            '【本地 0-API 客观物理指标比对（真迹 vs 本轮仿写）】：',
+            driftReport.summary,
+            '',
+            '【重要评分纪律（严禁伪扣分）】：',
+            '1. 因为 AI 盲写时只看过干瘪事件大纲、从未看过本段原文，**严禁因为 AI 没猜中原文里特有的道具细节、具体比喻意象（例如某种具体颜色烤漆/怀表比喻/特定台词字眼）而扣分！** 只要 AI 写出了同等级别、符合原作者思维方式的细节白描，该项即为高分。',
+            '2. 请结合上方客观物理指标表，严格只针对 **5 个可泛化的纯文风维度** 客观打分（满分 100）：句式段长节奏(20) + 叙事视角与心理克制度(20) + 对话口癖与标点质感(20) + 氛围推进与原著尺度贴合度(20) + 反AI味纯度(20)。',
+            '3. 若仿写不仅物理指标贴合、且抓住了原作者的神韵与去AI味纯度，应公正给出 90~96 分；若存在跨场景机械拼贴（Overfitting）、长段注水或 AI 八股则如实扣分。',
+            '',
+        ];
+
+        if (evaluateOnly) {
+            judgePromptLines.push(
+                '严格按以下两个标签输出（无需输出 `<style_dna>`）：',
+                '<score>',
+                '（仅输出 0~100 的整数总分，例如：91）',
+                '</score>',
+                '<diff_notes>',
+                '（先给出一行分项评分：句式节奏 X/20 | 视角心理 X/20 | 对话口癖 X/20 | 尺度氛围 X/20 | 去AI味纯度 X/20；再用 3~4 条具体要点评价当前精炼圣经的实战还原表现与是否消除过拟合复读）',
+                '</diff_notes>',
+            );
+        } else {
+            judgePromptLines.push(
                 '【核心防过拟合纪律（极其重要！）】：',
                 '- **严禁把本次盲测真迹（或任何单章）里的具体剧情原句、特定物品描写直接抄进 `<style_dna>` 圣经！**（否则下一轮会背答案或在新章节里复读原句！）',
                 '- `<style_dna>` 必须执行**去重压缩与泛化提纯**，总字数**严格控制在 1,600 ~ 2,600 字以内（绝对不可超过 3,000 字！）**，绝不允许无限滚雪球膨胀！',
@@ -837,44 +856,60 @@ export async function runStyleDistillationPipeline({
                 '',
                 '【当前版文风圣经（请在此基础上做去重提纯与精准修补，删除冗余与单章过拟合原句）】：',
                 cardUsedThisRound,
-                '',
-                `【原作者真实原文（${holdout.label}，仅供本轮对比评分，严禁抄录其中具体情节句进圣经！）】：`,
-                holdout.text,
-                '',
-                '【AI 本轮盲测仿写稿】：',
-                blindRewrite,
-            ].join('\n'),
+            );
+        }
+
+        judgePromptLines.push(
+            '',
+            `【原作者真实原文（${holdout.label}，仅供本轮对比评分，严禁抄录其中具体情节句！）】：`,
+            holdout.text,
+            '',
+            '【AI 本轮盲测仿写稿】：',
+            blindRewrite,
+        );
+
+        const calibrationRaw = await callModel({
+            stage: evaluateOnly ? `4_eval${roundNum}_readonly_score` : `4_round${roundNum}_forensic_diff`,
+            systemPrompt: analystSystem,
+            prompt: judgePromptLines.join('\n'),
         });
 
         const roundScore = extractFidelityScore(calibrationRaw);
         const roundDiffNotes = extractTaggedSection(calibrationRaw, 'diff_notes');
-        const nextStyleCard = extractTaggedSection(calibrationRaw, 'style_dna');
+        let regressedOnRetest = false;
 
-        // Best-of-N tracking: record the card that produced this round's score
-        if (roundScore !== null && roundScore >= bestRecord.score) {
-            bestRecord = { score: roundScore, styleCard: cardUsedThisRound };
-        }
-        // If same-holdout retest regressed below best score by >= 3 points, keep best card as baseline
-        const regressedOnRetest = isRetest && roundScore !== null && bestRecord.score >= 0 && roundScore <= bestRecord.score - 3;
-        if (regressedOnRetest) {
-            currentStyleCard = bestRecord.styleCard;
-        } else if (nextStyleCard && nextStyleCard.length >= 200) {
-            currentStyleCard = nextStyleCard;
+        if (!evaluateOnly) {
+            const nextStyleCard = extractTaggedSection(calibrationRaw, 'style_dna');
+            if (roundScore !== null && roundScore >= bestRecord.score) {
+                bestRecord = { score: roundScore, styleCard: cardUsedThisRound };
+            }
+            regressedOnRetest = isRetest && roundScore !== null && bestRecord.score >= 0 && roundScore <= bestRecord.score - 3;
+            if (regressedOnRetest) {
+                currentStyleCard = bestRecord.styleCard;
+            } else if (nextStyleCard && nextStyleCard.length >= 200) {
+                currentStyleCard = nextStyleCard;
+            }
         }
 
-        const holdoutLabelFull = `${holdout.label}${isRetest ? ' (错题重考)' : ''}`;
+        const holdoutLabelFull = evaluateOnly
+            ? `${holdout.label} (纯跑分验收·未改圣经)`
+            : `${holdout.label}${isRetest ? ' (错题重考)' : ''}`;
         roundHistory.push({
             round: roundNum,
             holdoutLabel: holdoutLabelFull,
             score: roundScore,
             diffNotes: roundDiffNotes,
+            evaluateOnly,
         });
 
         const roundLogEntry = {
             id: `round_${roundNum}`,
             type: 'round',
             round: roundNum,
-            title: `第 ${roundNum} 轮盲测对抗 · ${holdoutLabelFull}`,
+            evaluateOnly,
+            title: evaluateOnly
+                ? `🧪 纯跑分验收（未改圣经）· 第 ${roundNum} 次 · ${holdout.label}`
+                : `第 ${roundNum} 轮盲测对抗 · ${holdoutLabelFull}`,
             holdoutLabel: holdoutLabelFull,
             isRetest,
             score: roundScore,
@@ -889,7 +924,9 @@ export async function runStyleDistillationPipeline({
         onProgress({
             step: currentStep,
             totalSteps,
-            label: `第 ${roundNum} 轮盲测评分完成：${roundScore !== null ? `${roundScore}/100 分` : '已评估'}（圣经现 ${currentStyleCard.length} 字）`,
+            label: evaluateOnly
+                ? `🧪 纯跑分验收完成：${roundScore !== null ? `${roundScore}/100 分` : '已评估'}（圣经保持 ${currentStyleCard.length} 字未改动）`
+                : `第 ${roundNum} 轮盲测评分完成：${roundScore !== null ? `${roundScore}/100 分` : '已评估'}（圣经现 ${currentStyleCard.length} 字）`,
             logEntry: roundLogEntry,
         });
 

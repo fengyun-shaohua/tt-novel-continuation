@@ -799,6 +799,9 @@ function renderStyleTab(bodyEl) {
             <button type="button" id="tt-novel-wb-compress-style" class="menu_button ${isBloatedCard ? 'tt-novel-btn-primary' : ''}" ${task.running || !sp?.styleCard ? 'disabled' : ''}>
                 ✨ 一键去过拟合提纯瘦身 (1次API)
             </button>
+            <button type="button" id="tt-novel-wb-eval-style" class="menu_button" ${task.running || !sp?.styleCard ? 'disabled' : ''}>
+                🧪 纯跑分盲测验收 (不改圣经)
+            </button>
         </div>
         ${bloatedWarnHtml}
         ${progressHtml}
@@ -831,6 +834,9 @@ function renderStyleTab(bodyEl) {
     });
     bodyEl.querySelector('#tt-novel-wb-compress-style')?.addEventListener('click', () => {
         handlers.onCompressStyleCard?.();
+    });
+    bodyEl.querySelector('#tt-novel-wb-eval-style')?.addEventListener('click', () => {
+        handlers.onRunStyleDistill?.({ incremental: true, evaluateOnly: true });
     });
     bodyEl.querySelector('#tt-novel-wb-save-style')?.addEventListener('click', async () => {
         const cardText = String(bodyEl.querySelector('#tt-novel-wb-style-editor')?.value || '').trim();

@@ -1050,7 +1050,7 @@ async function runResynthArchiveTask() {
     }
 }
 
-async function runStyleDistillTask({ incremental = false } = {}) {
+async function runStyleDistillTask({ incremental = false, evaluateOnly = false } = {}) {
     const novelData = await loadNovelData();
     if (!novelData?.chapters?.length) {
         globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件', '小说续写阅读器');
@@ -1058,8 +1058,8 @@ async function runStyleDistillTask({ incremental = false } = {}) {
     }
 
     const ledger = await loadLedger();
-    if (incremental && !ledger?.styleProfile?.styleCard) {
-        globalThis.toastr?.warning?.('请先执行一次完整文风蒸馏，再追加盲测精炼', '小说续写阅读器');
+    if ((incremental || evaluateOnly) && !ledger?.styleProfile?.styleCard) {
+        globalThis.toastr?.warning?.('请先执行一次完整文风蒸馏，再进行盲测精炼或纯跑分验收', '小说续写阅读器');
         return;
     }
 
@@ -1075,10 +1075,12 @@ async function runStyleDistillTask({ incremental = false } = {}) {
     updateLiveProgress('style', {
         isRunning: true,
         isError: false,
-        resetLogs: !incremental,
-        text: incremental
-            ? `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 追加 1 轮全新真迹盲测与评分...`
-            : `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动 ${rounds} 轮骨相对抗蒸馏（并发上限 ≤ 2）...`,
+        resetLogs: !(incremental || evaluateOnly),
+        text: evaluateOnly
+            ? `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动纯跑分盲测验收（不修改当前 ${String(ledger.styleProfile.styleCard).length} 字圣经）...`
+            : (incremental
+                ? `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 追加 1 轮全新真迹盲测与评分...`
+                : `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动 ${rounds} 轮骨相对抗蒸馏（并发上限 ≤ 2）...`),
     });
 
     try {
@@ -1086,7 +1088,8 @@ async function runStyleDistillTask({ incremental = false } = {}) {
             novelData,
             maxConcurrency: 2,
             rounds,
-            existingProfile: incremental ? ledger.styleProfile : null,
+            existingProfile: (incremental || evaluateOnly) ? ledger.styleProfile : null,
+            evaluateOnly,
             callModel: caller.callModel,
             onProgress: ({ step, totalSteps, label, logEntry }) => {
                 updateLiveProgress('style', {
@@ -1100,22 +1103,29 @@ async function runStyleDistillTask({ incremental = false } = {}) {
         ledger.styleProfile = styleProfile;
         await saveLedger(ledger);
         const scoreChain = (styleProfile.roundHistory || [])
-            .map(r => `R${r.round} ${r.score !== null ? `${r.score}分` : '?'}`)
+            .map(r => `${r.evaluateOnly ? '验' : 'R'}${r.round} ${r.score !== null ? `${r.score}分` : '?'}`)
             .join(' → ');
         updateLiveProgress('style', {
             isRunning: false,
-            text: `✅ 蒸馏完成（${String(styleProfile.styleCard).length} 字 · ${scoreChain || '已定稿'}），全过程已保存，后续每章自动生效！`,
+            text: evaluateOnly
+                ? `✅ 纯跑分验收完成：本轮 ${styleProfile.latestScore ?? '?'}/100 分（圣经保持 ${String(styleProfile.styleCard).length} 字未改 · 历程 ${scoreChain}），可展开下方卡片查看客观指标与真迹对照！`
+                : `✅ 蒸馏完成（${String(styleProfile.styleCard).length} 字 · ${scoreChain || '已定稿'}），全过程已保存，后续每章自动生效！`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
-        globalThis.toastr?.success?.(`原著文风骨相蒸馏完成（${scoreChain || '已定稿'}）！`, '小说续写阅读器');
+        globalThis.toastr?.success?.(
+            evaluateOnly
+                ? `纯跑分验收完成：${styleProfile.latestScore ?? '?'}/100 分（圣经未改动）！`
+                : `原著文风骨相蒸馏完成（${scoreChain || '已定稿'}）！`,
+            '小说续写阅读器',
+        );
     } catch (error) {
         updateLiveProgress('style', {
             isRunning: false,
             isError: true,
-            text: `❌ 蒸馏失败：${error?.message || error}`,
+            text: `❌ ${evaluateOnly ? '跑分验收' : '蒸馏'}失败：${error?.message || error}`,
         });
-        globalThis.toastr?.error?.(`文风蒸馏失败：${error?.message || error}`, '小说续写阅读器');
+        globalThis.toastr?.error?.(`${evaluateOnly ? '跑分验收' : '文风蒸馏'}失败：${error?.message || error}`, '小说续写阅读器');
     }
 }
 
@@ -1162,7 +1172,7 @@ async function runCompressStyleCardTask() {
         await saveLedger(ledger);
         updateLiveProgress('style', {
             isRunning: false,
-            text: `✅ 提纯瘦身完成：${beforeLen} 字 → ${compressed.length} 字（零原句复读 · 实战可直接生效）！`,
+            text: `✅ 提纯瘦身完成：${beforeLen} 字 → ${compressed.length} 字！现在可以直接点击上方「🧪 纯跑分盲测验收 (不改圣经)」实测瘦身后的真实得分与真迹对比！`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();

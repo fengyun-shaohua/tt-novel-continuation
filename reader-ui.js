@@ -1,10 +1,13 @@
 import { escapeHtml, debounce } from '/scripts/utils.js';
 import { getContext } from '/scripts/extensions.js';
+import { isContinuedNovelFloor } from './context-assembler.js';
 import { loadLedger, loadNovelData, saveLedger } from './storage.js';
 
 const PROGRESS_META_KEY = 'novel_continuation_progress';
+const TOC_PAGE_LIMIT = 100;
 
 let drawerOpen = false;
+let showAllOriginalChapters = false;
 let previewChapterIndex = null;
 let cachedNovelData = null;
 let cachedLedger = null;
@@ -13,12 +16,23 @@ let onSettingChangeCallback = null;
 
 /**
  * Applies or removes the body CSS classes for Immersive Novel Mode, Hide User Floors, and Hide Reasoning.
- * @param {{ immersiveMode?: boolean, hideUserFloors?: boolean, hideReasoning?: boolean }} settings
+ * When master switch `settings.enabled` is false, all classes and the quickbar are cleanly withdrawn.
+ *
+ * @param {{ enabled?: boolean, immersiveMode?: boolean, hideUserFloors?: boolean, hideReasoning?: boolean }} settings
  */
 export function applyReaderBodyClasses(settings) {
-    document.body.classList.toggle('tt-novel-immersive', Boolean(settings?.immersiveMode));
-    document.body.classList.toggle('tt-novel-hide-user-floors', Boolean(settings?.hideUserFloors));
-    document.body.classList.toggle('tt-novel-hide-cot', settings?.hideReasoning !== false);
+    const active = settings?.enabled !== false;
+    document.body.classList.toggle('tt-novel-immersive', active && Boolean(settings?.immersiveMode));
+    document.body.classList.toggle('tt-novel-hide-user-floors', active && Boolean(settings?.hideUserFloors));
+    document.body.classList.toggle('tt-novel-hide-cot', active && settings?.hideReasoning !== false);
+
+    const bar = document.getElementById('tt-novel-quickbar');
+    if (bar) {
+        bar.classList.toggle('displayNone', !active);
+    }
+    if (!active && drawerOpen) {
+        toggleTocDrawer(false);
+    }
     syncQuickBarState(settings);
 }
 
@@ -207,10 +221,13 @@ function mountFloatingTocDrawer() {
     document.body.appendChild(drawer);
 
     drawer.querySelector('#tt-novel-toc-close')?.addEventListener('click', () => toggleTocDrawer(false));
-    drawer.querySelector('#tt-novel-jump-cutoff')?.addEventListener('click', () => jumpToCutoffBoundary());
-    drawer.querySelector('#tt-novel-jump-latest')?.addEventListener('click', () => jumpToLatestFloor());
-    drawer.querySelector('#tt-novel-jump-saved')?.addEventListener('click', () => jumpToSavedProgress());
-    drawer.querySelector('#tt-novel-toc-search')?.addEventListener('input', () => renderTocDrawerBody());
+    drawer.querySelector('#tt-novel-jump-cutoff')?.addEventListener('click', () => { void jumpToCutoffBoundary(); });
+    drawer.querySelector('#tt-novel-jump-latest')?.addEventListener('click', () => { void jumpToLatestFloor(); });
+    drawer.querySelector('#tt-novel-jump-saved')?.addEventListener('click', () => { void jumpToSavedProgress(); });
+    drawer.querySelector('#tt-novel-toc-search')?.addEventListener(
+        'input',
+        debounce(() => renderTocDrawerBody(), 250),
+    );
 }
 
 export async function toggleTocDrawer(forceState) {
@@ -239,25 +256,28 @@ function renderTocDrawerBody() {
             : '📑 章节目录与进度';
     }
 
-    // Map chat floors to original chapter index or AI continuation floors
     const originalFloorByChapter = new Map();
+    let lastOrigFloorIdx = -1;
+    chat.forEach((msg, floorIdx) => {
+        if (msg?.extra?.novelContinuationOrigin === 'original') {
+            lastOrigFloorIdx = floorIdx;
+            const origIdx = Number(msg.extra?.novelChapterIndex);
+            if (origIdx > 0) originalFloorByChapter.set(origIdx, floorIdx);
+        }
+    });
+
     const aiFloors = [];
     chat.forEach((msg, floorIdx) => {
-        if (!msg || msg.is_user || msg.is_system) return;
-        const origIdx = Number(msg.extra?.novelChapterIndex);
-        if (msg.extra?.novelContinuationOrigin === 'original' && origIdx > 0) {
-            originalFloorByChapter.set(origIdx, floorIdx);
-        } else {
-            const firstLine = String(msg.mes || '').split('\n').map(l => l.trim()).find(Boolean) || `续写章节`;
-            const cleanHeading = firstLine.replace(/^#+\s*/, '').slice(0, 38);
-            const swipeCount = Array.isArray(msg.swipes) ? msg.swipes.length : 1;
-            aiFloors.push({
-                floorIdx,
-                title: cleanHeading,
-                swipeCount,
-                wordCount: String(msg.mes || '').replace(/\s+/g, '').length,
-            });
-        }
+        if (!isContinuedNovelFloor(msg, floorIdx, lastOrigFloorIdx)) return;
+        const firstLine = String(msg.mes || '').split('\n').map(l => l.trim()).find(Boolean) || '续写章节';
+        const cleanHeading = firstLine.replace(/^#+\s*/, '').slice(0, 38);
+        const swipeCount = Array.isArray(msg.swipes) ? msg.swipes.length : 1;
+        aiFloors.push({
+            floorIdx,
+            title: cleanHeading,
+            swipeCount,
+            wordCount: String(msg.mes || '').replace(/\s+/g, '').length,
+        });
     });
 
     const rows = [];
@@ -266,10 +286,34 @@ function renderTocDrawerBody() {
         const cutoff = novel.cutoffChapterIndex || novel.totalChapters;
         rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（共 ${novel.totalChapters} 章，当前接续自第 ${cutoff} 章）</div>`);
 
-        for (const ch of novel.chapters) {
-            if (filterText && !ch.title.toLowerCase().includes(filterText) && !ch.content.toLowerCase().includes(filterText)) {
-                continue;
+        let visibleChapters = novel.chapters;
+        if (filterText) {
+            // Fast title match first; only scan body if < 30 matches and query >= 2 chars
+            const titleHits = novel.chapters.filter(ch => ch.title.toLowerCase().includes(filterText));
+            if (titleHits.length >= 20 || filterText.length < 2) {
+                visibleChapters = titleHits;
+            } else {
+                const bodyHits = [];
+                for (const ch of novel.chapters) {
+                    if (ch.title.toLowerCase().includes(filterText) || ch.content.toLowerCase().includes(filterText)) {
+                        bodyHits.push(ch);
+                        if (bodyHits.length >= 80) break;
+                    }
+                }
+                visibleChapters = bodyHits;
             }
+        } else if (!showAllOriginalChapters && novel.chapters.length > TOC_PAGE_LIMIT) {
+            const half = Math.floor(TOC_PAGE_LIMIT / 2);
+            const start = Math.max(0, Math.min(novel.chapters.length - TOC_PAGE_LIMIT, cutoff - half));
+            visibleChapters = novel.chapters.slice(start, start + TOC_PAGE_LIMIT);
+            rows.push(`
+                <button type="button" id="tt-novel-toc-show-all" class="tt-novel-jump-btn">
+                    展开全部 ${novel.chapters.length} 章（当前展示第 ${visibleChapters[0].index}~${visibleChapters[visibleChapters.length - 1].index} 章）
+                </button>
+            `);
+        }
+
+        for (const ch of visibleChapters) {
             const mountedFloor = originalFloorByChapter.get(ch.index);
             const isCutoff = ch.index === cutoff;
             const isAfterCutoff = ch.index > cutoff;
@@ -288,7 +332,7 @@ function renderTocDrawerBody() {
         }
     }
 
-    rows.push(`<div class="tt-novel-toc-divider">✦ AI 续写与当前聊天章节（${aiFloors.length} 章）</div>`);
+    rows.push(`<div class="tt-novel-toc-divider">✦ AI 续写章节（${aiFloors.length} 章）</div>`);
     if (aiFloors.length === 0) {
         rows.push('<div class="tt-novel-toc-empty">暂无续写章节，在底部输入框发送指令即可单次调用生成下一章。</div>');
     } else {
@@ -308,10 +352,15 @@ function renderTocDrawerBody() {
 
     listEl.innerHTML = rows.join('');
 
+    listEl.querySelector('#tt-novel-toc-show-all')?.addEventListener('click', () => {
+        showAllOriginalChapters = true;
+        renderTocDrawerBody();
+    });
+
     listEl.querySelectorAll('[data-action="jump-floor"]').forEach(el => {
         el.addEventListener('click', () => {
             const floor = Number(el.getAttribute('data-floor'));
-            scrollToChatFloor(floor);
+            void scrollToChatFloor(floor);
         });
     });
 
@@ -320,7 +369,7 @@ function renderTocDrawerBody() {
             const idx = Number(el.getAttribute('data-orig-index'));
             const mountedFloor = originalFloorByChapter.get(idx);
             if (mountedFloor !== undefined) {
-                scrollToChatFloor(mountedFloor);
+                void scrollToChatFloor(mountedFloor);
             } else {
                 openOriginalChapterPreview(idx);
             }
@@ -371,11 +420,11 @@ function openOriginalChapterPreview(chapterIndex) {
 }
 
 /**
- * Scrolls `#chat` to the specified message floor index, automatically clicking
- * `#show_more_messages` if the target floor is above the currently mounted DOM window.
+ * Scrolls `#chat` to the specified message floor index, awaiting async DOM updates
+ * when `#show_more_messages` loads earlier floors.
  * @param {number} floorIndex
  */
-export function scrollToChatFloor(floorIndex) {
+export async function scrollToChatFloor(floorIndex) {
     const chatEl = document.getElementById('chat');
     if (!chatEl || !Number.isFinite(floorIndex) || floorIndex < 0) return;
 
@@ -385,6 +434,7 @@ export function scrollToChatFloor(floorIndex) {
         if (!showMoreBtn) break;
         showMoreBtn.click();
         guard += 1;
+        await new Promise(resolve => setTimeout(resolve, 20));
     }
 
     const targetMes = chatEl.querySelector(`.mes[mesid="${floorIndex}"]`);
@@ -396,7 +446,7 @@ export function scrollToChatFloor(floorIndex) {
     }
 }
 
-function jumpToCutoffBoundary() {
+async function jumpToCutoffBoundary() {
     const chat = getContext()?.chat || [];
     let lastOrigFloor = -1;
     chat.forEach((msg, idx) => {
@@ -405,29 +455,37 @@ function jumpToCutoffBoundary() {
         }
     });
     if (lastOrigFloor >= 0) {
-        scrollToChatFloor(lastOrigFloor);
+        await scrollToChatFloor(lastOrigFloor);
     } else if (chat.length > 0) {
-        scrollToChatFloor(0);
+        await scrollToChatFloor(0);
     }
 }
 
-function jumpToLatestFloor() {
+async function jumpToLatestFloor() {
     const chat = getContext()?.chat || [];
     for (let i = chat.length - 1; i >= 0; i -= 1) {
         if (!chat[i]?.is_user) {
-            scrollToChatFloor(i);
+            await scrollToChatFloor(i);
             return;
         }
     }
 }
 
-function jumpToSavedProgress() {
+async function jumpToSavedProgress() {
+    const chat = getContext()?.chat || [];
     const progress = getContext()?.chatMetadata?.[PROGRESS_META_KEY];
-    if (progress && Number.isFinite(progress.floorIndex)) {
-        scrollToChatFloor(progress.floorIndex);
+    if (progress && Number.isFinite(progress.floorIndex) && progress.floorIndex < chat.length) {
+        await scrollToChatFloor(progress.floorIndex);
     } else {
-        jumpToCutoffBoundary();
+        await jumpToCutoffBoundary();
     }
+}
+
+export function clearReadingProgress() {
+    const context = getContext();
+    if (!context?.chatMetadata) return;
+    delete context.chatMetadata[PROGRESS_META_KEY];
+    context.saveMetadataDebounced?.();
 }
 
 function saveReadingProgress(floorIndex) {

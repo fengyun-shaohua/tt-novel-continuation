@@ -3,10 +3,11 @@
  * for the Novel Continuation extension. Zero DOM or network dependencies.
  */
 
-const CHAPTER_HEADING_REGEX = /^[\t \u3000]*(?:(?:正文|第[零一二三四五六七八九十百千万两〇○\d]+[卷集部篇])[\t \u3000]*)?(?:第[\t \u3000]*[零一二三四五六七八九十百千万两〇○壹贰叁肆伍陆柒捌玖拾佰仟\d]+[\t \u3000]*[章节回幕折]|(?:Chapter|CHAPTER)\s+\d+|【第[零一二三四五六七八九十百千万两〇○\d]+[章节回]】)[^\n\r]{0,80}$/gm;
+const CHAPTER_HEADING_REGEX = /^[\t \u3000]*(?:#{1,6}[\t \u3000]+)?(?:(?:正文|第[零一二三四五六七八九十百千万两〇○\d]+[卷集部篇])[\t \u3000]*)?(?:第[\t \u3000]*[零一二三四五六七八九十百千万两〇○壹贰叁肆伍陆柒捌玖拾佰仟\d]+[\t \u3000]*[章节回幕折]|(?:Chapter|CHAPTER)\s+\d+|【第[零一二三四五六七八九十百千万两〇○\d]+[章节回]】)[^\n\r]{0,80}$/gm;
 
 const FALLBACK_CHUNK_SIZE = 4200;
 const NOVEL_STATE_BLOCK_REGEX = /<novel_state>([\s\S]*?)<\/novel_state>/gi;
+const NOISE_BLOCKS_REGEX = /<(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)\b[^>]*>[\s\S]*?<\/(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)>/gi;
 
 const CJK_STOPWORDS = new Set([
     '一个', '一下', '一些', '一切', '一样', '一直', '一定', '已经', '以及', '以后',
@@ -30,8 +31,20 @@ export function normalizeNovelText(rawText) {
 }
 
 /**
+ * Strips thinking/CoT blocks (`<think>`, `<think_nya>`, `<cot>`, `<details>`), MVU variable blocks,
+ * and `<novel_state>` blocks from message text so retrieval queries only use pure story text.
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripNonStoryBlocks(text) {
+    return String(text ?? '')
+        .replace(NOISE_BLOCKS_REGEX, '')
+        .trim();
+}
+
+/**
  * Splits an imported novel (.txt / .md) into structured chapters.
- * Falls back to sentence-aligned chunking when no explicit chapter headings exist.
+ * Supports Markdown headings (`# 第一章`, `## 第1章`) and falls back to sentence-aligned chunking.
  *
  * @param {string} rawText
  * @param {string} [fileName='未命名小说.txt']
@@ -52,7 +65,10 @@ export function parseNovelTxt(rawText, fileName = '未命名小说.txt') {
     CHAPTER_HEADING_REGEX.lastIndex = 0;
     let match;
     while ((match = CHAPTER_HEADING_REGEX.exec(text)) !== null) {
-        const heading = match[0].trim().replace(/[\t \u3000]+/g, ' ');
+        const heading = match[0]
+            .trim()
+            .replace(/^#{1,6}[\t \u3000]+/, '')
+            .replace(/[\t \u3000]+/g, ' ');
         matches.push({ heading, start: match.index, bodyStart: match.index + match[0].length });
     }
 
@@ -76,7 +92,6 @@ export function parseNovelTxt(rawText, fileName = '未命名小说.txt') {
             });
         }
     } else {
-        // Fallback: split by ~4200 characters at paragraph boundaries
         const paragraphs = text.split(/\n{2,}|\n(?=[　\t ]{2,})/);
         let buffer = '';
         let autoIndex = 1;
@@ -134,7 +149,6 @@ export function parseSupplementaryDatabase(rawText, fileName = '补充设定库'
     if (!text) return [];
     const sourceName = String(fileName || '补充设定库').replace(/\.(json|jsonl|md|txt)$/i, '');
 
-    // 1. Try JSON (SillyTavern World Info `{ entries: {...} }` or array)
     if (text.startsWith('{') || text.startsWith('[')) {
         try {
             const parsed = JSON.parse(text);
@@ -170,11 +184,10 @@ export function parseSupplementaryDatabase(rawText, fileName = '补充设定库'
                     .filter(Boolean);
             }
         } catch {
-            // Fall through to JSONL or Markdown/TXT parser
+            // Fall through
         }
     }
 
-    // 2. Try JSONL
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     if (lines.length > 0 && lines.every(l => l.startsWith('{') && l.endsWith('}'))) {
         try {
@@ -198,11 +211,10 @@ export function parseSupplementaryDatabase(rawText, fileName = '补充设定库'
             });
             if (items.length > 0) return items;
         } catch {
-            // Fall through to Markdown/TXT heading parser
+            // Fall through
         }
     }
 
-    // 3. Markdown / TXT section parser (`# 标题`, `## 词条`, or `【词条】`)
     const sections = text.split(/\n(?=##?\s+|【[^】\n]{1,40}】)/);
     const items = [];
     sections.forEach((sec, idx) => {
@@ -239,18 +251,15 @@ export function parseSupplementaryDatabase(rawText, fileName = '补充设定库'
     return items;
 }
 
+function stripListPrefix(line) {
+    return String(line ?? '')
+        .replace(/^[\s\-*•]+/, '')
+        .replace(/^(?:\d+[.、)）]\s*)+/, '')
+        .trim();
+}
+
 /**
- * Extracts and strips the trailing `<novel_state>...</novel_state>` XML block
- * generated during single-call continuation.
- *
- * @param {string} rawMessageText
- * @returns {{
- *   hasState: boolean,
- *   cleanText: string,
- *   summary: string,
- *   worldUpdates: Array<{ category: string, name: string, state: string }>,
- *   hooks: Array<{ action: 'add' | 'resolve', content: string }>
- * }}
+ * Extracts and strips the trailing `<novel_state>...</novel_state>` XML block.
  */
 export function extractNovelStateBlock(rawMessageText) {
     const raw = String(rawMessageText ?? '');
@@ -280,7 +289,7 @@ export function extractNovelStateBlock(rawMessageText) {
 
         const worldMatch = inner.match(/<worldbook>([\s\S]*?)<\/worldbook>/i);
         if (worldMatch && worldMatch[1].trim()) {
-            const lines = worldMatch[1].split('\n').map(l => l.replace(/^[\s\-*•]+/, '').trim()).filter(Boolean);
+            const lines = worldMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
             for (const line of lines) {
                 const parsed = parseWorldUpdateLine(line);
                 if (parsed) worldUpdates.push(parsed);
@@ -289,7 +298,7 @@ export function extractNovelStateBlock(rawMessageText) {
 
         const hooksMatch = inner.match(/<hooks>([\s\S]*?)<\/hooks>/i);
         if (hooksMatch && hooksMatch[1].trim()) {
-            const lines = hooksMatch[1].split('\n').map(l => l.replace(/^[\s\-*•]+/, '').trim()).filter(Boolean);
+            const lines = hooksMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
             for (const line of lines) {
                 if (/^\[?(?:已填坑|已回收|完成|resolved)\]?/i.test(line)) {
                     const content = line.replace(/^\[?(?:已填坑|已回收|完成|resolved)\]?[:：\s]*/i, '').trim();
@@ -314,7 +323,6 @@ export function extractNovelStateBlock(rawMessageText) {
 }
 
 function parseWorldUpdateLine(line) {
-    // Supports: `类别|名称：状态描述` or `名称：状态描述`
     const colonIdx = line.search(/[:：]/);
     if (colonIdx === -1) return null;
     const head = line.slice(0, colonIdx).trim();
@@ -332,11 +340,10 @@ function parseWorldUpdateLine(line) {
 
 /**
  * Tokenizes Chinese/English query text into bigrams and entity terms for local retrieval.
- * @param {string} queryText
- * @returns {{ exactTerms: string[], bigrams: string[] }}
  */
 export function extractCjkQueryTokens(queryText) {
-    const cleaned = String(queryText ?? '')
+    const storyOnly = stripNonStoryBlocks(queryText);
+    const cleaned = storyOnly
         .replace(/[^\u4e00-\u9fa5a-zA-Z0-9]+/g, ' ')
         .trim();
     if (!cleaned) return { exactTerms: [], bigrams: [] };
@@ -345,8 +352,7 @@ export function extractCjkQueryTokens(queryText) {
     const exactSet = new Set();
     const bigramSet = new Set();
 
-    // Extract bracketed or quoted entity names from raw query first
-    const quotedMatches = String(queryText ?? '').match(/(?:【([^】]{2,16})】|「([^」]{2,16})」|“([^”]{2,16})”|"([^"]{2,16})")/g) || [];
+    const quotedMatches = storyOnly.match(/(?:【([^】]{2,16})】|「([^」]{2,16})」|“([^”]{2,16})”|"([^"]{2,16})")/g) || [];
     for (const q of quotedMatches) {
         const inner = q.slice(1, -1).trim();
         if (inner.length >= 2 && !CJK_STOPWORDS.has(inner)) {
@@ -378,13 +384,31 @@ export function extractCjkQueryTokens(queryText) {
 }
 
 /**
+ * Groups chapter lines into searchable ~180+ char windows so short dialogue lines are never dropped.
+ */
+function buildSearchableParagraphWindows(content) {
+    const rawLines = String(content || '').split(/\n+/).map(p => p.trim()).filter(Boolean);
+    const windows = [];
+    let buffer = '';
+    for (const line of rawLines) {
+        buffer = buffer ? `${buffer}\n${line}` : line;
+        if (buffer.length >= 140) {
+            windows.push(buffer);
+            buffer = '';
+        }
+    }
+    if (buffer) {
+        if (windows.length > 0 && buffer.length < 40) {
+            windows[windows.length - 1] += `\n${buffer}`;
+        } else {
+            windows.push(buffer);
+        }
+    }
+    return windows;
+}
+
+/**
  * Local zero-API CJK search over novel chapters with Pagekin-style timeline cutoff protection.
- * Automatically filters out any chapter with `index > cutoffChapterIndex` to prevent future spoilers.
- *
- * @param {string} queryText
- * @param {Array<{ index: number, title: string, content: string }>} chapters
- * @param {{ cutoffChapterIndex?: number, excludeTailCount?: number, topK?: number, maxSnippetChars?: number }} [options]
- * @returns {Array<{ chapterIndex: number, title: string, snippet: string, score: number }>}
  */
 export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
     if (!Array.isArray(chapters) || chapters.length === 0) return [];
@@ -403,12 +427,12 @@ export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
 
     for (const chapter of chapters) {
         if (chapter.index > maxAllowedChapter) continue;
-        const paragraphs = chapter.content.split(/\n+/).map(p => p.trim()).filter(p => p.length >= 25);
+        const windows = buildSearchableParagraphWindows(chapter.content);
 
         let bestPara = '';
         let bestScore = 0;
 
-        for (const para of paragraphs) {
+        for (const para of windows) {
             let score = 0;
             for (const term of exactTerms) {
                 if (para.includes(term) || chapter.title.includes(term)) {
@@ -426,7 +450,7 @@ export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
             }
         }
 
-        if (bestScore >= 4 && bestPara) {
+        if (bestScore >= 3 && bestPara) {
             const snippet = bestPara.length > maxSnippetChars
                 ? `${bestPara.slice(0, maxSnippetChars)}……`
                 : bestPara;
@@ -446,17 +470,12 @@ export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
 
 /**
  * Local zero-API CJK search over the supplementary fanfic/canon database (`canonDb`).
- *
- * @param {string} queryText
- * @param {Array<{ id: string, title: string, category: string, keywords: string[], content: string }>} items
- * @param {{ topK?: number, maxItemChars?: number }} [options]
- * @returns {Array<{ title: string, category: string, content: string, score: number }>}
  */
 export function searchCanonDatabaseCjk(queryText, items, options = {}) {
     if (!Array.isArray(items) || items.length === 0) return [];
     const topK = Number(options.topK ?? 4);
     const maxItemChars = Number(options.maxItemChars ?? 450);
-    const rawQuery = String(queryText ?? '');
+    const rawQuery = stripNonStoryBlocks(queryText);
     const { exactTerms, bigrams } = extractCjkQueryTokens(rawQuery);
 
     const scored = [];

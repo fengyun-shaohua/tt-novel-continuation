@@ -5,6 +5,7 @@ import { buildSingleCallContinuationContext, resolveCurrentTargetChapterIndex } 
 import { extractNovelStateBlock, parseNovelTxt, parseSupplementaryDatabase } from './parser.js';
 import {
     applyReaderBodyClasses,
+    clearReadingProgress,
     mountReaderUi,
     refreshReaderWidgets,
     scrollToChatFloor,
@@ -19,6 +20,7 @@ import {
     loadCanonDb,
     loadLedger,
     loadNovelData,
+    pruneLedgerAfterChapter,
     saveCanonDb,
     saveLedger,
     saveNovelData,
@@ -65,14 +67,21 @@ function saveExtensionSettings() {
 globalThis.novelContinuation_interceptGeneration = async function (chat, _contextSize, _abort, type) {
     const settings = getSettings();
     const context = getContext();
-    if (!settings.enabled || type === 'quiet') {
+    if (!settings.enabled || type === 'quiet' || type === 'impersonate') {
         context?.setExtensionPrompt?.(EXTENSION_PROMPT_TAG, '', extension_prompt_types.NONE, 0);
         return;
     }
 
     try {
         const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
-        const promptBlock = buildSingleCallContinuationContext({ chat, novelData, ledger, canonDb, settings });
+        const promptBlock = buildSingleCallContinuationContext({
+            chat,
+            novelData,
+            ledger,
+            canonDb,
+            settings,
+            generationType: type || 'normal',
+        });
 
         if (promptBlock) {
             context?.setExtensionPrompt?.(
@@ -95,9 +104,9 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
  * Strips `<novel_state>...</novel_state>` after a single-call chapter generation completes,
  * keeping the visible novel text pure and updating the local timeline ledger + World Info.
  */
-async function onMessageReceived(messageId) {
+async function onMessageReceived(messageId, type) {
     const settings = getSettings();
-    if (!settings.enabled) return;
+    if (!settings.enabled || type === 'first_message' || type === 'impersonate' || type === 'quiet') return;
 
     const context = getContext();
     const chat = context?.chat;
@@ -106,32 +115,46 @@ async function onMessageReceived(messageId) {
     const msg = chat[messageId];
     if (msg.is_user || msg.is_system) return;
 
+    const novelData = await loadNovelData();
+    msg.extra = msg.extra || {};
+    if (!msg.extra.novelContinuationOrigin) {
+        msg.extra.novelContinuationOrigin = 'continued';
+    }
+
+    const chapterIndex = Number(msg.extra.novelChapterIndex)
+        || Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData, true));
+    msg.extra.novelChapterIndex = chapterIndex;
+
     const extracted = extractNovelStateBlock(msg.mes);
     if (!extracted.hasState) {
+        await context.saveChat?.();
         await refreshReaderWidgets();
         return;
     }
 
     msg.mes = extracted.cleanText;
-    if (Array.isArray(msg.swipes) && Number.isFinite(msg.swipe_id) && msg.swipes[msg.swipe_id] !== undefined) {
-        msg.swipes[msg.swipe_id] = extracted.cleanText;
+    const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
+    if (Array.isArray(msg.swipes) && msg.swipes[swipeId] !== undefined) {
+        msg.swipes[swipeId] = extracted.cleanText;
     }
-    msg.extra = msg.extra || {};
-    msg.extra.novelContinuationState = {
+
+    const stateRecord = {
+        chapterIndex,
         summary: extracted.summary,
         worldUpdates: extracted.worldUpdates,
         hooks: extracted.hooks,
     };
+    msg.extra.novelContinuationState = stateRecord;
+    msg.extra.novelContinuationStateBySwipe = msg.extra.novelContinuationStateBySwipe || {};
+    msg.extra.novelContinuationStateBySwipe[swipeId] = stateRecord;
 
     context.updateMessageBlock?.(messageId, msg);
     await context.saveChat?.();
 
-    const novelData = await loadNovelData();
-    const chapterIndex = Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData) - 1);
     const firstLine = extracted.cleanText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
     const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
 
-    await applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle);
+    await applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle, messageId);
 
     if (settings.syncToWorldInfo && extracted.worldUpdates.length > 0) {
         try {
@@ -143,6 +166,30 @@ async function onMessageReceived(messageId) {
 
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
+}
+
+async function onMessageSwiped(messageId) {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    const context = getContext();
+    const msg = context?.chat?.[messageId];
+    if (!msg || msg.is_user) return;
+
+    const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
+    const swipeState = msg.extra?.novelContinuationStateBySwipe?.[swipeId];
+    const chapterIndex = Number(msg.extra?.novelChapterIndex);
+    if (swipeState && chapterIndex > 0) {
+        msg.extra.novelContinuationState = swipeState;
+        const firstLine = String(msg.mes || '').split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
+        const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
+        await applyExtractedStateToLedger(swipeState, chapterIndex, chapterTitle, messageId);
+        if (settings.syncToWorldInfo && swipeState.worldUpdates?.length > 0) {
+            const novelData = await loadNovelData();
+            await syncWorldUpdatesToTavernLorebook(novelData?.title, swipeState.worldUpdates, chapterIndex);
+        }
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+    }
 }
 
 /**
@@ -157,7 +204,11 @@ async function mountOriginalAnchorChaptersToChat(novelData, cutoffChapterIndex) 
     const cutoff = Math.min(novelData.chapters.length, Math.max(1, cutoffChapterIndex));
     const startIdx = Math.max(1, cutoff - anchorCount + 1);
     const selectedChapters = novelData.chapters.filter(c => c.index >= startIdx && c.index <= cutoff);
-    const nonOriginalTail = context.chat.filter(m => m?.extra?.novelContinuationOrigin !== 'original');
+
+    // Keep only actual continued novel floors (drop standard card greeting chat[0] when importing a novel)
+    const continuedTail = context.chat.filter(
+        (m, idx) => m?.extra?.novelContinuationOrigin === 'continued' || (idx > 0 && m?.is_user),
+    );
     const charName = context.name2 || novelData.title || '原著';
 
     const originalFloors = selectedChapters.map(ch => {
@@ -179,7 +230,7 @@ async function mountOriginalAnchorChaptersToChat(novelData, cutoffChapterIndex) 
     });
 
     context.chat.length = 0;
-    for (const floor of [...originalFloors, ...nonOriginalTail]) {
+    for (const floor of [...originalFloors, ...continuedTail]) {
         context.chat.push(floor);
     }
 
@@ -187,7 +238,7 @@ async function mountOriginalAnchorChaptersToChat(novelData, cutoffChapterIndex) 
     await context.printMessages?.();
     applyReaderBodyClasses(settings);
     if (originalFloors.length > 0) {
-        scrollToChatFloor(originalFloors.length - 1);
+        await scrollToChatFloor(originalFloors.length - 1);
     }
 }
 
@@ -197,7 +248,7 @@ async function handleCutoffFromChapter(targetChapterIndex) {
 
     const context = getContext();
     const hasAiFloors = Array.isArray(context?.chat) && context.chat.some(
-        m => !m?.is_user && m?.extra?.novelContinuationOrigin !== 'original',
+        m => m?.extra?.novelContinuationOrigin === 'continued',
     );
 
     if (hasAiFloors) {
@@ -213,11 +264,13 @@ async function handleCutoffFromChapter(targetChapterIndex) {
 
     novelData.cutoffChapterIndex = targetChapterIndex;
     await saveNovelData(novelData);
+    await pruneLedgerAfterChapter(targetChapterIndex);
+    clearReadingProgress();
     await mountOriginalAnchorChaptersToChat(novelData, targetChapterIndex);
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
     globalThis.toastr?.success?.(
-        `已截断至第 ${targetChapterIndex} 章，后续原著章节已屏蔽，现在可直接从该章往下续写！`,
+        `已截断至第 ${targetChapterIndex} 章，后续原著章节与未来状态已清理，现在可直接从该章往下续写！`,
         '小说续写阅读器',
     );
 }
@@ -322,7 +375,7 @@ function mountSettingsPanel() {
             <hr />
             <label class="checkbox_label">
                 <input type="checkbox" id="tt-novel-chk-enabled" ${settings.enabled ? 'checked' : ''} />
-                <span>启用单次调用原著/同人上下文自动组装（0 Agent · 0 并发）</span>
+                <span>启用小说续写插件（关闭时彻底还原普通酒馆聊天与排版）</span>
             </label>
             <label class="checkbox_label">
                 <input type="checkbox" id="tt-novel-chk-immersive" ${settings.immersiveMode ? 'checked' : ''} />
@@ -418,6 +471,9 @@ function bindSettingsEvents(wrapper) {
         wrapper.querySelector(selector)?.addEventListener('change', (e) => {
             settings[key] = Boolean(e.target.checked);
             saveExtensionSettings();
+            if (key === 'enabled' && !settings.enabled) {
+                getContext()?.setExtensionPrompt?.(EXTENSION_PROMPT_TAG, '', extension_prompt_types.NONE, 0);
+            }
             applyReaderBodyClasses(settings);
         });
     };
@@ -445,6 +501,7 @@ function bindSettingsEvents(wrapper) {
         await clearNovelData();
         await saveLedger(createEmptyLedger());
         await saveCanonDb(createEmptyCanonDb());
+        clearReadingProgress();
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
     });
@@ -515,6 +572,9 @@ export async function init() {
     const { eventSource, eventTypes } = context;
     if (eventSource && eventTypes) {
         eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageReceived);
+        if (eventTypes.MESSAGE_SWIPED) {
+            eventSource.on(eventTypes.MESSAGE_SWIPED, onMessageSwiped);
+        }
         eventSource.on(eventTypes.CHAT_CHANGED, async () => {
             applyReaderBodyClasses(getSettings());
             await refreshReaderWidgets();

@@ -1,4 +1,29 @@
-import { searchCanonDatabaseCjk, searchOriginalChaptersCjk } from './parser.js';
+import {
+    searchCanonDatabaseCjk,
+    searchOriginalChaptersCjk,
+    stripNonStoryBlocks,
+} from './parser.js';
+
+/**
+ * Determines whether a chat floor is an AI-continued novel chapter floor
+ * (excluding character card greetings or pre-import dialogue).
+ *
+ * @param {any} msg
+ * @param {number} floorIdx
+ * @param {number} lastOriginalFloorIdx
+ * @returns {boolean}
+ */
+export function isContinuedNovelFloor(msg, floorIdx, lastOriginalFloorIdx) {
+    if (!msg || msg.is_user || msg.is_system) return false;
+    if (msg.extra?.novelContinuationOrigin === 'original') return false;
+    if (msg.extra?.novelContinuationOrigin === 'continued' || msg.extra?.novelContinuationState) {
+        return true;
+    }
+    if (lastOriginalFloorIdx >= 0) {
+        return floorIdx > lastOriginalFloorIdx;
+    }
+    return floorIdx > 0;
+}
 
 /**
  * Computes the effective chapter number currently being written based on the
@@ -6,17 +31,29 @@ import { searchCanonDatabaseCjk, searchOriginalChaptersCjk } from './parser.js';
  *
  * @param {Array<any>} chat
  * @param {{ cutoffChapterIndex?: number } | null} novelData
+ * @param {boolean} [isContinue=false]
  * @returns {number}
  */
-export function resolveCurrentTargetChapterIndex(chat, novelData) {
+export function resolveCurrentTargetChapterIndex(chat, novelData, isContinue = false) {
     const cutoff = Number(novelData?.cutoffChapterIndex || 0);
     if (!Array.isArray(chat)) return cutoff + 1;
 
+    let lastOriginalFloorIdx = -1;
+    chat.forEach((msg, idx) => {
+        if (msg?.extra?.novelContinuationOrigin === 'original') {
+            lastOriginalFloorIdx = idx;
+        }
+    });
+
     let continuedFloors = 0;
-    for (const msg of chat) {
-        if (!msg || msg.is_user || msg.is_system) continue;
-        if (msg.extra?.novelContinuationOrigin === 'original') continue;
-        continuedFloors += 1;
+    chat.forEach((msg, idx) => {
+        if (isContinuedNovelFloor(msg, idx, lastOriginalFloorIdx)) {
+            continuedFloors += 1;
+        }
+    });
+
+    if (isContinue && continuedFloors > 0) {
+        return cutoff + continuedFloors;
     }
     return cutoff + continuedFloors + 1;
 }
@@ -48,25 +85,34 @@ export function resolveTimelineWorldStates(worldStates, maxChapterIndex) {
 }
 
 /**
+ * Selects active foreshadowing hooks up to `maxChapterIndex` (timeline-isolated).
+ */
+export function resolveTimelineHooks(hooks, maxChapterIndex) {
+    if (!Array.isArray(hooks) || hooks.length === 0) return [];
+    return hooks.filter(h => {
+        if (!h?.content) return false;
+        const planted = Number(h.plantedChapter || 0);
+        if (maxChapterIndex > 0 && planted > maxChapterIndex) return false;
+        if (h.status === 'resolved') {
+            const resolvedAt = Number(h.resolvedChapter || 0);
+            if (resolvedAt === 0 || resolvedAt <= maxChapterIndex) return false;
+        }
+        return true;
+    });
+}
+
+/**
  * Builds the Pagekin-style Single-Call Golden Context block injected before a standard
  * Tavern chat completion request. Zero Agent loops, zero extra API calls.
- *
- * @param {{
- *   chat: Array<any>,
- *   novelData: { title: string, totalChapters: number, cutoffChapterIndex: number, chapters: Array<{ index: number, title: string, content: string }> } | null,
- *   ledger: { summaries: Array<any>, worldStates: Array<any>, hooks: Array<any> },
- *   canonDb: { items: Array<any> },
- *   settings: {
- *     enabled: boolean,
- *     enableAutoStateBlock: boolean,
- *     maxOriginalHits: number,
- *     maxCanonHits: number,
- *     maxRecentSummaries: number
- *   }
- * }} params
- * @returns {string}
  */
-export function buildSingleCallContinuationContext({ chat, novelData, ledger, canonDb, settings }) {
+export function buildSingleCallContinuationContext({
+    chat,
+    novelData,
+    ledger,
+    canonDb,
+    settings,
+    generationType = 'normal',
+}) {
     if (!settings?.enabled) return '';
 
     const hasNovel = Boolean(novelData && Array.isArray(novelData.chapters) && novelData.chapters.length > 0);
@@ -79,16 +125,18 @@ export function buildSingleCallContinuationContext({ chat, novelData, ledger, ca
         return '';
     }
 
-    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData);
+    const isContinue = generationType === 'continue';
+    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue);
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
 
-    // 1. Gather query text from the latest user instruction + tail of the latest story floor
+    // 1. Gather pure story query text (stripping <think>, <think_nya>, <UpdateVariable>, etc.)
     const recentTexts = [];
     if (Array.isArray(chat)) {
         for (let i = chat.length - 1; i >= 0 && recentTexts.length < 2; i -= 1) {
             const msg = chat[i];
             if (msg?.mes && typeof msg.mes === 'string') {
-                recentTexts.push(msg.mes.slice(-900));
+                const cleaned = stripNonStoryBlocks(msg.mes);
+                if (cleaned) recentTexts.push(cleaned.slice(-900));
             }
         }
     }
@@ -103,7 +151,7 @@ export function buildSingleCallContinuationContext({ chat, novelData, ledger, ca
     const sections = [];
     const novelTitle = novelData?.title ? `《${novelData.title}》` : '当前长篇小说';
     sections.push(
-        `[小说续写上下文总纲 · ${novelTitle} · 准备撰写第 ${targetChapterIndex} 章]`,
+        `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写第 ${targetChapterIndex} 章` : `准备撰写第 ${targetChapterIndex} 章`}]`,
         '请严格保持前文叙事视角、句式节奏、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
     );
 
@@ -131,8 +179,8 @@ export function buildSingleCallContinuationContext({ chat, novelData, ledger, ca
         sections.push(tier1Lines.join('\n'));
     }
 
-    // 3. Foreshadowing Hooks (Pinned for this chapter vs Open background threads)
-    const openHooks = (ledger?.hooks || []).filter(h => h.status !== 'resolved');
+    // 3. Foreshadowing Hooks (Timeline-isolated)
+    const openHooks = resolveTimelineHooks(ledger?.hooks || [], targetChapterIndex - 1);
     if (openHooks.length > 0) {
         const pinned = openHooks.filter(h => h.status === 'pinned');
         const unpinned = openHooks.filter(h => h.status !== 'pinned').slice(-6);
@@ -188,9 +236,10 @@ export function buildSingleCallContinuationContext({ chat, novelData, ledger, ca
         }
     }
 
-    // 6. Fallback Style & Cliffhanger Anchor if original chapter isn't mounted in chat
+    // 6. Fallback Style & Cliffhanger Anchor when no original chapter floor is mounted in chat
     if (hasNovel && cutoff > 0) {
-        const hasOriginalFloorInChat = Array.isArray(chat) && chat.some(m => !m?.is_user && m?.mes?.length > 200);
+        const hasOriginalFloorInChat = Array.isArray(chat)
+            && chat.some(m => m?.extra?.novelContinuationOrigin === 'original');
         if (!hasOriginalFloorInChat) {
             const lastOriginal = novelData.chapters.find(c => c.index === cutoff);
             if (lastOriginal) {
@@ -201,8 +250,8 @@ export function buildSingleCallContinuationContext({ chat, novelData, ledger, ca
         }
     }
 
-    // 7. Single-Call Zero-Extra-Cost <novel_state> Trailer Instruction
-    if (settings.enableAutoStateBlock) {
+    // 7. Single-Call Zero-Extra-Cost <novel_state> Trailer Instruction (skip on mid-message continue)
+    if (settings.enableAutoStateBlock && !isContinue) {
         sections.push(
             [
                 '【单次调用自动归档指令（重要）】',

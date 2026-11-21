@@ -14,9 +14,6 @@ const KEY_NOVEL_DATA = 'novel_data_v1';
 const KEY_LEDGER = 'timeline_ledger_v1';
 const KEY_CANON_DB = 'canon_db_v1';
 
-/**
- * Default empty timeline ledger structure (Pagekin-style per-chapter state & foreshadowing ledger).
- */
 export function createEmptyLedger() {
     return {
         summaries: [],
@@ -32,9 +29,14 @@ export function createEmptyCanonDb() {
     };
 }
 
+function getStableChatKey() {
+    const context = getContext();
+    const rawId = String(context?.getCurrentChatId?.() || context?.chatId || '').trim();
+    return rawId || null;
+}
+
 /**
  * Resolves the active chat's TauriTavern store adapter.
- * Falls back to global extension.store scoped by chatId when chat handle is unavailable.
  */
 function getActiveChatStore() {
     const tt = globalThis.__TAURITAVERN__?.api;
@@ -45,7 +47,12 @@ function getActiveChatStore() {
                 async get(key) {
                     try {
                         return await handle.store.getJson({ namespace: EXTENSION_NAMESPACE, key });
-                    } catch {
+                    } catch (err) {
+                        const msg = String(err?.message || err || '').toLowerCase();
+                        if (msg.includes('not found') || msg.includes('missing') || msg.includes('no such')) {
+                            return null;
+                        }
+                        console.warn(`[小说续写阅读器] 读取聊天存储键 ${key} 失败:`, err);
                         return null;
                     }
                 },
@@ -66,10 +73,9 @@ function getActiveChatStore() {
     }
 
     const extStore = tt?.extension?.store;
-    const chatId = String(getContext()?.getCurrentChatId?.() || getContext()?.chatId || 'default_chat');
-    const scopedKey = (key) => `${chatId}__${key}`;
-
-    if (extStore) {
+    const chatId = getStableChatKey();
+    if (extStore && chatId) {
+        const scopedKey = (key) => `${chatId}__${key}`;
         return {
             async get(key) {
                 const res = await extStore.tryGetJson({
@@ -102,7 +108,6 @@ function getActiveChatStore() {
 
 /**
  * Loads the imported original novel for the current chat.
- * @returns {Promise<{ title: string, totalChapters: number, cutoffChapterIndex: number, chapters: Array<{ index: number, title: string, content: string, wordCount: number }> } | null>}
  */
 export async function loadNovelData() {
     const store = getActiveChatStore();
@@ -119,12 +124,9 @@ export async function loadNovelData() {
     };
 }
 
-/**
- * Persists the imported original novel for the current chat.
- */
 export async function saveNovelData(novelData) {
     const store = getActiveChatStore();
-    if (!store) throw new Error('TauriTavern 扩展存储尚未就绪，请先打开一个角色聊天');
+    if (!store) throw new Error('请先打开一个角色聊天后再导入小说数据');
     await store.set(KEY_NOVEL_DATA, novelData);
 }
 
@@ -133,9 +135,6 @@ export async function clearNovelData() {
     if (store) await store.remove(KEY_NOVEL_DATA);
 }
 
-/**
- * Loads the timeline ledger (summaries, per-chapter character/world states, foreshadowing hooks).
- */
 export async function loadLedger() {
     const store = getActiveChatStore();
     if (!store) return createEmptyLedger();
@@ -154,9 +153,6 @@ export async function saveLedger(ledger) {
     await store.set(KEY_LEDGER, ledger);
 }
 
-/**
- * Loads the supplementary fanfic/canon database for the current chat.
- */
 export async function loadCanonDb() {
     const store = getActiveChatStore();
     if (!store) return createEmptyCanonDb();
@@ -170,38 +166,70 @@ export async function loadCanonDb() {
 
 export async function saveCanonDb(canonDb) {
     const store = getActiveChatStore();
-    if (!store) throw new Error('TauriTavern 扩展存储尚未就绪');
+    if (!store) throw new Error('请先打开一个角色聊天后再挂载补充设定库');
     await store.set(KEY_CANON_DB, canonDb);
 }
 
 /**
- * Applies `<novel_state>` updates extracted from a single-call AI chapter generation
- * into the timeline ledger, tagging all entries with `effectiveChapter` for timeline isolation.
+ * Rolls back all ledger records (summaries, character states, hooks) generated after `maxChapterIndex`.
+ * Used when truncating/rewriting from an earlier chapter or deleting floors.
  *
- * @param {{ summary: string, worldUpdates: Array<{ category: string, name: string, state: string }>, hooks: Array<{ action: 'add' | 'resolve', content: string }> }} extracted
- * @param {number} chapterIndex
- * @param {string} chapterTitle
+ * @param {number} maxChapterIndex
  */
-export async function applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle) {
+export async function pruneLedgerAfterChapter(maxChapterIndex) {
+    const ledger = await loadLedger();
+    ledger.summaries = ledger.summaries.filter(s => Number(s.chapterIndex || 0) <= maxChapterIndex);
+    ledger.worldStates = ledger.worldStates.filter(w => Number(w.effectiveChapter || 0) <= maxChapterIndex);
+    ledger.hooks = ledger.hooks.filter(h => Number(h.plantedChapter || 0) <= maxChapterIndex);
+    for (const hook of ledger.hooks) {
+        if (hook.status === 'resolved' && Number(hook.resolvedChapter || 0) > maxChapterIndex) {
+            hook.status = 'open';
+            delete hook.resolvedChapter;
+        }
+    }
+    await saveLedger(ledger);
+    return ledger;
+}
+
+/**
+ * Applies `<novel_state>` updates extracted from a single-call AI chapter generation
+ * into the timeline ledger. Automatically replaces any prior records from the same
+ * `chapterIndex` or `floorIndex` so Regenerate / Swipe never leaves stale branch state.
+ */
+export async function applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle, floorIndex = null) {
     const ledger = await loadLedger();
     const now = Date.now();
 
-    if (extracted.summary) {
-        const existingIdx = ledger.summaries.findIndex(s => s.chapterIndex === chapterIndex);
-        const record = {
-            chapterIndex,
-            title: chapterTitle || `第 ${chapterIndex} 章`,
-            summary: extracted.summary,
-            updatedAt: now,
-        };
-        if (existingIdx !== -1) {
-            ledger.summaries[existingIdx] = record;
-        } else {
-            ledger.summaries.push(record);
-            ledger.summaries.sort((a, b) => a.chapterIndex - b.chapterIndex);
+    // 1. Roll back previous records belonging to this same chapterIndex or floorIndex
+    ledger.summaries = ledger.summaries.filter(
+        s => s.chapterIndex !== chapterIndex && (floorIndex === null || s.floorIndex !== floorIndex),
+    );
+    ledger.worldStates = ledger.worldStates.filter(
+        w => w.effectiveChapter !== chapterIndex && (floorIndex === null || w.floorIndex !== floorIndex),
+    );
+    ledger.hooks = ledger.hooks.filter(
+        h => !(h.autoExtracted && (h.plantedChapter === chapterIndex || (floorIndex !== null && h.floorIndex === floorIndex))),
+    );
+    for (const h of ledger.hooks) {
+        if (h.status === 'resolved' && h.resolvedChapter === chapterIndex) {
+            h.status = 'open';
+            delete h.resolvedChapter;
         }
     }
 
+    // 2. Insert new summary
+    if (extracted.summary) {
+        ledger.summaries.push({
+            chapterIndex,
+            floorIndex,
+            title: chapterTitle || `第 ${chapterIndex} 章`,
+            summary: extracted.summary,
+            updatedAt: now,
+        });
+        ledger.summaries.sort((a, b) => a.chapterIndex - b.chapterIndex);
+    }
+
+    // 3. Insert new world states for this chapter
     for (const item of extracted.worldUpdates || []) {
         if (!item.name || !item.state) continue;
         ledger.worldStates.push({
@@ -210,10 +238,12 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
             name: item.name,
             state: item.state,
             effectiveChapter: chapterIndex,
+            floorIndex,
             updatedAt: now,
         });
     }
 
+    // 4. Apply hook additions and resolutions
     for (const hook of extracted.hooks || []) {
         if (!hook.content) continue;
         if (hook.action === 'resolve') {
@@ -231,6 +261,8 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
                     id: `hook_${now}_${Math.random().toString(36).slice(2, 7)}`,
                     content: hook.content,
                     plantedChapter: chapterIndex,
+                    floorIndex,
+                    autoExtracted: true,
                     status: 'open',
                 });
             }
@@ -243,11 +275,7 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
 
 /**
  * Synchronizes extracted character/world state updates directly into SillyTavern's native World Info
- * lorebook bound to the current chat (`chat_metadata.world_info`), creating one if needed.
- *
- * @param {string} novelTitle
- * @param {Array<{ category: string, name: string, state: string }>} worldUpdates
- * @param {number} chapterIndex
+ * lorebook bound to the current chat (`chat_metadata.world_info`), replacing same-chapter lines on regenerate.
  */
 export async function syncWorldUpdatesToTavernLorebook(novelTitle, worldUpdates, chapterIndex) {
     if (!Array.isArray(worldUpdates) || worldUpdates.length === 0) return null;
@@ -258,8 +286,11 @@ export async function syncWorldUpdatesToTavernLorebook(novelTitle, worldUpdates,
     if (!bookName) {
         const sanitizedTitle = String(novelTitle || '小说续写')
             .replace(/[\\/:*?"<>|\s]+/g, '_')
-            .slice(0, 32);
-        bookName = `续写设定_${sanitizedTitle}`;
+            .slice(0, 24);
+        const chatSuffix = String(getStableChatKey() || 'chat')
+            .replace(/[^a-zA-Z0-9\u4e00-\u9fa5]+/g, '')
+            .slice(-8) || 'default';
+        bookName = `续写_${sanitizedTitle}_${chatSuffix}`;
         if (!Array.isArray(world_names) || !world_names.includes(bookName)) {
             const created = await createNewWorldInfo(bookName, { interactive: false });
             if (!created) return null;
@@ -270,6 +301,8 @@ export async function syncWorldUpdatesToTavernLorebook(novelTitle, worldUpdates,
 
     const data = await loadWorldInfo(bookName);
     if (!data || typeof data.entries !== 'object') return null;
+
+    const chapterPrefix = `【第 ${chapterIndex} 章状态】`;
 
     for (const update of worldUpdates) {
         const entryTitle = `[${update.category}] ${update.name}`;
@@ -282,15 +315,14 @@ export async function syncWorldUpdatesToTavernLorebook(novelTitle, worldUpdates,
             targetEntry.comment = entryTitle;
             targetEntry.key = [update.name];
         }
-        const stamp = `【第 ${chapterIndex} 章状态】${update.state}`;
-        if (!targetEntry.content) {
-            targetEntry.content = `${entryTitle}\n${stamp}`;
-        } else if (!targetEntry.content.includes(stamp)) {
-            const lines = targetEntry.content.split('\n').filter(Boolean);
-            const kept = lines.slice(-6);
-            kept.push(stamp);
-            targetEntry.content = kept.join('\n');
-        }
+        const stamp = `${chapterPrefix}${update.state}`;
+        const existingLines = String(targetEntry.content || '')
+            .split('\n')
+            .map(l => l.trim())
+            .filter(l => l && l !== entryTitle && !l.startsWith(chapterPrefix));
+        const kept = existingLines.slice(-5);
+        kept.push(stamp);
+        targetEntry.content = [entryTitle, ...kept].join('\n');
     }
 
     await saveWorldInfo(bookName, data, true);

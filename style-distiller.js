@@ -286,21 +286,90 @@ export function selectDistillationSamples(chapters, cutoffChapterIndex) {
 }
 
 /**
- * Extracts text inside `<tag>...</tag>` after stripping thinking/CoT blocks.
- * Falls back to the full stripped text when tags are absent.
+ * Strips thinking/CoT blocks, markdown code fences, and preset shell tags
+ * (`<soliumbra_reply>`, `<game>`, `<reply>`) so blind rewrites and extracted sections stay pure prose.
+ *
+ * @param {string} rawText
+ * @returns {string}
+ */
+export function cleanDistillProse(rawText) {
+    return stripNonStoryBlocks(rawText)
+        .replace(/^```(?:xml|html|markdown|md|txt)?\s*\n?/i, '')
+        .replace(/\n?```\s*$/i, '')
+        .replace(/<\/?(?:soliumbra_reply|game|reply|output)\b[^>]*>/gi, '')
+        .trim();
+}
+
+/**
+ * Extracts text inside `<tag>...</tag>` after stripping thinking/CoT blocks and preset shells.
+ * Falls back to the full cleaned text when tags are absent.
  *
  * @param {string} rawText
  * @param {string} tagName
  * @returns {string}
  */
 export function extractTaggedSection(rawText, tagName) {
-    const cleaned = stripNonStoryBlocks(rawText);
+    const cleaned = cleanDistillProse(rawText);
     const regex = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, 'i');
     const match = cleaned.match(regex);
     if (match && match[1].trim()) {
         return match[1].trim();
     }
     return cleaned.trim();
+}
+
+/**
+ * Computes an objective 0-API statistical drift comparison between Ground-Truth Holdout prose
+ * and AI Blind Rewrite prose so both Judge and next-round Ghostwriter receive exact physical targets.
+ *
+ * @param {string} truthText
+ * @param {string} rewriteText
+ */
+export function computeStyleDriftReport(truthText, rewriteText) {
+    const truthFp = computeLocalStyleFingerprint([{ index: 1, title: '', content: String(truthText || '') }], 1);
+    const rewriteFp = computeLocalStyleFingerprint([{ index: 1, title: '', content: String(rewriteText || '') }], 1);
+
+    const warnings = [];
+    if (truthFp.avgParagraphChars > 0) {
+        const ratio = (rewriteFp.avgParagraphChars - truthFp.avgParagraphChars) / truthFp.avgParagraphChars;
+        if (ratio >= 0.35) {
+            warnings.push(`仿写平均段长偏长（${rewriteFp.avgParagraphChars}字 vs 真迹${truthFp.avgParagraphChars}字），下一轮必须切短自然段！`);
+        } else if (ratio <= -0.35) {
+            warnings.push(`仿写平均段长过碎（${rewriteFp.avgParagraphChars}字 vs 真迹${truthFp.avgParagraphChars}字），适当合并连贯动作。`);
+        }
+    }
+    const shortParaDiff = (rewriteFp.shortParagraphRatio ?? 0) - (truthFp.shortParagraphRatio ?? 0);
+    if (shortParaDiff <= -18) {
+        warnings.push(`≤60字短段占比偏低（${rewriteFp.shortParagraphRatio}% vs 真迹${truthFp.shortParagraphRatio}%），严禁写冗长段落。`);
+    }
+    const dialDiff = rewriteFp.dialogueRatio - truthFp.dialogueRatio;
+    if (Math.abs(dialDiff) >= 15) {
+        warnings.push(`对话占比偏离真迹（${rewriteFp.dialogueRatio}% vs 真迹${truthFp.dialogueRatio}%）。`);
+    }
+    const tEllipsis = truthFp.punctuationPer1k?.ellipsis ?? 0;
+    const rEllipsis = rewriteFp.punctuationPer1k?.ellipsis ?? 0;
+    if (tEllipsis >= 8 && Math.abs(rEllipsis - tEllipsis) / tEllipsis >= 0.5) {
+        warnings.push(`省略号频次偏离（${rEllipsis}/千字 vs 真迹${tEllipsis}/千字）。`);
+    }
+
+    const lines = [
+        `• 平均段长：真迹 ${truthFp.avgParagraphChars} 字（≤60字短段 ${truthFp.shortParagraphRatio}%） vs 仿写 ${rewriteFp.avgParagraphChars} 字（≤60字短段 ${rewriteFp.shortParagraphRatio}%）`,
+        `• 句长节奏：真迹均句 ${truthFp.avgSentenceChars} 字（短句 ${truthFp.shortSentenceRatio}%） vs 仿写均句 ${rewriteFp.avgSentenceChars} 字（短句 ${rewriteFp.shortSentenceRatio}%）`,
+        `• 对话密度：真迹 ${truthFp.dialogueRatio}%（均长 ${truthFp.avgDialogueChars} 字） vs 仿写 ${rewriteFp.dialogueRatio}%（均长 ${rewriteFp.avgDialogueChars} 字）`,
+        `• 标点频次：省略号 ${tEllipsis} vs ${rEllipsis}/千字 | 感叹号 ${truthFp.punctuationPer1k?.exclamation ?? 0} vs ${rewriteFp.punctuationPer1k?.exclamation ?? 0}/千字`,
+    ];
+    if (warnings.length > 0) {
+        lines.push(`• 🎯 客观硬偏差提醒：${warnings.join('；')}`);
+    } else {
+        lines.push('• ✅ 各项本地物理统计指标已高度贴合原著真迹！');
+    }
+
+    return {
+        truthFp,
+        rewriteFp,
+        warnings,
+        summary: lines.join('\n'),
+    };
 }
 
 const PRESET_SKIP_IDENTIFIERS = new Set([
@@ -632,12 +701,18 @@ export async function runStyleDistillationPipeline({
     const loopCount = isIncremental ? 1 : targetRounds;
     let activeHoldoutCursor = startRoundIdx % samples.holdouts.length;
     let retestedHoldoutIdx = -1;
+    let prevDriftWarnings = [];
+    let bestRecord = {
+        score: roundHistory.reduce((mx, r) => (r.score !== null && r.score > mx ? r.score : mx), -1),
+        styleCard: currentStyleCard,
+    };
 
     for (let offset = 0; offset < loopCount; offset += 1) {
         const roundNum = startRoundIdx + offset + 1;
         const holdoutIdx = activeHoldoutCursor % samples.holdouts.length;
         const holdout = samples.holdouts[holdoutIdx];
         const isRetest = retestedHoldoutIdx === holdoutIdx && offset > 0;
+        const cardUsedThisRound = currentStyleCard;
 
         let dryOutline = preStrippedOutlines.get(holdoutIdx);
         if (!dryOutline) {
@@ -650,7 +725,7 @@ export async function runStyleDistillationPipeline({
                     holdout.text,
                 ].join('\n'),
             });
-            dryOutline = stripNonStoryBlocks(rawOutline);
+            dryOutline = cleanDistillProse(rawOutline);
             preStrippedOutlines.set(holdoutIdx, dryOutline);
         }
 
@@ -665,6 +740,10 @@ export async function runStyleDistillationPipeline({
         const nextHoldoutIdx = (holdoutIdx + 1) % samples.holdouts.length;
         const shouldPrefetchNextOutline = (offset + 1 < loopCount) && !preStrippedOutlines.has(nextHoldoutIdx);
 
+        const driftHintBlock = prevDriftWarnings.length > 0
+            ? `\n【上一轮物理硬指标纠偏重点（本轮必须修正）】：\n- ${prevDriftWarnings.join('\n- ')}\n`
+            : '';
+
         const roundTasks = [
             () => callModel({
                 stage: `3_round${roundNum}_blind_rewrite`,
@@ -673,14 +752,14 @@ export async function runStyleDistillationPipeline({
                     `【目标作品】：《${novelData.title}》`,
                     '【本地硬指标】：',
                     fingerprintText,
-                    '',
-                    '【当前版原著文风 DNA 圣经（请逐条严格执行，特别遵守反 AI 味黑名单）】：',
-                    currentStyleCard,
+                    driftHintBlock,
+                    '【当前版原著文风 DNA 圣经（请逐条严格执行，严禁机械照搬前文剧情原句）】：',
+                    cardUsedThisRound,
                     '',
                     '【原著灵魂原文范例】：',
                     goldenExcerpts,
                     '',
-                    '【本次盲测事件节拍大纲（请严格按上述文风圣经扩写成 750~950 字连续正文）】：',
+                    '【本次盲测事件节拍大纲（请严格按上述文风圣经扩写成 750~950 字连续正文，直接输出纯正文，不要加任何外层标签）】：',
                     dryOutline,
                 ].join('\n'),
             }),
@@ -700,17 +779,21 @@ export async function runStyleDistillationPipeline({
         }
 
         const [blindRewriteRaw, prefetchedOutlineRaw] = await runBoundedPool(roundTasks, concurrency);
-        const blindRewrite = stripNonStoryBlocks(blindRewriteRaw);
+        const blindRewrite = cleanDistillProse(blindRewriteRaw);
         if (shouldPrefetchNextOutline && prefetchedOutlineRaw) {
-            preStrippedOutlines.set(nextHoldoutIdx, stripNonStoryBlocks(prefetchedOutlineRaw));
+            preStrippedOutlines.set(nextHoldoutIdx, cleanDistillProse(prefetchedOutlineRaw));
         }
 
-        // Step B of Round: Forensic Diff, Pure-Style Fidelity Scoring (0~100), & Style Bible Patching
+        // Compute objective 0-API statistical drift between Holdout Truth and Blind Rewrite
+        const driftReport = computeStyleDriftReport(holdout.text, blindRewrite);
+        prevDriftWarnings = driftReport.warnings;
+
+        // Step B of Round: Forensic Diff, Pure-Style Fidelity Scoring (0~100), & Anti-Overfitting Style Bible Refinement
         currentStep += 1;
         onProgress({
             step: currentStep,
             totalSteps,
-            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮纯文风对比评分）：左右对照原著真迹与盲测仿写，打分并迭代强化文风圣经...`,
+            label: `步骤 ${currentStep}/${totalSteps}（第 ${roundNum} 轮客观+法医对比评分）：对照物理指标与真迹打分，提纯升级圣经...`,
         });
 
         const prevScoresText = roundHistory.length > 0
@@ -721,33 +804,41 @@ export async function runStyleDistillationPipeline({
             stage: `4_round${roundNum}_forensic_diff`,
             systemPrompt: analystSystem,
             prompt: [
-                `现在进行第 ${roundNum} 轮「原著真迹 vs AI 盲测仿写」法医级盲评对比与文风圣经迭代升级——目标作品：《${novelData.title}》。`,
+                `现在进行第 ${roundNum} 轮「原著真迹 vs AI 盲测仿写」法医级盲评对比与文风圣经提纯升级——目标作品：《${novelData.title}》。`,
                 prevScoresText,
-                '【重要评分纪律】：因为 AI 盲写时只看过干瘪事件大纲、没看过原文，**严禁因为具体台词措辞不同或大纲未提及的情节细节差异而扣分！**',
-                '请严格只针对 **5 个纯文风维度** 客观打分（满分 100）：句式段长节奏(20) + 叙事视角与心理克制度(20) + 对话口癖与标点质感(20) + 氛围推进与原著尺度贴合度(20) + 反AI味纯度(20)。',
-                '如果 AI 仿写已经很贴近原作者的笔触、节奏、标点和尺度且基本无 AI 套话，应公正给出 85~95 分；有明显 AI 味或节奏/尺度跑偏则如实扣分并揪出破绽！',
+                '',
+                '【本地 0-API 客观物理指标比对（真迹 vs 本轮仿写）】：',
+                driftReport.summary,
+                '',
+                '【重要评分纪律（严禁伪扣分）】：',
+                '1. 因为 AI 盲写时只看过干瘪事件大纲、从未看过本段原文，**严禁因为 AI 没猜中原文里特有的道具细节、具体比喻意象（例如某种具体颜色烤漆/怀表比喻/特定台词字眼）而扣分！** 只要 AI 写出了同等级别、符合原作者思维方式的细节白描，该项即为高分。',
+                '2. 请结合上方客观物理指标表，严格只针对 **5 个可泛化的纯文风维度** 客观打分（满分 100）：句式段长节奏(20) + 叙事视角与心理克制度(20) + 对话口癖与标点质感(20) + 氛围推进与原著尺度贴合度(20) + 反AI味纯度(20)。',
+                '3. 若仿写不仅物理指标贴合、且抓住了原作者的神韵与去AI味纯度，应公正给出 90~96 分；若存在跨场景机械拼贴（Overfitting）、长段注水或 AI 八股则如实扣分。',
+                '',
+                '【核心防过拟合纪律（极其重要！）】：',
+                '- **严禁把本次盲测真迹（或任何单章）里的具体剧情原句、特定物品描写直接抄进 `<style_dna>` 圣经！**（否则下一轮会背答案或在新章节里复读原句！）',
+                '- `<style_dna>` 必须执行**去重压缩与泛化提纯**，总字数**严格控制在 1,600 ~ 2,600 字以内（绝对不可超过 3,000 字！）**，绝不允许无限滚雪球膨胀！',
                 '',
                 '严格按以下三个标签输出：',
                 '<score>',
-                '（仅输出 0~100 的整数总分，例如：88）',
+                '（仅输出 0~100 的整数总分，例如：91）',
                 '</score>',
                 '<diff_notes>',
-                '（先给出一行分项评分：句式节奏 X/20 | 视角心理 X/20 | 对话口癖 X/20 | 尺度氛围 X/20 | 去AI味纯度 X/20；再用 3~5 条具体要点列出本轮揪出的残留文风破绽及原著真迹对比）',
+                '（先给出一行分项评分：句式节奏 X/20 | 视角心理 X/20 | 对话口癖 X/20 | 尺度氛围 X/20 | 去AI味纯度 X/20；再用 3~4 条具体要点列出本轮揪出的可泛化文风差距）',
                 '</diff_notes>',
                 '<style_dna>',
-                '（升级后的深度版《原著文风 DNA 圣经》，**必须保持 1,800 ~ 2,800 字的详尽实操体量**，**严格增量强化——严禁删减或概括丢弃上一轮已经验证有效的铁律和反 AI 味黑名单条目！** 必须包含：',
-                '  一、叙事视角与心理表达铁律（附实句示例）',
-                '  二、句式、段长、排版与对话标点口癖（附实句示例）',
-                '  三、核心人物声线反差与互动动力学',
-                '  四、分场景推进节奏与内容尺度边界',
-                '  五、原作者招牌动词、感官抓手与高频语感库',
-                '  六、【经多轮盲测累积的反 AI 味纠偏黑名单】（每条采用“❌ AI常见错误写法 → ✅ 原著真实写法”的实句对照））',
+                '（精炼提纯版《原著文风骨相 DNA 圣经》，**总字数严格控制在 1,600 ~ 2,600 字**，必须分五大模块：',
+                '  一、段落骨相、句长与标点硬指标（含本地统计数值上限）',
+                '  二、叙事视角、心理限制与分场景内心独白语态（如何按场景切换克制/松弛/审视语态，严禁跨场景乱拼）',
+                '  三、对话节奏、核心人物声线反差与克制微动作法则',
+                '  四、感官/静物白描方法论与内容尺度边界（写抽象技法，严禁抄入单章具体道具或整段原句！）',
+                '  五、【精炼反 AI 味纠偏短例库】（严格保留最具代表性的 **6~10 组** 去剧情化短句对照：“❌ AI常见通病 → ✅ 原著通用笔法”，去重合并、优胜劣汰，严禁无限累加！））',
                 '</style_dna>',
                 '',
-                '【当前版文风圣经（请在此基础上做增量补丁与强化，绝不丢失旧铁律）】：',
-                currentStyleCard,
+                '【当前版文风圣经（请在此基础上做去重提纯与精准修补，删除冗余与单章过拟合原句）】：',
+                cardUsedThisRound,
                 '',
-                `【原作者真实原文（${holdout.label}）】：`,
+                `【原作者真实原文（${holdout.label}，仅供本轮对比评分，严禁抄录其中具体情节句进圣经！）】：`,
                 holdout.text,
                 '',
                 '【AI 本轮盲测仿写稿】：',
@@ -758,7 +849,16 @@ export async function runStyleDistillationPipeline({
         const roundScore = extractFidelityScore(calibrationRaw);
         const roundDiffNotes = extractTaggedSection(calibrationRaw, 'diff_notes');
         const nextStyleCard = extractTaggedSection(calibrationRaw, 'style_dna');
-        if (nextStyleCard && nextStyleCard.length >= 200) {
+
+        // Best-of-N tracking: record the card that produced this round's score
+        if (roundScore !== null && roundScore >= bestRecord.score) {
+            bestRecord = { score: roundScore, styleCard: cardUsedThisRound };
+        }
+        // If same-holdout retest regressed below best score by >= 3 points, keep best card as baseline
+        const regressedOnRetest = isRetest && roundScore !== null && bestRecord.score >= 0 && roundScore <= bestRecord.score - 3;
+        if (regressedOnRetest) {
+            currentStyleCard = bestRecord.styleCard;
+        } else if (nextStyleCard && nextStyleCard.length >= 200) {
             currentStyleCard = nextStyleCard;
         }
 
@@ -778,10 +878,11 @@ export async function runStyleDistillationPipeline({
             holdoutLabel: holdoutLabelFull,
             isRetest,
             score: roundScore,
+            driftReport: driftReport.summary,
             dryOutline,
             blindRewrite,
             holdoutTruth: holdout.text,
-            diffNotes: roundDiffNotes,
+            diffNotes: `${roundDiffNotes}${regressedOnRetest ? '\n\n[择优保护] 本轮重考分数回落，已自动保留历史最高分版本圣经。' : ''}`,
             styleCardLength: currentStyleCard.length,
         };
         processLog.push(roundLogEntry);
@@ -797,8 +898,8 @@ export async function runStyleDistillationPipeline({
             break;
         }
 
-        // Same-holdout re-test if score < 85 and this holdout hasn't been re-tested yet; otherwise advance to next unseen holdout
-        if (!isIncremental && roundScore !== null && roundScore < 85 && retestedHoldoutIdx !== holdoutIdx) {
+        // Same-holdout re-test if score < 90 and this holdout hasn't been re-tested yet; otherwise advance to next unseen holdout
+        if (!isIncremental && roundScore !== null && roundScore < 90 && retestedHoldoutIdx !== holdoutIdx) {
             retestedHoldoutIdx = holdoutIdx;
         } else {
             activeHoldoutCursor = (holdoutIdx + 1) % samples.holdouts.length;
@@ -811,7 +912,7 @@ export async function runStyleDistillationPipeline({
         .join('\n\n');
 
     return {
-        version: 3,
+        version: 4,
         title: novelData.title,
         cutoffChapterIndex: cutoff,
         distilledAt: Date.now(),
@@ -825,4 +926,47 @@ export async function runStyleDistillationPipeline({
         goldenExcerpts,
         diffFindings: summaryDiffFindings,
     };
+}
+
+/**
+ * Compresses & de-overfits a bloated Style DNA Bible (e.g. >3,500 chars with verbatim holdout quotes)
+ * into a sharp, combat-ready 1,800 ~ 2,500-char Style Bible in 1 single API call.
+ *
+ * @param {{
+ *   novelTitle: string,
+ *   styleCard: string,
+ *   fingerprintText?: string,
+ *   callModel: (args: { prompt: string, systemPrompt: string, stage: string }) => Promise<string>,
+ * }} params
+ */
+export async function compressAndDeoverfitStyleCard({ novelTitle, styleCard, fingerprintText = '', callModel }) {
+    if (!styleCard || !String(styleCard).trim()) {
+        throw new Error('当前没有可提纯瘦身的文风圣经');
+    }
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+
+    const raw = await callModel({
+        stage: 'compress_deoverfit_style_card',
+        systemPrompt: '你是顶尖小说编辑与提示词架构师，擅长把冗长过拟合的文风分析文档提纯为极高密度、零剧情泄露、可直接实战执行的短小精悍写作圣经。',
+        prompt: [
+            `请将下方《${novelTitle || '当前小说'}》目前过长/存在过拟合风险的《原著文风 DNA 圣经》（现 ${String(styleCard).length} 字），一次性去重提纯瘦身为 **1,800 ~ 2,500 字** 的实战终极版！`,
+            '',
+            '【严格提纯纪律】：',
+            '1. **彻底清除单章过拟合原句与具体剧情道具**：删掉所有可直接被 AI 当作复读机照抄的长段原文描写（如特定颜色烤漆/特定衣裙玉石描写/某次具体对话原句），全部升华为**可泛化到未来任意新章节的通用笔法法则**！',
+            '2. **完整保留所有高价值核心洞察**：务必保留段落骨相数值、视角限制、分场景内心独白语态切换（如亢奋/拉扯/静物审视分流）、角色声线寡言反差、微距白描法则、以及去否定式心理废话等真正有效的骨相原则！',
+            '3. **精炼反 AI 味对照库**：将所有零散的反 AI 味案例去重合并为最具代表性的 **8~10 组短句级通用对照（❌ AI通病写法 → ✅ 原著笔法写法）**，去掉具体情节剧透。',
+            '4. 总字数严格控制在 **1,800 ~ 2,500 字** 之间，用 `<style_dna>...</style_dna>` 标签包裹输出。',
+            fingerprintText ? `\n【本地客观统计锚点（务必保留在模块一）】：\n${fingerprintText}\n` : '',
+            '【待提纯瘦身的现有文风圣经】：',
+            String(styleCard).trim(),
+        ].join('\n'),
+    });
+
+    const compressed = extractTaggedSection(raw, 'style_dna');
+    if (!compressed || compressed.length < 200) {
+        throw new Error('提纯返回的文风圣经异常过短，已保留原版未覆盖');
+    }
+    return compressed;
 }

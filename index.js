@@ -43,7 +43,11 @@ import {
     runStoryAndCharacterArchivePipeline,
     synthesizeArchiveFromBatches,
 } from './story-archiver.js';
-import { buildDistillationPresetMessages, runStyleDistillationPipeline } from './style-distiller.js';
+import {
+    buildDistillationPresetMessages,
+    compressAndDeoverfitStyleCard,
+    runStyleDistillationPipeline,
+} from './style-distiller.js';
 
 const SETTINGS_KEY = 'novel_continuation';
 const EXTENSION_PROMPT_TAG = 'novel_continuation_golden_context';
@@ -1115,6 +1119,64 @@ async function runStyleDistillTask({ incremental = false } = {}) {
     }
 }
 
+async function runCompressStyleCardTask() {
+    const ledger = await loadLedger();
+    const sp = ledger?.styleProfile;
+    if (!sp?.styleCard || !String(sp.styleCard).trim()) {
+        globalThis.toastr?.warning?.('当前还没有已生成的文风圣经可供提纯瘦身', '小说续写阅读器');
+        return;
+    }
+
+    let caller;
+    try {
+        caller = createPresetModelCaller();
+    } catch (err) {
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const beforeLen = String(sp.styleCard).length;
+    updateLiveProgress('style', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 将 ${beforeLen} 字文风圣经去过拟合提纯至 ~2,200 字实战版...`,
+    });
+
+    try {
+        const compressed = await compressAndDeoverfitStyleCard({
+            novelTitle: sp.title || '当前小说',
+            styleCard: sp.styleCard,
+            fingerprintText: sp.fingerprintText || '',
+            callModel: caller.callModel,
+        });
+        sp.styleCard = compressed;
+        sp.distilledAt = Date.now();
+        sp.processLog = Array.isArray(sp.processLog) ? sp.processLog : [];
+        sp.processLog.push({
+            id: `compress_${Date.now()}`,
+            type: 'stage',
+            title: `✨ 去过拟合提纯瘦身（${beforeLen} 字 → ${compressed.length} 字）`,
+            summary: `已剥离单章原句剧透与冗余重复，保留全部核心骨相洞察，节省 ${Math.max(0, beforeLen - compressed.length)} 字上下文。`,
+            detail: compressed,
+        });
+        await saveLedger(ledger);
+        updateLiveProgress('style', {
+            isRunning: false,
+            text: `✅ 提纯瘦身完成：${beforeLen} 字 → ${compressed.length} 字（零原句复读 · 实战可直接生效）！`,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(`文风圣经已提纯瘦身：${beforeLen} 字 → ${compressed.length} 字！`, '小说续写阅读器');
+    } catch (error) {
+        updateLiveProgress('style', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 提纯瘦身失败：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`提纯瘦身失败：${error?.message || error}`, '小说续写阅读器');
+    }
+}
+
 async function runSurgicalDeclicheLatestTask() {
     const status = getLatestClicheStatus();
     if (!status.hasContinuedFloor) {
@@ -1382,6 +1444,7 @@ export async function init() {
         onResynthArchive: runResynthArchiveTask,
         onFetchCustomModels: fetchCustomApiModels,
         onRunStyleDistill: runStyleDistillTask,
+        onCompressStyleCard: runCompressStyleCardTask,
         onRunDeclicheLatest: runSurgicalDeclicheLatestTask,
         onConnectBridge: (url) => {
             settings.remoteBridgeUrl = url;

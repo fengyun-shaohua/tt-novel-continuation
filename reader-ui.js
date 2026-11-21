@@ -734,6 +734,12 @@ function renderStyleTab(bodyEl) {
                             </span>
                         </summary>
                         <div class="tt-novel-round-body">
+                            ${item.driftReport ? `
+                                <div class="tt-novel-diff-box" style="border-left-color: #4ac4b7;">
+                                    <div class="tt-novel-mini-label">📊 本地 0-API 客观物理指标比对（真迹 vs 盲写）</div>
+                                    <div class="tt-novel-pre-wrap">${escapeHtml(item.driftReport)}</div>
+                                </div>
+                            ` : ''}
                             <div class="tt-novel-diff-box">
                                 <div class="tt-novel-mini-label">⚖️ 5 维纯文风评分与本轮揪出的破绽（圣经更新至 ${item.styleCardLength || '?'} 字）</div>
                                 <div class="tt-novel-pre-wrap">${escapeHtml(item.diffNotes || '')}</div>
@@ -771,6 +777,12 @@ function renderStyleTab(bodyEl) {
         ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
         : '';
 
+    const cardLen = sp?.styleCard ? String(sp.styleCard).length : 0;
+    const isBloatedCard = cardLen > 3500;
+    const bloatedWarnHtml = isBloatedCard
+        ? `<div class="tt-novel-banner is-warn">⚠️ 当前文风圣经长达 <b>${cardLen} 字</b>（超出理想实战体量 1,800~2,600 字），容易引发跨章节过拟合复读与 Token 浪费。建议直接点下方「✨ 一键去过拟合提纯瘦身」保留全部洞察并压缩至 ~2,200 字！</div>`
+        : '';
+
     bodyEl.innerHTML = `
         <div class="tt-novel-action-bar">
             <select id="tt-novel-wb-distill-rounds" class="text_pole" style="width: 108px;">
@@ -784,7 +796,11 @@ function renderStyleTab(bodyEl) {
             <button type="button" id="tt-novel-wb-distill-refine" class="menu_button" ${task.running || !sp?.styleCard ? 'disabled' : ''}>
                 🔄 追加 1 轮盲测精炼
             </button>
+            <button type="button" id="tt-novel-wb-compress-style" class="menu_button ${isBloatedCard ? 'tt-novel-btn-primary' : ''}" ${task.running || !sp?.styleCard ? 'disabled' : ''}>
+                ✨ 一键去过拟合提纯瘦身 (1次API)
+            </button>
         </div>
+        ${bloatedWarnHtml}
         ${progressHtml}
         <section class="tt-novel-section">
             <div class="tt-novel-section-title">🔬 蒸馏全过程透明视图（每一步产出与真迹/仿写对照均可展开核验）</div>
@@ -812,6 +828,9 @@ function renderStyleTab(bodyEl) {
     });
     bodyEl.querySelector('#tt-novel-wb-distill-refine')?.addEventListener('click', () => {
         handlers.onRunStyleDistill?.({ incremental: true });
+    });
+    bodyEl.querySelector('#tt-novel-wb-compress-style')?.addEventListener('click', () => {
+        handlers.onCompressStyleCard?.();
     });
     bodyEl.querySelector('#tt-novel-wb-save-style')?.addEventListener('click', async () => {
         const cardText = String(bodyEl.querySelector('#tt-novel-wb-style-editor')?.value || '').trim();

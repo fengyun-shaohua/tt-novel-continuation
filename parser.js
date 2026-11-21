@@ -3,9 +3,12 @@
  * for the Novel Continuation extension. Zero DOM or network dependencies.
  */
 
-const CHAPTER_HEADING_REGEX = /^[\t \u3000]*(?:#{1,6}[\t \u3000]+)?(?:(?:正文|第[零一二三四五六七八九十百千万两〇○\d]+[卷集部篇])[\t \u3000]*)?(?:第[\t \u3000]*[零一二三四五六七八九十百千万两〇○壹贰叁肆伍陆柒捌玖拾佰仟\d]+[\t \u3000]*[章节回幕折]|(?:Chapter|CHAPTER)\s+\d+|【第[零一二三四五六七八九十百千万两〇○\d]+[章节回]】)[^\n\r]{0,80}$/gm;
+const VOLUME_LINE_REGEX = /^[\t \u3000]*(?:#{1,6}[\t \u3000]+)?第[\t \u3000]*[零一二三四五六七八九十百千万两〇○壹贰叁肆伍陆柒捌玖拾佰仟\d]+[\t \u3000]*[篇卷部集](?:[\t \u3000：:、\-—（(].{0,50})?$/;
+const CHAPTER_LINE_REGEX = /^[\t \u3000]*(?:#{1,6}[\t \u3000]+)?(?:(?:正文|第[零一二三四五六七八九十百千万两〇○\d]+[卷集部篇])[\t \u3000]*)?(?:第[\t \u3000]*[零一二三四五六七八九十百千万两〇○壹贰叁肆伍陆柒捌玖拾佰仟\d]+[\t \u3000]*[章节回幕折]|(?:Chapter|CHAPTER)\s+\d+|【第[零一二三四五六七八九十百千万两〇○\d]+[章节回]】|(?:引子|序章|楔子|尾声|终章|番外(?:[\t \u3000：:·\-\d一二三四五六七八九十].{0,30})?))(?:[\t \u3000：:、\-—].{0,60}|[\t \u3000]*[^\n\r]{0,50})?$/;
 
 const FALLBACK_CHUNK_SIZE = 4200;
+const MEGA_CHAPTER_THRESHOLD = 8000;
+const MEGA_CHAPTER_TARGET = 4500;
 const NOVEL_STATE_BLOCK_REGEX = /<novel_state>([\s\S]*?)<\/novel_state>/gi;
 const NOISE_BLOCKS_REGEX = /<(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)\b[^>]*>[\s\S]*?<\/(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)>/gi;
 
@@ -43,15 +46,82 @@ export function stripNonStoryBlocks(text) {
 }
 
 /**
+ * Splits an oversized chapter (> MEGA_CHAPTER_THRESHOLD chars) into paragraph-aligned sub-parts
+ * so mobile rendering, scrolling, and cutoff selection stay smooth and precise.
+ *
+ * @param {string} title
+ * @param {string} content
+ * @returns {Array<{ title: string, content: string }>}
+ */
+function splitMegaChapterIfNeeded(title, content) {
+    const compactLen = content.replace(/\s+/g, '').length;
+    if (compactLen <= MEGA_CHAPTER_THRESHOLD) {
+        return [{ title, content }];
+    }
+
+    const paragraphs = content.split(/\n+/).map(p => p.trim()).filter(Boolean);
+    const chunks = [];
+    let buffer = '';
+    for (const para of paragraphs) {
+        if (buffer.length + para.length > MEGA_CHAPTER_TARGET && buffer.length >= 1200) {
+            chunks.push(buffer.trim());
+            buffer = para;
+        } else {
+            buffer = buffer ? `${buffer}\n\n${para}` : para;
+        }
+    }
+    if (buffer.trim()) {
+        if (chunks.length > 0 && buffer.trim().length < 700) {
+            chunks[chunks.length - 1] += `\n\n${buffer.trim()}`;
+        } else {
+            chunks.push(buffer.trim());
+        }
+    }
+
+    if (chunks.length <= 1) {
+        return [{ title, content }];
+    }
+    return chunks.map((chunk, idx) => ({
+        title: `${title} (${idx + 1}/${chunks.length})`,
+        content: chunk,
+    }));
+}
+
+/**
+ * Classifies a single line as a volume heading, chapter heading, or normal prose.
+ * Rejects lines ending in sentence/dialogue punctuation to avoid false positives inside prose.
+ */
+function classifyHeadingLine(rawLine) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.length > 60) return null;
+    if (/[，,。；;”"」]$/.test(trimmed)) return null;
+
+    const clean = trimmed
+        .replace(/^#{1,6}[\t \u3000]+/, '')
+        .replace(/[\t \u3000]+/g, ' ')
+        .trim();
+
+    if (CHAPTER_LINE_REGEX.test(trimmed)) {
+        return { kind: 'chapter', heading: clean };
+    }
+    if (VOLUME_LINE_REGEX.test(trimmed)) {
+        return { kind: 'volume', heading: clean };
+    }
+    return null;
+}
+
+/**
  * Splits an imported novel (.txt / .md) into structured chapters.
- * Supports Markdown headings (`# 第一章`, `## 第1章`) and falls back to sentence-aligned chunking.
+ * Supports multi-volume/part prefixes (`第一篇：侵蚀` -> `第一篇：侵蚀 · 第1章`),
+ * Markdown headings (`# 第一章`), auto sub-splitting of mega-chapters (>8000 chars),
+ * and paragraph-aligned fallback chunking.
  *
  * @param {string} rawText
  * @param {string} [fileName='未命名小说.txt']
  * @returns {{ title: string, totalChapters: number, cutoffChapterIndex: number, chapters: Array<{ index: number, title: string, content: string, wordCount: number }> }}
  */
 export function parseNovelTxt(rawText, fileName = '未命名小说.txt') {
-    const text = normalizeNovelText(rawText);
+    let text = normalizeNovelText(rawText);
     const cleanTitle = String(fileName || '未命名小说')
         .replace(/\.(txt|md|epub|json)$/i, '')
         .replace(/^《|》$/g, '')
@@ -61,33 +131,62 @@ export function parseNovelTxt(rawText, fileName = '未命名小说.txt') {
         return { title: cleanTitle, totalChapters: 0, cutoffChapterIndex: 0, chapters: [] };
     }
 
+    // Strip common TXT site boilerplate banners at file start/end
+    text = text
+        .replace(/^-{5,}\n[^\n]{0,120}(?:本文件来自|发布页|下载自)[\s\S]{0,200}?-{5,}\s*/i, '')
+        .replace(/\s*-{5,}\n[^\n]{0,120}(?:本文件来自|发布页|下载自)[\s\S]{0,200}?-{5,}$/i, '')
+        .trim();
+
+    const lines = text.split('\n');
     const matches = [];
-    CHAPTER_HEADING_REGEX.lastIndex = 0;
-    let match;
-    while ((match = CHAPTER_HEADING_REGEX.exec(text)) !== null) {
-        const heading = match[0]
-            .trim()
-            .replace(/^#{1,6}[\t \u3000]+/, '')
-            .replace(/[\t \u3000]+/g, ' ');
-        matches.push({ heading, start: match.index, bodyStart: match.index + match[0].length });
+    for (let lineIdx = 0; lineIdx < lines.length; lineIdx += 1) {
+        const cls = classifyHeadingLine(lines[lineIdx]);
+        if (cls) {
+            matches.push({ ...cls, lineIdx });
+        }
     }
 
     const rawChapters = [];
 
     if (matches.length >= 2) {
-        const prologue = text.slice(0, matches[0].start).trim();
-        if (prologue.length >= 200) {
+        const prologue = lines.slice(0, matches[0].lineIdx).join('\n').trim();
+        if (prologue.replace(/\s+/g, '').length >= 200) {
             rawChapters.push({ title: '序章 / 前言', content: prologue });
         }
+
+        let currentVolume = '';
         for (let i = 0; i < matches.length; i += 1) {
             const current = matches[i];
-            const nextStart = i + 1 < matches.length ? matches[i + 1].start : text.length;
-            const body = text.slice(current.bodyStart, nextStart).trim();
-            if (!body && i + 1 < matches.length) {
+            const nextLineIdx = i + 1 < matches.length ? matches[i + 1].lineIdx : lines.length;
+            const body = lines.slice(current.lineIdx + 1, nextLineIdx).join('\n').trim();
+            const bodyLen = body.replace(/\s+/g, '').length;
+
+            if (current.kind === 'volume') {
+                if (bodyLen < 150 && i + 1 < matches.length) {
+                    // Pure volume/part divider (e.g. `第一篇：侵蚀` right before `第1章`)
+                    currentVolume = current.heading;
+                    continue;
+                }
+                // Standalone volume/part containing its own story text (e.g. `第零篇 贪鼬（序）：渗透`)
+                currentVolume = '';
+                rawChapters.push({
+                    title: current.heading,
+                    content: body,
+                });
                 continue;
             }
+
+            if (bodyLen === 0 && i + 1 < matches.length) {
+                continue;
+            }
+
+            const isStandaloneSpecial = /^(?:引子|序章|楔子|尾声|终章|番外)/.test(current.heading);
+            const fullTitle = (currentVolume && !isStandaloneSpecial && !current.heading.includes(currentVolume))
+                ? `${currentVolume} · ${current.heading}`
+                : current.heading;
+
             rawChapters.push({
-                title: current.heading,
+                title: fullTitle,
                 content: body,
             });
         }
@@ -117,7 +216,13 @@ export function parseNovelTxt(rawText, fileName = '未命名小说.txt') {
         }
     }
 
-    const chapters = rawChapters.map((item, idx) => {
+    const normalizedChapters = [];
+    for (const item of rawChapters) {
+        const parts = splitMegaChapterIfNeeded(item.title, item.content.trim());
+        normalizedChapters.push(...parts);
+    }
+
+    const chapters = normalizedChapters.map((item, idx) => {
         const index = idx + 1;
         const content = item.content.trim();
         return {

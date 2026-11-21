@@ -9,7 +9,6 @@ import {
     mountReaderUi,
     refreshReaderWidgets,
     scrollToChatFloor,
-    syncPullUnlockBanners,
     toggleTocDrawer,
 } from './reader-ui.js';
 import { connectRemoteBridge, disconnectRemoteBridge } from './remote-bridge.js';
@@ -214,8 +213,6 @@ async function onMessageSwiped(messageId) {
     }
 }
 
-let isUnlockingChapters = false;
-
 function createOriginalChapterFloor(ch, charName) {
     const formatted = `### ${ch.title}\n\n${ch.content}`;
     return {
@@ -235,19 +232,19 @@ function createOriginalChapterFloor(ch, charName) {
 }
 
 /**
- * Mounts the most recent 3 chapters ending at `focusChapterIndex` into `#chat`
- * while keeping all earlier pre-cutoff chapters (`1 .. startIdx - 1`) ready to unlock on scroll-up.
+ * Mounts all original chapters `1 .. upToChapterIndex` directly into `context.chat`
+ * and relies on TauriTavern's native `BoundedChatSurface` virtualization to hide/manage high floor counts.
  */
-async function mountOriginalAnchorChaptersToChat(novelData, focusChapterIndex) {
+async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { focusChapterIndex = null } = {}) {
     const context = getContext();
     if (!context || !Array.isArray(context.chat) || !novelData?.chapters?.length) return;
 
     const settings = getSettings();
-    const anchorCount = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 3));
-    const target = Math.min(novelData.chapters.length, Math.max(1, focusChapterIndex));
-    const startIdx = Math.max(1, target - anchorCount + 1);
-    const endIdx = target;
-    const selectedChapters = novelData.chapters.filter(c => c.index >= startIdx && c.index <= endIdx);
+    const maxChapter = Math.min(novelData.chapters.length, Math.max(1, upToChapterIndex));
+    const focusTarget = focusChapterIndex
+        ? Math.min(maxChapter, Math.max(1, focusChapterIndex))
+        : maxChapter;
+    const selectedChapters = novelData.chapters.filter(c => c.index >= 1 && c.index <= maxChapter);
 
     const continuedTail = context.chat.filter(
         (m, idx) => m?.extra?.novelContinuationOrigin === 'continued' || (idx > 0 && m?.is_user),
@@ -267,163 +264,17 @@ async function mountOriginalAnchorChaptersToChat(novelData, focusChapterIndex) {
     }
     await context.printMessages?.();
     applyReaderBodyClasses(settings);
-    syncPullUnlockBanners(novelData);
 
-    const targetFloorIdx = originalFloors.findIndex(f => f.extra?.novelChapterIndex === target);
+    const targetFloorIdx = originalFloors.findIndex(f => f.extra?.novelChapterIndex === focusTarget);
     if (targetFloorIdx >= 0) {
         await scrollToChatFloor(targetFloorIdx);
     } else if (originalFloors.length > 0) {
-        await scrollToChatFloor(0);
+        await scrollToChatFloor(originalFloors.length - 1);
     }
 }
 
 /**
- * Unlocks and prepends `batchSize` (default 3) earlier pre-cutoff chapters into `#chat`
- * when the user scrolls up to the top or taps the top unlock bar, keeping reading scroll position anchored.
- */
-async function unlockEarlierOriginalChapters(batchSize = 3, { scrollToChapter = null } = {}) {
-    if (isUnlockingChapters) return;
-    isUnlockingChapters = true;
-    try {
-        const context = getContext();
-        const novelData = await loadNovelData();
-        if (!context || !Array.isArray(context.chat) || !novelData?.chapters?.length) return;
-
-        const origIndices = context.chat
-            .filter(m => m?.extra?.novelContinuationOrigin === 'original')
-            .map(m => Number(m.extra?.novelChapterIndex))
-            .filter(n => n > 0);
-        if (origIndices.length === 0) return;
-
-        const minMounted = Math.min(...origIndices);
-        if (minMounted <= 1) return;
-
-        const newStart = Math.max(1, minMounted - batchSize);
-        const newEnd = minMounted - 1;
-        const chaptersToPrepend = novelData.chapters.filter(c => c.index >= newStart && c.index <= newEnd);
-        if (chaptersToPrepend.length === 0) return;
-
-        const charName = context.name2 || novelData.title || '原著';
-        const prependFloors = chaptersToPrepend.map(ch => createOriginalChapterFloor(ch, charName));
-
-        // Find where the first original chapter currently sits in context.chat
-        const firstOrigPos = context.chat.findIndex(m => m?.extra?.novelContinuationOrigin === 'original');
-        const insertPos = firstOrigPos >= 0 ? firstOrigPos : 0;
-        context.chat.splice(insertPos, 0, ...prependFloors);
-
-        novelData.viewingChapterIndex = scrollToChapter || newStart;
-        await saveNovelData(novelData);
-
-        try {
-            await context.saveChat?.();
-        } catch {
-            // Ignore save errors on temporary welcome screen
-        }
-        await context.printMessages?.();
-        applyReaderBodyClasses(getSettings());
-        syncPullUnlockBanners(novelData);
-
-        if (scrollToChapter) {
-            const targetFloorIdx = context.chat.findIndex(
-                m => m?.extra?.novelContinuationOrigin === 'original' && Number(m?.extra?.novelChapterIndex) === scrollToChapter,
-            );
-            if (targetFloorIdx >= 0) {
-                await scrollToChatFloor(targetFloorIdx);
-            }
-        } else {
-            // Anchor scroll position at the previously earliest chapter (`minMounted`) so the user can keep scrolling up smoothly
-            const anchorFloorIdx = context.chat.findIndex(
-                m => m?.extra?.novelContinuationOrigin === 'original' && Number(m?.extra?.novelChapterIndex) === minMounted,
-            );
-            if (anchorFloorIdx >= 0) {
-                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-                const chatEl = document.getElementById('chat');
-                const anchorMes = chatEl?.querySelector(`.mes[mesid="${anchorFloorIdx}"]`);
-                if (chatEl && anchorMes) {
-                    const alignAnchor = () => {
-                        const chatRect = chatEl.getBoundingClientRect();
-                        const mesRect = anchorMes.getBoundingClientRect();
-                        // Position the old top chapter ~180px below the top edge so the newly unlocked chapter's tail is visible right above it
-                        chatEl.scrollTop = Math.max(24, chatEl.scrollTop + (mesRect.top - chatRect.top) - 180);
-                    };
-                    alignAnchor();
-                    setTimeout(alignAnchor, 240);
-                }
-            }
-            globalThis.toastr?.info?.(
-                `已向上解锁第 ${newStart}${newStart !== newEnd ? `~${newEnd}` : ''} 章（继续上滑可解锁更早章节）`,
-                '小说续写阅读器',
-                { timeOut: 1800 },
-            );
-        }
-
-        await refreshReaderWidgets();
-    } finally {
-        isUnlockingChapters = false;
-    }
-}
-
-/**
- * Unlocks and appends `batchSize` (default 3) later pre-cutoff chapters into `#chat`.
- */
-async function unlockLaterOriginalChapters(batchSize = 3, { scrollToChapter = null } = {}) {
-    if (isUnlockingChapters) return;
-    isUnlockingChapters = true;
-    try {
-        const context = getContext();
-        const novelData = await loadNovelData();
-        if (!context || !Array.isArray(context.chat) || !novelData?.chapters?.length) return;
-
-        const cutoff = Number(novelData.cutoffChapterIndex || novelData.totalChapters);
-        let maxMounted = -Infinity;
-        let lastOrigPos = -1;
-        context.chat.forEach((m, idx) => {
-            if (m?.extra?.novelContinuationOrigin === 'original') {
-                const chIdx = Number(m.extra?.novelChapterIndex);
-                if (chIdx > maxMounted) maxMounted = chIdx;
-                lastOrigPos = idx;
-            }
-        });
-
-        if (!Number.isFinite(maxMounted) || maxMounted >= cutoff) return;
-
-        const nextStart = maxMounted + 1;
-        const nextEnd = Math.min(cutoff, maxMounted + batchSize);
-        const chaptersToAppend = novelData.chapters.filter(c => c.index >= nextStart && c.index <= nextEnd);
-        if (chaptersToAppend.length === 0) return;
-
-        const charName = context.name2 || novelData.title || '原著';
-        const appendFloors = chaptersToAppend.map(ch => createOriginalChapterFloor(ch, charName));
-
-        context.chat.splice(lastOrigPos + 1, 0, ...appendFloors);
-        novelData.viewingChapterIndex = scrollToChapter || nextStart;
-        await saveNovelData(novelData);
-
-        try {
-            await context.saveChat?.();
-        } catch {
-            // Ignore save errors on temporary welcome screen
-        }
-        await context.printMessages?.();
-        applyReaderBodyClasses(getSettings());
-        syncPullUnlockBanners(novelData);
-
-        const targetCh = scrollToChapter || nextStart;
-        const targetFloorIdx = context.chat.findIndex(
-            m => m?.extra?.novelContinuationOrigin === 'original' && Number(m?.extra?.novelChapterIndex) === targetCh,
-        );
-        if (targetFloorIdx >= 0) {
-            await scrollToChatFloor(targetFloorIdx);
-        }
-
-        await refreshReaderWidgets();
-    } finally {
-        isUnlockingChapters = false;
-    }
-}
-
-/**
- * Loads and displays any user-selected chapter `targetChapterIndex` directly in the main `#chat` reader.
+ * Jumps directly to any user-selected chapter `targetChapterIndex` in the main `#chat` reader.
  */
 async function handleViewOriginalChapter(targetChapterIndex) {
     const novelData = await loadNovelData();
@@ -444,24 +295,9 @@ async function handleViewOriginalChapter(targetChapterIndex) {
         return;
     }
 
-    const origIndices = chat
-        .filter(m => m?.extra?.novelContinuationOrigin === 'original')
-        .map(m => Number(m.extra?.novelChapterIndex))
-        .filter(n => n > 0);
-    const minMounted = origIndices.length ? Math.min(...origIndices) : Infinity;
-    const maxMounted = origIndices.length ? Math.max(...origIndices) : -Infinity;
     const cutoff = Number(novelData.cutoffChapterIndex || novelData.totalChapters);
-
-    if (targetChapterIndex === minMounted - 1) {
-        await unlockEarlierOriginalChapters(3, { scrollToChapter: targetChapterIndex });
-        return;
-    }
-    if (targetChapterIndex === maxMounted + 1 && targetChapterIndex <= cutoff) {
-        await unlockLaterOriginalChapters(3, { scrollToChapter: targetChapterIndex });
-        return;
-    }
-
-    await mountOriginalAnchorChaptersToChat(novelData, targetChapterIndex);
+    const upTo = Math.max(cutoff, targetChapterIndex);
+    await mountOriginalAnchorChaptersToChat(novelData, upTo, { focusChapterIndex: targetChapterIndex });
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
 }
@@ -486,8 +322,9 @@ async function restoreNovelFloorsIfNeeded() {
     const novelData = await loadNovelData();
     if (!novelData?.chapters?.length) return;
 
-    const resumeChapter = novelData.viewingChapterIndex || novelData.cutoffChapterIndex || novelData.totalChapters;
-    await mountOriginalAnchorChaptersToChat(novelData, resumeChapter);
+    const cutoff = novelData.cutoffChapterIndex || novelData.totalChapters;
+    const focusChapter = novelData.viewingChapterIndex || cutoff;
+    await mountOriginalAnchorChaptersToChat(novelData, cutoff, { focusChapterIndex: focusChapter });
 }
 
 async function handleCutoffFromChapter(targetChapterIndex) {
@@ -501,7 +338,7 @@ async function handleCutoffFromChapter(targetChapterIndex) {
 
     if (hasAiFloors) {
         const clearAi = window.confirm(
-            `即将从【第 ${targetChapterIndex} 章】开始夺舍重续（第 1~${targetChapterIndex} 章全部保留在原著流中，默认展示最近 3 章、上滑解锁前文；第 ${targetChapterIndex + 1} 章及之后的原著将被自动屏蔽防剧透）。\n\n是否同时清空当前聊天里已生成的旧续写楼层，从第 ${targetChapterIndex} 章干净重续？`,
+            `即将从【第 ${targetChapterIndex} 章】开始夺舍重续（第 1~${targetChapterIndex} 章全部导入聊天，第 ${targetChapterIndex + 1} 章及之后的原著将被自动屏蔽防剧透）。\n\n是否同时清空当前聊天里已生成的旧续写楼层，从第 ${targetChapterIndex} 章干净重续？`,
         );
         if (clearAi && Array.isArray(context?.chat)) {
             const kept = context.chat.filter(m => m?.extra?.novelContinuationOrigin === 'original');
@@ -515,12 +352,11 @@ async function handleCutoffFromChapter(targetChapterIndex) {
     await saveNovelData(novelData);
     await pruneLedgerAfterChapter(targetChapterIndex);
     clearReadingProgress();
-    await mountOriginalAnchorChaptersToChat(novelData, targetChapterIndex);
+    await mountOriginalAnchorChaptersToChat(novelData, targetChapterIndex, { focusChapterIndex: targetChapterIndex });
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
-    const startShown = Math.max(1, targetChapterIndex - 2);
     globalThis.toastr?.success?.(
-        `已从第 ${targetChapterIndex} 章夺舍！第 1~${targetChapterIndex} 章均已导入，当前画面显示第 ${startShown}~${targetChapterIndex} 章，上滑即可逐批解锁前文！`,
+        `已截断至第 ${targetChapterIndex} 章（第 1~${targetChapterIndex} 章已全部导入聊天，由酒馆自动管理高楼层），现在可直接往下续写！`,
         '小说续写阅读器',
     );
 }
@@ -820,8 +656,6 @@ export async function init() {
         onToggleSetting: handleToggleSetting,
         onCutoffFromChapter: handleCutoffFromChapter,
         onViewChapter: handleViewOriginalChapter,
-        onUnlockEarlier: unlockEarlierOriginalChapters,
-        onUnlockLater: unlockLaterOriginalChapters,
     });
     await restoreNovelFloorsIfNeeded();
     await refreshReaderWidgets();

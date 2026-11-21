@@ -422,3 +422,29 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-inline-field input.text_pole {
     width: 72px;
 }
+
+.tt-novel-bridge-box {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.22);
+    border: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
+    font-size: 0.82rem;
+}
+
+.tt-novel-bridge-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.tt-novel-bridge-row input.text_pole {
+    flex: 1;
+}
+
+.tt-novel-bridge-status {
+    opacity: 0.85;
+    font-size: 0.78rem;
+}

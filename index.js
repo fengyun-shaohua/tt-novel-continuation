@@ -10,6 +10,7 @@ import {
     scrollToChatFloor,
     toggleTocDrawer,
 } from './reader-ui.js';
+import { connectRemoteBridge, disconnectRemoteBridge } from './remote-bridge.js';
 import {
     applyExtractedStateToLedger,
     clearNovelData,
@@ -38,6 +39,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     maxOriginalHits: 3,
     maxCanonHits: 4,
     maxRecentSummaries: 6,
+    remoteBridgeUrl: '',
 });
 
 function getSettings() {
@@ -350,6 +352,16 @@ function mountSettingsPanel() {
                 <button type="button" id="tt-novel-clear-canon" class="menu_button">清空补充设定库</button>
                 <button type="button" id="tt-novel-clear-all" class="menu_button">重置当前聊天小说数据</button>
             </div>
+            <hr />
+            <div class="tt-novel-bridge-box">
+                <div><b>🔌 外部 Agent 远程介入桥 (WebSocket / MCP)</b></div>
+                <div class="tt-novel-bridge-row">
+                    <input type="text" id="tt-novel-bridge-url" class="text_pole" placeholder="ws://电脑局域网IP:17890/ws" value="${escapeHtml(settings.remoteBridgeUrl || '')}" />
+                    <button type="button" id="tt-novel-bridge-connect" class="menu_button">🔗 连接</button>
+                    <button type="button" id="tt-novel-bridge-disconnect" class="menu_button">⏹ 断开</button>
+                </div>
+                <small id="tt-novel-bridge-status" class="tt-novel-bridge-status">⚪ 未连接外部 Agent</small>
+            </div>
         </div>
     `;
 
@@ -435,6 +447,25 @@ function bindSettingsEvents(wrapper) {
         await saveCanonDb(createEmptyCanonDb());
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
+    });
+
+    const updateBridgeUi = ({ state, detail }) => {
+        const statusEl = document.getElementById('tt-novel-bridge-status');
+        if (!statusEl) return;
+        const icon = state === 'connected' ? '🟢' : (state === 'connecting' ? '🟡' : (state === 'error' ? '🔴' : '⚪'));
+        statusEl.textContent = `${icon} ${detail || state}`;
+    };
+
+    wrapper.querySelector('#tt-novel-bridge-connect')?.addEventListener('click', () => {
+        const inputEl = /** @type {HTMLInputElement | null} */ (document.getElementById('tt-novel-bridge-url'));
+        const url = String(inputEl?.value || '').trim();
+        settings.remoteBridgeUrl = url;
+        saveExtensionSettings();
+        connectRemoteBridge(url, { getSettings, saveExtensionSettings }, updateBridgeUi);
+    });
+
+    wrapper.querySelector('#tt-novel-bridge-disconnect')?.addEventListener('click', () => {
+        disconnectRemoteBridge();
     });
 }
 

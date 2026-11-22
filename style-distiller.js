@@ -403,28 +403,45 @@ const PRESET_SKIP_IDENTIFIERS = new Set([
  *   userPrompt: string,
  *   customPrefix?: string,
  *   substitute?: ((text: string) => string) | null,
+ *   preserveDirectives?: boolean,
  * }} task
  * @returns {Array<{ role: string, content: string }>}
  */
-export function buildDistillationPresetMessages(presetObj, { systemPrompt, userPrompt, customPrefix = '', substitute = null }) {
+export function buildDistillationPresetMessages(
+    presetObj,
+    { systemPrompt, userPrompt, customPrefix = '', substitute = null, preserveDirectives = false },
+) {
     const parseOptInt = (val, fallback) => {
         if (val === undefined || val === null || val === '') return fallback;
         const n = Number(val);
         return Number.isFinite(n) ? Math.floor(n) : fallback;
     };
 
+    const safeLastUserSnippet = String(userPrompt || '')
+        .replace(/>>>/g, '»')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 320);
+
     const preparePresetContent = (raw) => {
-        let cleaned = String(raw ?? '')
-            .replace(/\{\{\/\/[\s\S]*?\}\}/g, '')
-            .replace(/<<<\|catgodml\|[\s\S]*?>>>/gi, '')
-            .replace(/<run_tool_replacement>/gi, '')
-            .replace(/<\|(?:sep|merge)\|>/gi, '');
+        let cleaned = String(raw ?? '');
+        if (safeLastUserSnippet && /\{\{lastUserMessage\}\}/i.test(cleaned)) {
+            cleaned = cleaned.replace(/\{\{lastUserMessage\}\}/gi, safeLastUserSnippet);
+        }
         if (typeof substitute === 'function') {
             try {
                 cleaned = String(substitute(cleaned) ?? '');
             } catch {
-                // Keep raw cleaned text if host macro substitution throws
+                // Keep raw text if host macro substitution throws
             }
+        } else {
+            cleaned = cleaned.replace(/\{\{\/\/[\s\S]*?\}\}/g, '');
+        }
+        if (!preserveDirectives) {
+            cleaned = cleaned
+                .replace(/<<<\|catgodml\|[\s\S]*?>>>/gi, '')
+                .replace(/<run_tool_replacement>/gi, '')
+                .replace(/<\|(?:sep|merge)\|>/gi, '');
         }
         return cleaned.trim();
     };

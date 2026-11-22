@@ -577,19 +577,22 @@ function getAvailableOpenAiPresetNames() {
 function resolveSelectedDistillationPreset(presetSelection) {
     const selected = String(presetSelection ?? '').trim();
     if (!selected) {
-        return { presetObj: null, label: '不使用预设（纯净直连）' };
+        return { presetObj: null, label: '不使用预设（纯净直连）', isActivePreset: false };
     }
 
     const pm = getPresetManager('openai');
-    if (selected === '__current__') {
-        const activeName = String(pm?.getSelectedPresetName?.() || oai_settings?.preset_settings_openai || '').trim();
+    const activeName = String(pm?.getSelectedPresetName?.() || oai_settings?.preset_settings_openai || '').trim();
+    if (selected === '__current__' || (activeName && selected === activeName)) {
         if (Array.isArray(oai_settings?.prompts) && oai_settings.prompts.length > 0) {
             return {
                 presetObj: oai_settings,
                 label: activeName ? `当前酒馆预设：${activeName}` : '当前酒馆预设',
+                isActivePreset: true,
             };
         }
-        return { presetObj: null, label: '不使用预设（当前非对话补全预设）' };
+        if (selected === '__current__') {
+            return { presetObj: null, label: '不使用预设（当前非对话补全预设）', isActivePreset: false };
+        }
     }
 
     let rawPreset = pm?.getCompletionPresetByName?.(selected);
@@ -603,7 +606,7 @@ function resolveSelectedDistillationPreset(presetSelection) {
     if (!rawPreset || !Array.isArray(rawPreset.prompts)) {
         throw new Error(`未找到所选预设「${selected}」，请在「工作台 → 设置」中重新选择`);
     }
-    return { presetObj: rawPreset, label: selected };
+    return { presetObj: rawPreset, label: selected, isActivePreset: false };
 }
 
 function normalizeCustomApiBaseUrl(rawUrl) {
@@ -732,6 +735,8 @@ function createPresetModelCaller() {
         ? (text) => context.substituteParams(text)
         : null;
 
+    const preserveDirectives = Boolean(resolvedPreset.isActivePreset);
+
     if (apiMode === 'custom') {
         const baseUrl = normalizeCustomApiBaseUrl(settings.bgCustomApiUrl);
         const apiKey = String(settings.bgCustomApiKey || '').trim();
@@ -748,6 +753,7 @@ function createPresetModelCaller() {
                     systemPrompt,
                     userPrompt: prompt,
                     substitute: substituteFn,
+                    preserveDirectives,
                 })
                 : [
                     ...(systemPrompt ? [{ role: 'system', content: String(systemPrompt).trim() }] : []),
@@ -780,6 +786,7 @@ function createPresetModelCaller() {
                 systemPrompt,
                 userPrompt: prompt,
                 substitute: substituteFn,
+                preserveDirectives,
             });
             const reply = await context.generateRaw({ prompt: messages });
             return String(reply || '');

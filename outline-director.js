@@ -199,7 +199,7 @@ export function buildDirectorOutlinePrompt({
         }
     }
 
-    const chronicle = Array.isArray(ledger?.chronicle) ? ledger.chronicle.slice(-8) : [];
+    const chronicle = Array.isArray(ledger?.chronicle) ? ledger.chronicle.slice(-12) : [];
     if (chronicle.length > 0) {
         parts.push('', '【近期剧情编年史与现有信息差】：');
         for (const evt of chronicle) {

@@ -233,7 +233,7 @@ export function buildSingleCallContinuationContext({
     const activeChronicle = (ledger?.chronicle || [])
         .filter(e => Number(e.startChapter || 0) < targetChapterIndex)
         .sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0))
-        .slice(-20);
+        .slice(-30);
     const activeStates = resolveTimelineWorldStates(ledger?.worldStates || [], targetChapterIndex - 1);
     const activeSummaries = (ledger?.summaries || [])
         .filter(s => Number(s.chapterIndex || 0) < targetChapterIndex)

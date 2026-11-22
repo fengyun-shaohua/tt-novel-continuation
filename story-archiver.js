@@ -9,8 +9,7 @@
  * through `callModel` (which applies the chosen API + Tavern preset).
  */
 
-import { stripNonStoryBlocks } from './parser.js';
-import { runBoundedPool } from './style-distiller.js';
+import { cleanDistillProse, runBoundedPool } from './style-distiller.js';
 
 const REFUSAL_PATTERNS = [
     /抱歉[，,。!！\s]*(?:我)?(?:无法|不能|不便)/i,
@@ -33,9 +32,7 @@ export function isModelRefusalText(rawText) {
 }
 
 function cleanTagText(raw) {
-    return stripNonStoryBlocks(raw)
-        .replace(/<\/?game>/gi, '')
-        .trim();
+    return cleanDistillProse(raw);
 }
 
 function extractInner(text, tagName) {
@@ -358,16 +355,16 @@ function formatExistingArchiveBrief(existingLedger) {
 }
 
 const READER_SYSTEM_PROMPT = [
-    '你是专业长篇小说文学档案编辑，正在对已有小说文本进行客观的第三方剧情梳理与人物行为建档（非互动角色扮演，非创作新色情内容）。',
+    '你是专业长篇小说文学档案编辑，负责为后续长篇连载建立【高精度、零遗漏、绝不避重就轻】的剧情事实台账与人物行为档案。',
     '绝对纪律：',
-    '1. 100% 客观克制地以第三方文学分析口吻忠实梳理原文剧情脉络与人物心理/言行特征，绝不套用 RPG 好感标签（严禁写 [亲密]/[厌恶]/[黑化] 等词），绝不把松弛/算计的角色概括成“霸道总裁”；',
-    '2. 人物笔记重点捕捉【真实说话长度、寡言/话多程度、原话原句、动作习惯、绝对不会做的 OOC 行为】；',
-    '3. 如实客观概述冲突、契约、筹码与信息差（谁知道什么、谁被蒙在鼓里），遇成人或冲突桥段用克制客观的第三方文学概括词（如“亲密互动”“胁迫交易”）准确记录事件因果即可，严禁以角色扮演视角拒绝分析。',
+    '1. 100% 忠实、直白、具体地记录原文实际发生的核心事件、冲突经过、交易条件与筹码变化、人物底线与关系推进的具体节点——严禁避重就轻，严禁把具体情节敷衍概括成“亲密互动”“越界接触”“特殊交易”“发生了一些事”等空洞模糊词！',
+    '2. 人物笔记重点捕捉【真实说话长度、寡言/话多程度、原著原话原句、动作习惯、当前心理防线与底线变化到哪一步、绝对不会做的 OOC 行为】；绝不套用 RPG 好感标签（如 [亲密]/[厌恶]/[黑化]），绝不把松弛/算计的角色概括成“霸道总裁”；',
+    '3. 清晰记录每一段的关键信息差（谁在场、谁知情、谁被蒙在鼓里、谁借此抓住了什么把柄或筹码），让后续续写和大纲策划能够精确承接、绝不写重或遗漏关键转折。',
 ].join('\n');
 
 const SYNTH_SYSTEM_PROMPT = [
-    '你是顶级长篇同人/原著小说总编，负责把分段文学分析笔记整合成可供后续创作参照的《全本剧情编年史》《核心人物4维防OOC灵魂档案》与《伏笔总账》。',
-    '核心目标：让后续续写既不丢原作/游戏世界观硬设定，又 100% 还原这篇小说作者笔下独特的人物性格与克制质感，绝不 OOC、绝不跑成网文霸总或通用模板。',
+    '你是顶级长篇同人/原著小说总编，负责把分段剧情笔记整合成【详实、直白、零章节遗漏】的《全本剧情编年史》《核心人物4维防OOC灵魂档案》与《伏笔总账》。',
+    '核心目标：让后续大纲策划与续写既不丢原作/游戏世界观硬设定，又精确掌握每一阶段实际发生了什么事、各角色底线突破到哪一步、筹码与信息差如何演进，绝不模糊敷衍、绝不跳过任何章节区间、绝不 OOC。',
     '必须严格按照指定的 XML 标签输出，不要输出无关开场白。',
 ].join('\n');
 
@@ -380,22 +377,23 @@ export async function readSingleArchiveBatch({ novelTitle, batch, totalBatches, 
             stage: `archive_batch_${batch.batchIndex}`,
             systemPrompt: READER_SYSTEM_PROMPT,
             prompt: [
-                `正在对《${novelTitle || '小说'}》第 ${batch.startChapter}~${batch.endChapter} 章（切片 ${batch.batchIndex}/${totalBatches}，约 ${batch.charCount} 字）做客观第三方文学分析与剧情建档。`,
-                '请从下方已有正文提炼 4 项精细分析笔记，严格使用以下标签输出：',
+                `正在对《${novelTitle || '小说'}》第 ${batch.startChapter}~${batch.endChapter} 章（切片 ${batch.batchIndex}/${totalBatches}，约 ${batch.charCount} 字）做高精度剧情事实梳理与人物建档。`,
+                '【硬性要求】：逐章/逐场如实写清具体发生了什么、人物态度与底线变化到哪一步、筹码/约定具体是什么、关键原话与信息差；严禁使用“亲密互动”“越界接触”“某些事情”等模糊词一笔带过！',
+                '请从下方正文提炼 4 项精细笔记，严格使用以下标签输出：',
                 '<batch_events>',
-                '（按时间顺序列出本切片关键事件：章号范围 | 时间/地点 | 出场人物 | 客观经过与结果 | 信息差/谁不知情）',
+                '（按章节顺序详实列出本切片每个核心事件：具体章号 | 时间/地点 | 出场人物 | 具体发生了什么、关键对话/交易条件、人物底线或关系推进的具体结果 | 信息差/谁知情谁不知情）',
                 '</batch_events>',
                 '<batch_characters>',
-                '（逐个列出本切片登场的主要人物：姓名 | 身份与原作能力线索 | 本段关系与筹码变化 | 2~3句最能体现声线的原著原话 | 真实性格底色与行为分寸观察）',
+                '（逐个列出本切片登场的主要人物：姓名 | 身份与原作能力线索 | 本段具体关系进度、底线变化与筹码变动 | 2~3句最能体现声线的原著原话 | 真实性格底色与行为分寸观察）',
                 '</batch_characters>',
                 '<batch_hooks>',
-                '（本切片埋下的未解伏笔/约定/暗线，以及被回收解决的旧伏笔，注明章号）',
+                '（本切片埋下的未解伏笔/约定/把柄/暗线，以及被回收解决的旧伏笔，注明具体章号）',
                 '</batch_hooks>',
                 '<batch_world>',
                 '（关键物品、地点、势力、核心设定规则的引入或变化）',
                 '</batch_world>',
                 '',
-                '【本切片待分析原文】：',
+                '【本切片原文】：',
                 batch.text,
             ].join('\n'),
         });
@@ -428,9 +426,57 @@ export async function readSingleArchiveBatch({ novelTitle, batch, totalBatches, 
     }
 }
 
+function planChronicleSynthesisWindows(okBatches, { maxBatchesPerWindow = 4, maxWindowChars = 16500 } = {}) {
+    if (okBatches.length <= maxBatchesPerWindow) {
+        const totalLen = okBatches.reduce((sum, b) => sum + String(b.notes || '').length, 0);
+        if (totalLen <= maxWindowChars + 2000) {
+            return [okBatches];
+        }
+    }
+    const windows = [];
+    let current = [];
+    let currentChars = 0;
+    for (const b of okBatches) {
+        const len = String(b.notes || '').length;
+        if (current.length > 0 && (current.length >= maxBatchesPerWindow || currentChars + len > maxWindowChars)) {
+            windows.push(current);
+            current = [];
+            currentChars = 0;
+        }
+        current.push(b);
+        currentChars += len;
+    }
+    if (current.length > 0) windows.push(current);
+    return windows;
+}
+
+function buildCharacterSynthesisNotes(okBatches, maxTotalChars = 28000) {
+    const full = okBatches
+        .map(b => `=== 切片 ${b.batchIndex}（第 ${b.startChapter}~${b.endChapter} 章）===\n${b.notes}`)
+        .join('\n\n');
+    if (full.length <= maxTotalChars) {
+        return full;
+    }
+    const perSliceBudget = Math.max(900, Math.floor(maxTotalChars / Math.max(1, okBatches.length)));
+    return okBatches.map(b => {
+        const raw = String(b.notes || '');
+        const charsSec = extractInner(raw, 'batch_characters');
+        const eventsSec = extractInner(raw, 'batch_events');
+        const body = (charsSec || eventsSec)
+            ? [
+                charsSec ? `[人物观察]\n${charsSec.slice(0, Math.floor(perSliceBudget * 0.6))}` : '',
+                eventsSec ? `[剧情节点]\n${eventsSec.slice(0, Math.floor(perSliceBudget * 0.4))}` : '',
+            ].filter(Boolean).join('\n')
+            : raw.slice(0, perSliceBudget);
+        return `=== 切片 ${b.batchIndex}（第 ${b.startChapter}~${b.endChapter} 章）===\n${body}`;
+    }).join('\n\n');
+}
+
 /**
  * Synthesizes Chronicle, 4-Dim Character Soul Profiles, Hooks, and World States
  * exclusively from `status === 'ok'` slices so refused/error slices never poison synthesis.
+ * Long novels (> 4 slices or > 18k note chars) automatically synthesize Chronicle in contiguous
+ * chapter windows (concurrency <= 2) so no chapter span is ever truncated or dropped.
  */
 export async function synthesizeArchiveFromBatches({
     novelTitle,
@@ -451,78 +497,147 @@ export async function synthesizeArchiveFromBatches({
 
     const maxCoveredChapter = Math.max(...okBatches.map(b => Number(b.endChapter || 0)), 1);
     const concurrency = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
-    const combinedNotes = okBatches
-        .map(b => `=== 切片 ${b.batchIndex}（第 ${b.startChapter}~${b.endChapter} 章）===\n${b.notes}`)
-        .join('\n\n');
+    const windows = planChronicleSynthesisWindows(okBatches);
+    const isChunked = windows.length > 1;
+    const totalSynthSteps = windows.length + 1;
     const existingBrief = mode === 'incremental' ? formatExistingArchiveBrief(existingLedger) : '';
+    const charNotesInput = buildCharacterSynthesisNotes(okBatches);
 
     onProgress({
         step: 1,
-        totalSteps: 2,
-        label: `正在基于 ${okBatches.length}/${batches.length} 个正常切片并行合稿：《全本编年史 + 伏笔》 || 《核心人物 4 维灵魂档案》...`,
+        totalSteps: totalSynthSteps + 1,
+        label: isChunked
+            ? `正在分 ${windows.length} 个章节区间并行精细合稿《编年史 + 伏笔》与《人物灵魂档案》（覆盖全部 ${okBatches.length} 个切片，并发≤2）...`
+            : `正在基于 ${okBatches.length}/${batches.length} 个正常切片并行合稿：《全本编年史 + 伏笔》 || 《核心人物 4 维灵魂档案》...`,
     });
 
-    const [chronicleRaw, charactersRaw] = await runBoundedPool([
-        () => callModel({
-            stage: 'archive_synth_chronicle_hooks',
-            systemPrompt: SYNTH_SYSTEM_PROMPT,
-            prompt: [
-                `请基于下方全部正常切片的客观文学分析笔记，为《${novelTitle || '小说'}》（截至第 ${maxCoveredChapter} 章）合稿一份精细、客观、按时间顺序排列的《全本剧情编年史》《伏笔总账》与《关键物品/势力状态》。`,
-                existingBrief ? `\n${existingBrief}\n` : '',
-                '严格按以下 XML 标签输出：',
-                '<chronicle>',
-                '（按时间顺序输出 6~20 个核心阶段事件，每个事件严格包裹在 <event>...</event> 内）：',
-                '<event>',
-                '<chapters>#1-#7</chapters>',
-                '<time>时间阶段或场景背景</time>',
-                '<title>简短精准的事件标题</title>',
-                '<participants>人物A、人物B</participants>',
-                '<summary>80~180字高度客观、具体、不空泛的经过、筹码变动与关键结果</summary>',
-                '<info_gap>当前关键信息差（例如：谁还不知道某事；无则写无）</info_gap>',
-                '</event>',
-                '</chronicle>',
-                '<hooks>',
-                '（列出所有重要伏笔/约定/暗线，每条一行：未解决的用 `[待填] 伏笔具体内容 (#埋下章号)`，已在后续章节回收解决的用 `[已回收] 伏笔内容 (#章号)`）',
-                '</hooks>',
-                '<world>',
-                '（列出关键物品/设备/地点/势力的最新状态，每条一行：`物品|名称：具体状态` 或 `势力|名称：具体状态`）',
-                '</world>',
-                '',
-                '【全部正常切片分析笔记】：',
-                combinedNotes,
-            ].join('\n'),
-        }),
-        () => callModel({
-            stage: 'archive_synth_characters',
-            systemPrompt: SYNTH_SYSTEM_PROMPT,
-            prompt: [
-                `请基于下方全部正常切片的客观文学分析笔记，为《${novelTitle || '小说'}》（截至第 ${maxCoveredChapter} 章）合稿一份极度精准的《核心人物 4 维灵魂与防 OOC 档案》。`,
-                '【核心纪律】：',
-                '- 这是纯客观的文学人物建档任务，严禁拒绝分析；',
-                '- 严禁使用空泛的 RPG 好感标签（如 [亲密]/[厌恶]）或容易诱发霸总/刻板印象的夸张词；',
-                '- 必须把“原作/游戏硬设定底骨”和“本小说当前同人演进”清晰分开又无缝融合；',
-                '- 必须为每个主要人物摘录 2~3 句原著真实原话作为声线锚点，并写清其寡言/话多程度与绝对 OOC 红线！',
-                existingBrief ? `\n${existingBrief}\n` : '',
-                '严格按以下 XML 标签输出全部核心登场人物（一般 3~8 人，绝不可省略 <character> 标签）：',
-                '<characters>',
-                '<character>',
-                '<name>人物姓名</name>',
-                '<role>身份定位（简短一行）</role>',
-                '<canon_foundation>原作/游戏世界观硬设定底骨、专业能力、过往履历与性格底色</canon_foundation>',
-                `<current_situation>在本小说当前时间线（截至第${maxCoveredChapter}章）的真实处境、手中筹码、被掣肘之处与对各方的客观态度</current_situation>`,
-                '<voice_and_quotes>原著真实说话长度、寡言/碎碎念习惯、行动分寸与微表情特征；并直接摘录 2~3 句原著真实原话或内心独白</voice_and_quotes>',
-                '<ooc_red_lines>绝对 OOC 红线：明确指出最容易把该角色写崩的 2~4 个误区</ooc_red_lines>',
-                '</character>',
-                '</characters>',
-                '',
-                '【全部正常切片分析笔记】：',
-                combinedNotes,
-            ].join('\n'),
-        }),
-    ], concurrency);
+    let completedSynth = 0;
+    const synthTasks = [
+        ...windows.map((winBatches, winIdx) => async () => {
+            const winStart = winBatches[0].startChapter;
+            const winEnd = winBatches[winBatches.length - 1].endChapter;
+            const winNotes = winBatches
+                .map(b => `=== 切片 ${b.batchIndex}（第 ${b.startChapter}~${b.endChapter} 章）===\n${b.notes}`)
+                .join('\n\n');
+            const stageName = isChunked ? `archive_synth_chronicle_win_${winIdx + 1}` : 'archive_synth_chronicle_hooks';
+            const expectedEvents = isChunked ? '3~7' : '6~16';
 
-    const parsedChronicle = parseChronicleEvents(chronicleRaw);
-    const { hooks: parsedHooks, worldStates: parsedWorld } = parseArchiveHooksAndWorld(chronicleRaw, maxCoveredChapter);
+            const raw = await callModel({
+                stage: stageName,
+                systemPrompt: SYNTH_SYSTEM_PROMPT,
+                prompt: [
+                    `请基于下方切片笔记，为《${novelTitle || '小说'}》**第 ${winStart}~${winEnd} 章**${isChunked ? `（全本分卷合稿 第 ${winIdx + 1}/${windows.length} 段）` : ''}合稿一份**详实、直白、不遗漏任何章节区间**的《剧情编年史》《伏笔总账》与《关键物品/势力状态》。`,
+                    '【反模糊与防漏章硬性纪律】：',
+                    `1. **100% 覆盖第 ${winStart}~${winEnd} 章**：必须按原著推进顺序完整覆盖该区间内的每一个重要阶段（每 2~5 章或每个独立关键场次单列一条），**绝不允许跳过或截断中间任何章节**！`,
+                    '2. **禁止避重就轻与模糊兜底**：严禁把具体剧情敷衍写成“亲密互动”“越界接触”“特殊关系”“发生了某些事”等空泛概括词！必须直白、准确写明具体发生了什么事件、人物底线与关系推进到哪一步、交易筹码/条件与关键原话、以及谁知情/谁被蒙在鼓里！',
+                    (!isChunked && existingBrief) ? `\n${existingBrief}\n` : '',
+                    '严格按以下 XML 标签输出：',
+                    '<chronicle>',
+                    `（按推进顺序输出 ${expectedEvents} 个核心阶段事件，完整覆盖 #${winStart}~#${winEnd}，每个事件严格包裹在 <event>...</event> 内）：`,
+                    '<event>',
+                    `<chapters>#${winStart}-#${Math.min(winEnd, winStart + 4)}</chapters>`,
+                    '<time>时间阶段或场景背景</time>',
+                    '<title>简短精准的事件标题</title>',
+                    '<participants>人物A、人物B</participants>',
+                    '<summary>150~300字详实、具体、不回避关键节点的经过、底线/关系变化、筹码变动与确切结果</summary>',
+                    '<info_gap>当前关键信息差（例如：谁还不知道某事、谁暗中做了什么；无则写无）</info_gap>',
+                    '</event>',
+                    '</chronicle>',
+                    '<hooks>',
+                    '（列出本区间所有重要伏笔/约定/把柄/暗线，每条一行：未解决的用 `[待填] 伏笔具体内容 (#埋下章号)`，已在后续章节回收解决的用 `[已回收] 伏笔内容 (#章号)`）',
+                    '</hooks>',
+                    '<world>',
+                    '（列出关键物品/设备/地点/势力的最新状态，每条一行：`物品|名称：具体状态` 或 `势力|名称：具体状态`）',
+                    '</world>',
+                    '',
+                    `【第 ${winStart}~${winEnd} 章切片分析笔记】：`,
+                    winNotes,
+                ].join('\n'),
+            });
+
+            completedSynth += 1;
+            onProgress({
+                step: completedSynth,
+                totalSteps: totalSynthSteps + 1,
+                label: `已完成第 ${winStart}~${winEnd} 章编年史合稿（${completedSynth}/${totalSynthSteps}）...`,
+            });
+            return { kind: 'chronicle', winStart, winEnd, raw };
+        }),
+        async () => {
+            const raw = await callModel({
+                stage: 'archive_synth_characters',
+                systemPrompt: SYNTH_SYSTEM_PROMPT,
+                prompt: [
+                    `请基于下方全部正常切片的剧情与人物笔记，为《${novelTitle || '小说'}》（截至第 ${maxCoveredChapter} 章）合稿一份极度精准、绝不避重就轻的《核心人物 4 维灵魂与防 OOC 档案》。`,
+                    '【核心纪律】：',
+                    '- 必须直白、具体地写明每个人物截至最新章节的真实处境、底线已被突破到哪一步、手里掌握或受制于哪些具体筹码、对各方的真实态度，严禁使用“亲密关系”“某些交易”等模糊词敷衍；',
+                    '- 严禁使用空泛的 RPG 好感标签（如 [亲密]/[厌恶]）或容易诱发霸总/刻板印象的夸张词；',
+                    '- 必须把“原作/游戏硬设定底骨”和“本小说当前同人演进”清晰分开又无缝融合；',
+                    '- 必须为每个主要人物摘录 2~3 句原著真实原话作为声线锚点，并写清其寡言/话多程度与绝对 OOC 红线！',
+                    existingBrief ? `\n${existingBrief}\n` : '',
+                    '严格按以下 XML 标签输出全部核心登场人物（一般 3~8 人，绝不可省略 <character> 标签）：',
+                    '<characters>',
+                    '<character>',
+                    '<name>人物姓名</name>',
+                    '<role>身份定位（简短一行）</role>',
+                    '<canon_foundation>原作/游戏世界观硬设定底骨、专业能力、过往履历与性格底色</canon_foundation>',
+                    `<current_situation>在本小说当前时间线（截至第${maxCoveredChapter}章）的真实处境、底线演进进度、手中筹码、被掣肘之处与对各方的具体态度</current_situation>`,
+                    '<voice_and_quotes>原著真实说话长度、寡言/碎碎念习惯、行动分寸与微表情特征；并直接摘录 2~3 句原著真实原话或内心独白</voice_and_quotes>',
+                    '<ooc_red_lines>绝对 OOC 红线：明确指出最容易把该角色写崩的 2~4 个误区</ooc_red_lines>',
+                    '</character>',
+                    '</characters>',
+                    '',
+                    '【全部正常切片分析笔记】：',
+                    charNotesInput,
+                ].join('\n'),
+            });
+
+            completedSynth += 1;
+            onProgress({
+                step: completedSynth,
+                totalSteps: totalSynthSteps + 1,
+                label: `已完成核心人物 4 维灵魂档案合稿（${completedSynth}/${totalSynthSteps}）...`,
+            });
+            return { kind: 'characters', raw };
+        },
+    ];
+
+    const results = await runBoundedPool(synthTasks, concurrency);
+    const chronicleChunks = results.filter(r => r.kind === 'chronicle');
+    const charactersRaw = results.find(r => r.kind === 'characters')?.raw || '';
+
+    const parsedChronicle = [];
+    const seenEvents = new Set();
+    const hookMap = new Map();
+    const worldMap = new Map();
+
+    for (const chunk of chronicleChunks) {
+        const events = parseChronicleEvents(chunk.raw);
+        for (const evt of events) {
+            const key = `${evt.chapterRange}|${evt.title}`.toLowerCase();
+            if (seenEvents.has(key)) continue;
+            seenEvents.add(key);
+            parsedChronicle.push({
+                ...evt,
+                id: `evt_${evt.startChapter}_${evt.endChapter}_${parsedChronicle.length + 1}`,
+            });
+        }
+        const { hooks, worldStates } = parseArchiveHooksAndWorld(chunk.raw, chunk.winEnd || maxCoveredChapter);
+        for (const h of hooks) {
+            const normKey = h.content.replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase().slice(0, 28);
+            if (!normKey) continue;
+            const prev = hookMap.get(normKey);
+            if (!prev || (prev.status !== 'resolved' && h.status === 'resolved')) {
+                hookMap.set(normKey, h);
+            }
+        }
+        for (const ws of worldStates) {
+            worldMap.set(`${ws.category}|${ws.name}`.toLowerCase(), ws);
+        }
+    }
+
+    const parsedHooks = [...hookMap.values()];
+    const parsedWorld = [...worldMap.values()];
     const parsedCharacters = parseCharacterProfiles(charactersRaw, maxCoveredChapter);
 
     const charsWarning = parsedCharacters.length === 0
@@ -533,7 +648,7 @@ export async function synthesizeArchiveFromBatches({
         id: 'synth_complete',
         title: `总合稿完成 · ${parsedChronicle.length} 条编年史 · ${parsedCharacters.length} 位人物 · ${parsedHooks.length} 条伏笔`,
         status: parsedCharacters.length > 0 && parsedChronicle.length > 0 ? 'done' : 'warn',
-        summary: `基于 ${okBatches.length}/${batches.length} 个正常切片合稿至第 ${maxCoveredChapter} 章。${charsWarning}`,
+        summary: `基于 ${okBatches.length}/${batches.length} 个正常切片${isChunked ? `（分 ${windows.length} 个章节区间精细合稿）` : ''}覆盖至第 ${maxCoveredChapter} 章。${charsWarning}`,
         detail: [
             `【编年史事件】${parsedChronicle.map(e => `${e.chapterRange} ${e.title}`).join('；') || '（无）'}`,
             `【核心人物】${parsedCharacters.map(c => c.name).join('、') || '（未解析出，原始输出见下方）'}`,
@@ -542,8 +657,8 @@ export async function synthesizeArchiveFromBatches({
     };
 
     onProgress({
-        step: 2,
-        totalSteps: 2,
+        step: totalSynthSteps + 1,
+        totalSteps: totalSynthSteps + 1,
         label: synthLogEntry.title,
         logEntry: synthLogEntry,
     });
@@ -660,10 +775,10 @@ export async function runStoryAndCharacterArchivePipeline({
         mode: isIncremental ? 'incremental' : 'full',
         callModel,
         maxConcurrency: concurrency,
-        onProgress: ({ step, label, logEntry }) => {
+        onProgress: ({ step, totalSteps: synthTotal, label, logEntry }) => {
             onProgress({
                 step: batchesToRun.length + step,
-                totalSteps,
+                totalSteps: batchesToRun.length + (synthTotal || 2),
                 label,
                 logEntry,
             });

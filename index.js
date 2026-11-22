@@ -4,7 +4,13 @@ import { oai_settings } from '/scripts/openai.js';
 import { getPresetManager } from '/scripts/preset-manager.js';
 import { deleteMessage, resetChatSurfaceView } from '/script.js';
 import { escapeHtml } from '/scripts/utils.js';
-import { buildSurgicalDeclichePrompt, scanStoryCliches } from './cliche-guard.js';
+import {
+    buildDeepRewritePrompt,
+    buildSurgicalDeclichePrompt,
+    parseDeepRewriteResponse,
+    scanStoryCliches,
+    validateDraftForRewrite,
+} from './cliche-guard.js';
 import {
     buildNovelStateTrailerPrompt,
     buildSingleCallContinuationContext,
@@ -73,6 +79,13 @@ const DEFAULT_SETTINGS = Object.freeze({
     bgCustomApiModel: '',
     bgCustomApiModelsCache: [],
     bgCustomTemperature: 0.7,
+    autoDeepRewrite: false,
+    rewriteModelMode: 'bg',
+    rewriteTavernModel: '',
+    rewriteCustomApiUrl: '',
+    rewriteCustomApiKey: '',
+    rewriteCustomApiModel: '',
+    rewriteCustomApiModelsCache: [],
     clicheBlacklist: '',
     maxOriginalHits: 3,
     maxCanonHits: 4,
@@ -324,6 +337,11 @@ async function onMessageReceived(messageId, type) {
         }
     }
 
+    // Synchronously capture preceding user outline before any async fold timer deletes that floor
+    if (messageId >= 1 && chat[messageId - 1]?.is_user && typeof chat[messageId - 1].mes === 'string' && chat[messageId - 1].mes.trim()) {
+        msg.extra.novelAuthorOutline = chat[messageId - 1].mes.trim();
+    }
+
     // 0-API local cliché scan right after generation completes
     const clicheScan = scanStoryCliches(msg.mes, settings.clicheBlacklist);
     msg.extra.novelClicheHits = clicheScan.totalHits;
@@ -332,15 +350,36 @@ async function onMessageReceived(messageId, type) {
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
 
-    if (clicheScan.totalHits > 0) {
+    if (clicheScan.totalHits > 0 && !settings.autoDeepRewrite) {
         globalThis.toastr?.info?.(
-            `第 ${chapterIndex} 章检测到 ${clicheScan.totalHits} 处八股词（${clicheScan.uniqueTerms.slice(0, 3).join('、')}），可在「工作台 → 反八股」一键精修`,
+            `第 ${chapterIndex} 章检测到 ${clicheScan.totalHits} 处八股词（${clicheScan.uniqueTerms.slice(0, 3).join('、')}），可在「工作台 → 精修重塑」一键处理`,
             '小说续写阅读器',
         );
     }
 
     if (shouldFoldUserOutline) {
         scheduleFoldPrecedingUserOutlineFloor(msg);
+    }
+
+    // Optional Auto Deep Diagnosis & Rewrite (strictly gated by empty/refusal validation + re-entry lock)
+    if (settings.autoDeepRewrite && novelData?.chapters?.length && type !== 'continue') {
+        const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
+        const doneMap = msg.extra.novelDeepRewrittenSwipes || {};
+        if (!doneMap[swipeId] && !deepRewriteInFlight) {
+            const draftCheck = validateDraftForRewrite(msg.mes);
+            if (!draftCheck.ok) {
+                updateLiveProgress('cliche', {
+                    isRunning: false,
+                    isError: true,
+                    text: `🛡️ 已跳过第 ${chapterIndex} 章自动重塑：${draftCheck.reason}`,
+                });
+                globalThis.toastr?.warning?.(`🛡️ ${draftCheck.reason}`, '小说续写阅读器');
+            } else {
+                setTimeout(() => {
+                    void runDeepRewriteLatestTask({ targetMsgRef: msg, triggerSource: 'auto' });
+                }, 360);
+            }
+        }
     }
 }
 
@@ -676,14 +715,7 @@ async function callCustomOpenAiViaHost({ baseUrl, apiKey, model, temperature, me
     return extractChatCompletionText(parsed ?? rawText);
 }
 
-async function fetchCustomApiModels() {
-    const settings = getSettings();
-    const baseUrl = normalizeCustomApiBaseUrl(settings.bgCustomApiUrl);
-    if (!baseUrl) {
-        globalThis.toastr?.warning?.('请先填写自定义 API 的 Base URL（例如 https://api.xxx.com/v1）', '小说续写阅读器');
-        return [];
-    }
-    const apiKey = String(settings.bgCustomApiKey || '').trim();
+async function fetchModelsFromCustomEndpoint(baseUrl, apiKey) {
     const context = getContext();
     const headers = typeof context?.getRequestHeaders === 'function'
         ? { ...context.getRequestHeaders(), 'Content-Type': 'application/json' }
@@ -707,7 +739,18 @@ async function fetchCustomApiModels() {
     const rawList = Array.isArray(result?.data)
         ? result.data
         : (Array.isArray(result?.data?.data) ? result.data.data : []);
-    const modelIds = [...new Set(rawList.map(m => String(m?.id || m?.name || m || '').trim()).filter(Boolean))];
+    return [...new Set(rawList.map(m => String(m?.id || m?.name || m || '').trim()).filter(Boolean))];
+}
+
+async function fetchCustomApiModels() {
+    const settings = getSettings();
+    const baseUrl = normalizeCustomApiBaseUrl(settings.bgCustomApiUrl);
+    if (!baseUrl) {
+        globalThis.toastr?.warning?.('请先填写自定义 API 的 Base URL（例如 https://api.xxx.com/v1）', '小说续写阅读器');
+        return [];
+    }
+    const apiKey = String(settings.bgCustomApiKey || '').trim();
+    const modelIds = await fetchModelsFromCustomEndpoint(baseUrl, apiKey);
     settings.bgCustomApiModelsCache = modelIds;
     if (!settings.bgCustomApiModel && modelIds.length > 0) {
         settings.bgCustomApiModel = modelIds[0];
@@ -718,34 +761,91 @@ async function fetchCustomApiModels() {
     return modelIds;
 }
 
+async function fetchRewriteCustomModels() {
+    const settings = getSettings();
+    const baseUrl = normalizeCustomApiBaseUrl(settings.rewriteCustomApiUrl || settings.bgCustomApiUrl);
+    if (!baseUrl) {
+        globalThis.toastr?.warning?.('请先填写重塑专用（或后台设置里）自定义 API 的 Base URL', '小说续写阅读器');
+        return [];
+    }
+    const apiKey = String(settings.rewriteCustomApiKey || settings.bgCustomApiKey || '').trim();
+    const modelIds = await fetchModelsFromCustomEndpoint(baseUrl, apiKey);
+    settings.rewriteCustomApiModelsCache = modelIds;
+    if (!settings.rewriteCustomApiModel && modelIds.length > 0) {
+        settings.rewriteCustomApiModel = modelIds[0];
+    }
+    saveExtensionSettings();
+    await refreshReaderWidgets();
+    return modelIds;
+}
+
+function getAvailableTavernModelsForActiveSource() {
+    try {
+        const src = String(oai_settings?.chat_completion_source || 'custom');
+        const selectIdMap = {
+            custom: 'model_custom_select',
+            openai: 'model_openai_select',
+            claude: 'model_claude_select',
+            makersuite: 'model_google_select',
+            vertexai: 'model_vertexai_select',
+            openrouter: 'model_openrouter_select',
+            deepseek: 'model_deepseek_select',
+            xai: 'model_xai_select',
+            groq: 'model_groq_select',
+            mistralai: 'model_mistralai_select',
+        };
+        const el = document.getElementById(selectIdMap[src] || 'model_custom_select');
+        if (!el) return [];
+        return [...new Set(
+            Array.from(el.querySelectorAll('option'))
+                .map(opt => String(opt.value || '').trim())
+                .filter(Boolean),
+        )];
+    } catch {
+        return [];
+    }
+}
+
 /**
  * Unified preset-wrapped LLM caller shared by:
- * 1) Story & Character Archiver (`story-archiver.js` — full, incremental, single-slice retry, re-synth)
+ * 1) Story & Character Archiver (`story-archiver.js`)
  * 2) Multi-round Style Distiller (`style-distiller.js`)
- * 3) Surgical De-Cliché Refiner (`cliche-guard.js`)
- * Supports BOTH Tavern's current active API (`bgApiMode: 'tavern'`) and Custom OpenAI-compatible API (`bgApiMode: 'custom'`).
+ * 3) Director Outline Generator (`outline-director.js`)
+ * 4) Deep Diagnosis & Rewrite / Surgical De-Cliché (`cliche-guard.js`, supporting dedicated rewrite model override!)
  */
-function createPresetModelCaller() {
+function createPresetModelCaller({ role = 'bg' } = {}) {
     const context = getContext();
     const settings = getSettings();
     const resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
-    const apiMode = settings.bgApiMode === 'custom' ? 'custom' : 'tavern';
 
     const substituteFn = typeof context?.substituteParams === 'function'
         ? (text) => context.substituteParams(text)
         : null;
-
     const preserveDirectives = Boolean(resolvedPreset.isActivePreset);
 
-    if (apiMode === 'custom') {
-        const baseUrl = normalizeCustomApiBaseUrl(settings.bgCustomApiUrl);
-        const apiKey = String(settings.bgCustomApiKey || '').trim();
-        const model = String(settings.bgCustomApiModel || '').trim();
+    const isRewriteCustom = role === 'rewrite' && settings.rewriteModelMode === 'custom';
+    const isRewriteTavernOverride = role === 'rewrite' && settings.rewriteModelMode === 'tavern_override';
+    const useCustomApi = isRewriteCustom || (!isRewriteTavernOverride && settings.bgApiMode === 'custom');
+
+    if (useCustomApi) {
+        const baseUrl = normalizeCustomApiBaseUrl(
+            isRewriteCustom ? (settings.rewriteCustomApiUrl || settings.bgCustomApiUrl) : settings.bgCustomApiUrl,
+        );
+        const apiKey = String(
+            isRewriteCustom ? (settings.rewriteCustomApiKey || settings.bgCustomApiKey) : settings.bgCustomApiKey,
+        ).trim();
+        const model = String(
+            isRewriteCustom ? (settings.rewriteCustomApiModel || settings.bgCustomApiModel) : settings.bgCustomApiModel,
+        ).trim();
         if (!baseUrl) {
-            throw new Error('当前已选择「自定义 API」，请先在「工作台 → 设置」填写 Base URL');
+            throw new Error(isRewriteCustom
+                ? '重塑已选「独立自定义 API」，请先填写 Base URL（或在「设置」中填写后台自定义 API）'
+                : '当前已选择「自定义 API」，请先在「工作台 → 设置」填写 Base URL');
         }
         if (!model) {
-            throw new Error('当前已选择「自定义 API」，请先在「工作台 → 设置」选择或填写模型名称');
+            throw new Error(isRewriteCustom
+                ? '重塑已选「独立自定义 API」，请先选择或填写重塑模型名称'
+                : '当前已选择「自定义 API」，请先在「工作台 → 设置」选择或填写模型名称');
         }
         const callModel = async ({ prompt, systemPrompt }) => {
             const messages = resolvedPreset.presetObj
@@ -778,26 +878,56 @@ function createPresetModelCaller() {
     if (typeof context?.generateRaw !== 'function') {
         throw new Error('当前环境不支持 generateRaw 模型调用');
     }
-    const modelLabel = getActiveApiModelLabel();
+
+    const overrideModel = isRewriteTavernOverride ? String(settings.rewriteTavernModel || '').trim() : '';
+    if (isRewriteTavernOverride && !overrideModel) {
+        throw new Error('重塑已选「复用酒馆连接 · 仅换模型名」，请先在「精修重塑」页填写或选择模型名（如 gemini-4-argon）');
+    }
+    const modelLabel = overrideModel || getActiveApiModelLabel();
 
     const callModel = async ({ prompt, systemPrompt }) => {
-        if (resolvedPreset.presetObj) {
-            const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
-                systemPrompt,
-                userPrompt: prompt,
-                substitute: substituteFn,
-                preserveDirectives,
-            });
-            const reply = await context.generateRaw({ prompt: messages });
-            return String(reply || '');
+        const invokeRaw = async () => {
+            if (resolvedPreset.presetObj) {
+                const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
+                    systemPrompt,
+                    userPrompt: prompt,
+                    substitute: substituteFn,
+                    preserveDirectives,
+                });
+                return String(await context.generateRaw({ prompt: messages }) || '');
+            }
+            return String(await context.generateRaw({ prompt, systemPrompt }) || '');
+        };
+
+        if (!overrideModel) {
+            return await invokeRaw();
         }
-        const reply = await context.generateRaw({ prompt, systemPrompt });
-        return String(reply || '');
+
+        // One-shot scoped override of `generate_data.model` on Tavern's active connection
+        // without mutating `oai_settings` or affecting normal chat turns.
+        const ev = context?.eventSource;
+        const evName = context?.eventTypes?.CHAT_COMPLETION_SETTINGS_READY;
+        let applied = false;
+        const modelOverrideHook = (data) => {
+            if (applied || !data || typeof data !== 'object') return;
+            applied = true;
+            data.model = overrideModel;
+        };
+        if (ev && evName) {
+            ev.on?.(evName, modelOverrideHook);
+        }
+        try {
+            return await invokeRaw();
+        } finally {
+            if (ev && evName) {
+                ev.removeListener?.(evName, modelOverrideHook);
+            }
+        }
     };
 
     return {
         callModel,
-        modelLabel: `酒馆API / ${modelLabel}`,
+        modelLabel: overrideModel ? `酒馆连接换模 / ${overrideModel}` : `酒馆API / ${modelLabel}`,
         presetLabel: resolvedPreset.label,
     };
 }
@@ -817,9 +947,19 @@ function getRuntimeMeta() {
     const bgModelLabel = isCustom
         ? `自定义API / ${settings.bgCustomApiModel || '未填模型'}`
         : `酒馆API / ${getActiveApiModelLabel()}`;
+
+    let rewriteModelLabel = bgModelLabel;
+    if (settings.rewriteModelMode === 'tavern_override') {
+        rewriteModelLabel = `酒馆连接换模 / ${settings.rewriteTavernModel || '未填模型'}`;
+    } else if (settings.rewriteModelMode === 'custom') {
+        rewriteModelLabel = `独立自定义API / ${settings.rewriteCustomApiModel || settings.bgCustomApiModel || '未填模型'}`;
+    }
+
     return {
         activeModel: bgModelLabel,
+        rewriteModelLabel,
         tavernModel: getActiveApiModelLabel(),
+        tavernModels: getAvailableTavernModelsForActiveSource(),
         bgApiMode: isCustom ? 'custom' : 'tavern',
         presetLabel,
         activePresetName,
@@ -1316,6 +1456,178 @@ async function getLatestChapterAnchorInfo() {
     return resolveLatestChapterAnchor(novelData, continuedChapters);
 }
 
+let deepRewriteInFlight = false;
+
+async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = 'manual', extraDirective = '' } = {}) {
+    if (deepRewriteInFlight) {
+        if (triggerSource === 'manual') {
+            globalThis.toastr?.warning?.('当前已有深度诊断重塑任务正在执行，请稍候', '小说续写阅读器');
+        }
+        return;
+    }
+
+    const context = getContext();
+    const chat = context?.chat;
+    if (!Array.isArray(chat)) return;
+
+    let msg = targetMsgRef;
+    let floorIndex = msg ? chat.indexOf(msg) : -1;
+    let chapterIndex = Number(msg?.extra?.novelChapterIndex || 0);
+
+    if (!msg || floorIndex < 0) {
+        const status = getLatestClicheStatus();
+        if (!status.hasContinuedFloor) {
+            if (triggerSource === 'manual') {
+                globalThis.toastr?.warning?.('当前还没有 AI 续写章节可供深度重塑', '小说续写阅读器');
+            }
+            return;
+        }
+        floorIndex = status.floorIndex;
+        chapterIndex = status.chapterIndex;
+        msg = chat[floorIndex];
+    }
+    if (!msg) return;
+
+    const rawOriginal = String(msg.mes || '');
+    const draftCheck = validateDraftForRewrite(rawOriginal);
+    if (!draftCheck.ok) {
+        updateLiveProgress('cliche', {
+            isRunning: false,
+            isError: true,
+            text: `🛡️ 已拦截第 ${chapterIndex || '?'} 章重塑：${draftCheck.reason}`,
+        });
+        globalThis.toastr?.warning?.(`🛡️ ${draftCheck.reason}`, '小说续写阅读器');
+        return;
+    }
+
+    let caller;
+    try {
+        caller = createPresetModelCaller({ role: 'rewrite' });
+    } catch (err) {
+        updateLiveProgress('cliche', {
+            isRunning: false,
+            isError: true,
+            text: `⚠️ 无法启动深度重塑：${err?.message || err}`,
+        });
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    deepRewriteInFlight = true;
+    const settings = getSettings();
+    const beforeScan = scanStoryCliches(rawOriginal, settings.clicheBlacklist);
+    const hadGameWrapper = /<game>[\s\S]*<\/game>/i.test(rawOriginal);
+    const origSwipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
+    const modeTag = triggerSource === 'auto' ? '⚡ 自动深度重塑' : '🔥 深度诊断重塑';
+
+    updateLiveProgress('cliche', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ ${modeTag}启动：正在使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 对第 ${chapterIndex || '?'} 章（初稿 ${draftCheck.charCount} 字）执行 5 项病灶诊断与推翻重写...`,
+    });
+    if (triggerSource === 'auto') {
+        globalThis.toastr?.info?.(
+            `初稿校验通过（${draftCheck.charCount} 字），正在用 [${caller.modelLabel}] 自动深度重塑第 ${chapterIndex || '?'} 章...`,
+            '小说续写阅读器',
+        );
+    }
+
+    try {
+        const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+        const allContinued = collectContinuedChaptersFromChat(novelData);
+        const prevContinued = chapterIndex > 0
+            ? allContinued.filter(c => Number(c.index) < chapterIndex)
+            : allContinued.slice(0, -1);
+        const prevChapterAnchor = resolveLatestChapterAnchor(novelData, prevContinued);
+        const authorOutline = String(msg.extra?.novelAuthorOutline || '').trim();
+
+        const { systemPrompt, prompt, driftSummary } = buildDeepRewritePrompt({
+            draftText: draftCheck.storyText,
+            chapterIndex: chapterIndex || (prevChapterAnchor?.nextChapterIndex || 1),
+            authorOutline,
+            prevChapterAnchor,
+            novelData,
+            ledger,
+            scanReport: beforeScan,
+            customBlacklistText: settings.clicheBlacklist,
+            extraDirective,
+        });
+
+        const rawOutput = await caller.callModel({
+            stage: 'deep_diagnosis_rewrite',
+            systemPrompt,
+            prompt,
+        });
+
+        const { diagnosisPre, rewrittenContent } = parseDeepRewriteResponse(rawOutput, draftCheck.charCount);
+        const finalMes = hadGameWrapper ? `<game>\n${rewrittenContent}\n</game>` : rewrittenContent;
+
+        // Re-resolve live floor index in case preceding user outline floor was folded during async call
+        const liveFloorIdx = chat.indexOf(msg);
+        if (liveFloorIdx < 0) {
+            throw new Error('目标章节楼层在重写期间已移除，已取消写入');
+        }
+
+        if (!Array.isArray(msg.swipes) || msg.swipes.length === 0) {
+            msg.swipes = [rawOriginal];
+        }
+        msg.swipes.push(finalMes);
+        const newSwipeId = msg.swipes.length - 1;
+        msg.swipe_id = newSwipeId;
+        msg.mes = finalMes;
+
+        const afterScan = scanStoryCliches(finalMes, settings.clicheBlacklist);
+        const afterChars = rewrittenContent.replace(/\s+/g, '').length;
+
+        msg.extra = msg.extra || {};
+        msg.extra.novelClicheHits = afterScan.totalHits;
+        msg.extra.novelDeepRewrittenSwipes = {
+            ...(msg.extra.novelDeepRewrittenSwipes || {}),
+            [origSwipeId]: true,
+            [newSwipeId]: true,
+        };
+        if (msg.extra.novelContinuationStateBySwipe?.[origSwipeId]) {
+            msg.extra.novelContinuationStateBySwipe[newSwipeId] = msg.extra.novelContinuationStateBySwipe[origSwipeId];
+        }
+
+        ledger.latestRewriteReport = {
+            chapterIndex: chapterIndex || (prevChapterAnchor?.nextChapterIndex || 1),
+            triggerSource,
+            modelLabel: caller.modelLabel,
+            presetLabel: caller.presetLabel,
+            beforeChars: draftCheck.charCount,
+            afterChars,
+            beforeCliches: beforeScan.totalHits,
+            afterCliches: afterScan.totalHits,
+            driftSummary,
+            diagnosisPre,
+            createdAt: Date.now(),
+        };
+        await saveLedger(ledger);
+
+        context.updateMessageBlock?.(liveFloorIdx, msg);
+        await context.saveChat?.();
+        updateLiveProgress('cliche', {
+            isRunning: false,
+            text: `✅ ${modeTag}完成（${caller.modelLabel}）：字数 ${draftCheck.charCount} → ${afterChars} 字 · 八股 ${beforeScan.totalHits} → ${afterScan.totalHits} 处（初稿已保留为上一页 Swipe，可随时左右滑动对比，下方可展开完整 5 项诊断报告）。`,
+        });
+        await refreshReaderWidgets();
+        globalThis.toastr?.success?.(
+            `第 ${chapterIndex || '?'} 章深度重塑完成（${afterChars} 字 · 八股 ${beforeScan.totalHits}→${afterScan.totalHits}），初稿已保留在上一页！`,
+            '小说续写阅读器',
+        );
+    } catch (error) {
+        updateLiveProgress('cliche', {
+            isRunning: false,
+            isError: true,
+            text: `❌ ${modeTag}未覆盖原稿：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`深度重塑失败（原初稿已保留）：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        deepRewriteInFlight = false;
+    }
+}
+
 async function runSurgicalDeclicheLatestTask() {
     const status = getLatestClicheStatus();
     if (!status.hasContinuedFloor) {
@@ -1323,22 +1635,32 @@ async function runSurgicalDeclicheLatestTask() {
         return;
     }
 
+    const context = getContext();
+    const msg = context?.chat?.[status.floorIndex];
+    if (!msg) return;
+
+    const rawOriginal = String(msg.mes || '');
+    const draftCheck = validateDraftForRewrite(rawOriginal);
+    if (!draftCheck.ok) {
+        updateLiveProgress('cliche', {
+            isRunning: false,
+            isError: true,
+            text: `🛡️ 已拦截局部精修：${draftCheck.reason}`,
+        });
+        globalThis.toastr?.warning?.(`🛡️ ${draftCheck.reason}`, '小说续写阅读器');
+        return;
+    }
+
     let caller;
     try {
-        caller = createPresetModelCaller();
+        caller = createPresetModelCaller({ role: 'rewrite' });
     } catch (err) {
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
 
-    const context = getContext();
-    const msg = context?.chat?.[status.floorIndex];
-    if (!msg) return;
-
     const ledger = await loadLedger();
-    const rawOriginal = String(msg.mes || '');
     const hadGameWrapper = /<game>[\s\S]*<\/game>/i.test(rawOriginal);
-    const storyOnly = stripNonStoryBlocks(rawOriginal).replace(/<\/?game>/gi, '').trim();
 
     updateLiveProgress('cliche', {
         isRunning: true,
@@ -1348,18 +1670,24 @@ async function runSurgicalDeclicheLatestTask() {
 
     try {
         const { systemPrompt, prompt } = buildSurgicalDeclichePrompt({
-            storyText: storyOnly,
+            storyText: draftCheck.storyText,
             scanReport: status.report,
             styleProfile: ledger.styleProfile,
             customBlacklistText: getSettings().clicheBlacklist,
         });
         const refinedRaw = await caller.callModel({ systemPrompt, prompt });
-        const refinedClean = stripNonStoryBlocks(refinedRaw).replace(/<\/?game>/gi, '').trim();
-        if (!refinedClean || refinedClean.length < Math.min(120, Math.floor(storyOnly.length * 0.3))) {
-            throw new Error('精修返回正文异常过短，已保留原稿未覆盖');
+        const refinedCheck = validateDraftForRewrite(refinedRaw, {
+            minChars: Math.min(120, Math.floor(draftCheck.charCount * 0.35)),
+        });
+        if (!refinedCheck.ok) {
+            throw new Error(`精修返回异常（${refinedCheck.reason}），已保留原稿未覆盖`);
         }
 
-        const finalMes = hadGameWrapper ? `<game>\n${refinedClean}\n</game>` : refinedClean;
+        const finalMes = hadGameWrapper ? `<game>\n${refinedCheck.storyText}\n</game>` : refinedCheck.storyText;
+        const liveFloorIdx = context.chat.indexOf(msg);
+        if (liveFloorIdx < 0) {
+            throw new Error('目标章节楼层已移除');
+        }
         if (!Array.isArray(msg.swipes) || msg.swipes.length === 0) {
             msg.swipes = [rawOriginal];
         }
@@ -1371,11 +1699,11 @@ async function runSurgicalDeclicheLatestTask() {
         msg.extra = msg.extra || {};
         msg.extra.novelClicheHits = afterScan.totalHits;
 
-        context.updateMessageBlock?.(status.floorIndex, msg);
+        context.updateMessageBlock?.(liveFloorIdx, msg);
         await context.saveChat?.();
         updateLiveProgress('cliche', {
             isRunning: false,
-            text: `✅ 精修完成！八股命中数由 ${status.report?.totalHits ?? 0} 处降至 ${afterScan.totalHits} 处（原稿已自动保留在上一条 Swipe 分支，可随时左右切换）。`,
+            text: `✅ 局部去八股完成！八股命中数由 ${status.report?.totalHits ?? 0} 处降至 ${afterScan.totalHits} 处（原稿已自动保留在上一条 Swipe 分支，可随时左右切换）。`,
         });
         await refreshReaderWidgets();
         globalThis.toastr?.success?.(
@@ -1582,12 +1910,14 @@ export async function init() {
         },
         onResynthArchive: runResynthArchiveTask,
         onFetchCustomModels: fetchCustomApiModels,
+        onFetchRewriteCustomModels: fetchRewriteCustomModels,
         onRunStyleDistill: runStyleDistillTask,
         onCompressStyleCard: runCompressStyleCardTask,
         onGenerateDirectorOutline: runGenerateDirectorOutlineTask,
         onApplyOutlineToChat: applyDirectorOutlineToChatInput,
         getLatestChapterAnchorInfo,
         onRunDeclicheLatest: runSurgicalDeclicheLatestTask,
+        onRunDeepRewriteLatest: (opts) => runDeepRewriteLatestTask({ triggerSource: 'manual', ...(opts || {}) }),
         onConnectBridge: (url) => {
             settings.remoteBridgeUrl = url;
             saveExtensionSettings();

@@ -152,7 +152,7 @@ function mountWorkbenchModal() {
                 <button type="button" class="tt-novel-wb-tab" data-tab="memory">📚 剧情与人物</button>
                 <button type="button" class="tt-novel-wb-tab" data-tab="outline">🎬 导演大纲</button>
                 <button type="button" class="tt-novel-wb-tab" data-tab="style">🎨 文风蒸馏</button>
-                <button type="button" class="tt-novel-wb-tab" data-tab="cliche">🧹 反八股<span id="tt-novel-tab-cliche-dot" class="tt-novel-tab-dot displayNone"></span></button>
+                <button type="button" class="tt-novel-wb-tab" data-tab="cliche">🩺 精修重塑<span id="tt-novel-tab-cliche-dot" class="tt-novel-tab-dot displayNone"></span></button>
                 <button type="button" class="tt-novel-wb-tab" data-tab="toc">📑 目录</button>
                 <button type="button" class="tt-novel-wb-tab" data-tab="settings">⚙️ 设置</button>
             </nav>
@@ -308,10 +308,12 @@ function renderWorkbench() {
             : '📖 小说续写工作台';
     }
     if (subEl) {
+        const settings = handlers.getSettings?.() || {};
         const chPart = cachedNovelData?.totalChapters
             ? `锚点 #${cachedNovelData.cutoffChapterIndex}/${cachedNovelData.totalChapters} · `
             : '';
-        subEl.textContent = `${chPart}模型：${meta.activeModel || '当前酒馆模型'} · 预设：${meta.presetLabel || '当前酒馆预设'}`;
+        const autoTag = settings.autoDeepRewrite ? ' · ⚡自动重塑已开' : '';
+        subEl.textContent = `${chPart}模型：${meta.activeModel || '当前酒馆模型'} · 预设：${meta.presetLabel || '当前酒馆预设'}${autoTag}`;
     }
 
     document.querySelectorAll('#tt-novel-wb-tabs .tt-novel-wb-tab').forEach(btn => {
@@ -1158,22 +1160,109 @@ function renderStyleTab(bodyEl) {
 }
 
 /* ==========================================================================
-   TAB 3: 🧹 反八股体检 (Zero-API Cliché Scanner + Surgical De-Cliché)
+   TAB 3: 🩺 精修重塑 (Auto/Manual 5-Step Deep Rewrite + Zero-API Cliché Audit)
    ========================================================================== */
 function renderClicheTab(bodyEl) {
     const settings = handlers.getSettings?.() || {};
+    const meta = handlers.getRuntimeMeta?.() || {};
     const status = handlers.getLatestClicheStatus?.() || { hasContinuedFloor: false, report: null };
     const task = liveTaskState.cliche;
     const report = status.report;
+    const lastRewrite = cachedLedger?.latestRewriteReport || null;
+
+    const rewriteMode = ['bg', 'tavern_override', 'custom'].includes(settings.rewriteModelMode)
+        ? settings.rewriteModelMode
+        : 'bg';
+    const tavernModels = Array.isArray(meta.tavernModels) ? meta.tavernModels : [];
+    const savedRewriteTavernModel = String(settings.rewriteTavernModel || '');
+    const rewriteCustomModels = Array.isArray(settings.rewriteCustomApiModelsCache) ? settings.rewriteCustomApiModelsCache : [];
+    const savedRewriteCustomModel = String(settings.rewriteCustomApiModel || '');
 
     const progressHtml = task.text
         ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
         : '';
 
-    let summaryHtml = '<div class="tt-novel-empty">当前尚未生成 AI 续写章节。续写完成后，插件会在本地 0 API 自动扫描高频八股词。</div>';
+    let rewriteModelConfigHtml = `<div class="tt-novel-muted">当前重塑将跟随后台设置：<code>${escapeHtml(meta.activeModel || '当前酒馆模型')}</code> · 预设：<code>${escapeHtml(meta.presetLabel || '当前酒馆预设')}</code></div>`;
+    if (rewriteMode === 'tavern_override') {
+        const selectHtml = tavernModels.length > 0
+            ? `
+                <select id="tt-novel-rw-tavern-select" class="text_pole">
+                    <option value="">-- 从酒馆当前连接已拉取模型中速选（${tavernModels.length}个）--</option>
+                    ${tavernModels.map(m => `<option value="${escapeHtml(m)}" ${m === savedRewriteTavernModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+                </select>
+            `
+            : '';
+        rewriteModelConfigHtml = `
+            <div class="tt-novel-custom-api-box">
+                <div class="tt-novel-edit-grid">
+                    <div class="tt-novel-muted">💡 复用酒馆当前接口地址与密钥，只在重写这一步临时切换模型名（例如主聊天用 <code>Gemini4h</code> 写初稿，此处填 <code>Gemini4a / gemini-4-argon</code> 自动重写）。</div>
+                    <label>重塑专用模型名（直接手填或从下方速选）：
+                        <input type="text" id="tt-novel-rw-tavern-model" class="text_pole" placeholder="例如 gemini-4-argon / gemini-2.5-pro" value="${escapeHtml(savedRewriteTavernModel)}" />
+                    </label>
+                    ${selectHtml}
+                </div>
+            </div>
+        `;
+    } else if (rewriteMode === 'custom') {
+        const customSelectHtml = rewriteCustomModels.length > 0
+            ? `
+                <select id="tt-novel-rw-custom-select" class="text_pole">
+                    <option value="">-- 从已拉取列表速选重塑模型（${rewriteCustomModels.length}个）--</option>
+                    ${rewriteCustomModels.map(m => `<option value="${escapeHtml(m)}" ${m === savedRewriteCustomModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+                </select>
+            `
+            : '';
+        rewriteModelConfigHtml = `
+            <div class="tt-novel-custom-api-box">
+                <div class="tt-novel-edit-grid">
+                    <label>独立重塑 Base URL（留空则自动复用「设置」里的自定义 API 地址）：
+                        <input type="text" id="tt-novel-rw-custom-url" class="text_pole" placeholder="${escapeHtml(settings.bgCustomApiUrl || 'https://api.example.com/v1')}" value="${escapeHtml(settings.rewriteCustomApiUrl || '')}" />
+                    </label>
+                    <label>独立重塑 API Key（留空则自动复用「设置」里的 Key）：
+                        <div class="tt-novel-bridge-row">
+                            <input type="password" id="tt-novel-rw-custom-key" class="text_pole" placeholder="sk-...（可留空继承）" value="${escapeHtml(settings.rewriteCustomApiKey || '')}" />
+                            <button type="button" id="tt-novel-rw-toggle-key" class="menu_button tt-novel-btn-sm" title="显示/隐藏 Key">👁️</button>
+                        </div>
+                    </label>
+                    <label>重塑模型名称（可点右侧拉取或直接手填）：
+                        <div class="tt-novel-bridge-row">
+                            <input type="text" id="tt-novel-rw-custom-model" class="text_pole" placeholder="例如 gemini-4-argon / claude-sonnet-4" value="${escapeHtml(savedRewriteCustomModel)}" />
+                            <button type="button" id="tt-novel-rw-fetch-models" class="menu_button tt-novel-btn-sm">🔄 拉取模型</button>
+                        </div>
+                    </label>
+                    ${customSelectHtml}
+                </div>
+            </div>
+        `;
+    }
+
+    const latestRewriteHtml = lastRewrite
+        ? `
+            <details class="tt-novel-round-card" open>
+                <summary class="tt-novel-round-head">
+                    <span><strong>🩺 第 ${lastRewrite.chapterIndex || '?'} 章深度诊断与台词排雷报告</strong> <span class="tt-novel-muted">(${escapeHtml(lastRewrite.modelLabel || '')})</span></span>
+                    <span class="tt-novel-chip is-ok">${lastRewrite.beforeChars || 0}→${lastRewrite.afterChars || 0}字 · 八股 ${lastRewrite.beforeCliches ?? 0}→${lastRewrite.afterCliches ?? 0}</span>
+                </summary>
+                <div class="tt-novel-round-body">
+                    ${lastRewrite.driftSummary ? `
+                        <div class="tt-novel-diff-box" style="border-left-color: #4ac4b7;">
+                            <div class="tt-novel-mini-label">📊 初稿 0-API 客观文风骨相体检</div>
+                            <div class="tt-novel-pre-wrap">${escapeHtml(lastRewrite.driftSummary)}</div>
+                        </div>
+                    ` : ''}
+                    <div class="tt-novel-diff-box">
+                        <div class="tt-novel-mini-label">🔍 5 项病灶诊断、原台词排雷与执行蓝图（仅展示于此，绝不污染聊天楼层；初稿保留在上一页 Swipe）</div>
+                        <div class="tt-novel-pre-wrap">${escapeHtml(lastRewrite.diagnosisPre || '（本次重写模型未单独输出 <pre> 诊断段落，已直接写入纯净正文）')}</div>
+                    </div>
+                </div>
+            </details>
+        `
+        : '';
+
+    let summaryHtml = '<div class="tt-novel-empty">当前尚未生成 AI 续写章节。续写完成后，插件会在本地 0 API 自动扫描高频八股词；若开启上方自动重塑，会在校验非空回、非道歉后自动调用指定模型推翻重塑。</div>';
     if (status.hasContinuedFloor && report) {
         if (report.totalHits === 0) {
-            summaryHtml = `<div class="tt-novel-banner is-ok">✅ 最新续写章节（第 ${status.chapterIndex} 章 / 楼层 #${status.floorIndex}）体检通过：未检出任何高频网文八股！</div>`;
+            summaryHtml = `<div class="tt-novel-banner is-ok">✅ 最新续写章节（第 ${status.chapterIndex} 章 / 楼层 #${status.floorIndex}）八股体检通过：未检出任何高频网文八股！</div>`;
         } else {
             summaryHtml = `
                 <div class="tt-novel-banner is-warn">
@@ -1192,13 +1281,44 @@ function renderClicheTab(bodyEl) {
     }
 
     bodyEl.innerHTML = `
-        <div class="tt-novel-action-bar">
-            <button type="button" id="tt-novel-cliche-rescan" class="menu_button">🔍 重新扫描最新章 (0 API)</button>
-            <button type="button" id="tt-novel-cliche-fix" class="menu_button tt-novel-btn-primary" ${task.running || !status.hasContinuedFloor ? 'disabled' : ''}>
-                🧹 一键局部去八股精修 (1次API · 套预设 · 不改剧情)
-            </button>
-        </div>
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">⚡ 一键深度诊断 · 推翻重塑配置（支持双模型接力 + 空回/道歉自动拦截）</div>
+            <label class="checkbox_label">
+                <input type="checkbox" id="tt-novel-rw-auto-toggle" ${settings.autoDeepRewrite ? 'checked' : ''} />
+                <span><b>开启「续写完成后自动深度诊断 · 推翻重塑本章」</b></span>
+            </label>
+            <div class="tt-novel-muted">
+                开启后流程：主模型写完初稿 → <b>0-API 自动验空回/验道歉</b>（空回或道歉立刻拦截，绝不白扣重写费用）→ 校验通过后自动用下方指定模型跑 5 项 <code>&lt;pre&gt;</code> 诊断并推翻重写，初稿自动保留为上一页 Swipe 方便左右滑动对比。
+            </div>
+            <div class="tt-novel-inline-field">
+                <span>重塑专用模型来源：</span>
+                <select id="tt-novel-rw-mode" class="text_pole" style="max-width: 260px;">
+                    <option value="bg" ${rewriteMode === 'bg' ? 'selected' : ''}>跟随后台任务 API 设置</option>
+                    <option value="tavern_override" ${rewriteMode === 'tavern_override' ? 'selected' : ''}>复用酒馆当前连接 · 仅换模型名（推荐双模型）</option>
+                    <option value="custom" ${rewriteMode === 'custom' ? 'selected' : ''}>独立自定义 API / 模型</option>
+                </select>
+            </div>
+            ${rewriteModelConfigHtml}
+            <div class="tt-novel-muted">当前生效重塑通道：<code>${escapeHtml(meta.rewriteModelLabel || meta.activeModel || '当前酒馆模型')}</code> · 预设：<code>${escapeHtml(meta.presetLabel || '当前酒馆预设')}</code></div>
+        </section>
+
+        <section class="tt-novel-section tt-novel-card">
+            <div class="tt-novel-section-title">🔥 手动触发重塑或精修最新续写章</div>
+            <input type="text" id="tt-novel-rw-extra" class="text_pole" placeholder="可选：本轮临时额外指定重点（如：压短凯尔希台词 / 加强信息差张力 / 拆短长段落）..." />
+            <div class="tt-novel-action-bar">
+                <button type="button" id="tt-novel-deep-rewrite-now" class="menu_button tt-novel-btn-primary" ${task.running || !status.hasContinuedFloor ? 'disabled' : ''}>
+                    🔥 深度诊断 · 推翻重塑本章 (1次API · 保留初稿)
+                </button>
+                <button type="button" id="tt-novel-cliche-fix" class="menu_button" ${task.running || !status.hasContinuedFloor ? 'disabled' : ''}>
+                    🧹 轻量局部去八股微调
+                </button>
+                <button type="button" id="tt-novel-cliche-rescan" class="menu_button">🔍 重新体检 (0 API)</button>
+            </div>
+        </section>
+
         ${progressHtml}
+        ${latestRewriteHtml}
+
         <section class="tt-novel-section">
             <div class="tt-novel-section-title">📋 最新续写章节八股体检报告</div>
             ${summaryHtml}
@@ -1213,6 +1333,72 @@ function renderClicheTab(bodyEl) {
         </section>
     `;
 
+    bodyEl.querySelector('#tt-novel-rw-auto-toggle')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('autoDeepRewrite', Boolean(e.target.checked));
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rw-mode')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('rewriteModelMode', String(e.target.value || 'bg'));
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rw-tavern-model')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('rewriteTavernModel', String(e.target.value || '').trim());
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rw-tavern-select')?.addEventListener('change', (e) => {
+        const picked = String(e.target.value || '').trim();
+        if (!picked) return;
+        handlers.onUpdateSetting?.('rewriteTavernModel', picked);
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rw-custom-url')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('rewriteCustomApiUrl', String(e.target.value || '').trim());
+    });
+    bodyEl.querySelector('#tt-novel-rw-custom-key')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('rewriteCustomApiKey', String(e.target.value || '').trim());
+    });
+    bodyEl.querySelector('#tt-novel-rw-toggle-key')?.addEventListener('click', () => {
+        const keyInput = bodyEl.querySelector('#tt-novel-rw-custom-key');
+        if (keyInput) keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+    });
+    bodyEl.querySelector('#tt-novel-rw-custom-model')?.addEventListener('change', (e) => {
+        handlers.onUpdateSetting?.('rewriteCustomApiModel', String(e.target.value || '').trim());
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rw-custom-select')?.addEventListener('change', (e) => {
+        const picked = String(e.target.value || '').trim();
+        if (!picked) return;
+        handlers.onUpdateSetting?.('rewriteCustomApiModel', picked);
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rw-fetch-models')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const urlInput = bodyEl.querySelector('#tt-novel-rw-custom-url');
+        const keyInput = bodyEl.querySelector('#tt-novel-rw-custom-key');
+        if (urlInput) handlers.onUpdateSetting?.('rewriteCustomApiUrl', String(urlInput.value || '').trim());
+        if (keyInput) handlers.onUpdateSetting?.('rewriteCustomApiKey', String(keyInput.value || '').trim());
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ 拉取中...';
+        try {
+            const list = await handlers.onFetchRewriteCustomModels?.();
+            if (Array.isArray(list) && list.length > 0) {
+                globalThis.toastr?.success?.(`已拉取到 ${list.length} 个重塑模型！`, '小说续写阅读器');
+            } else {
+                globalThis.toastr?.warning?.('接口已连上，但未返回模型列表，可直接手动填写模型名', '小说续写阅读器');
+            }
+        } catch (err) {
+            globalThis.toastr?.error?.(`拉取重塑模型失败：${err?.message || err}`, '小说续写阅读器');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+    });
+
+    bodyEl.querySelector('#tt-novel-deep-rewrite-now')?.addEventListener('click', () => {
+        const extraDirective = String(bodyEl.querySelector('#tt-novel-rw-extra')?.value || '').trim();
+        handlers.onRunDeepRewriteLatest?.({ extraDirective });
+    });
     bodyEl.querySelector('#tt-novel-cliche-rescan')?.addEventListener('click', () => {
         renderWorkbench();
     });
@@ -1490,6 +1676,7 @@ function renderSettingsTab(bodyEl) {
             <label class="checkbox_label"><input type="checkbox" data-setting="hideReasoning" ${settings.hideReasoning !== false ? 'checked' : ''} /><span>隐藏「AI 思维链与思考批注框」</span></label>
             <label class="checkbox_label"><input type="checkbox" data-setting="authorMode" ${settings.authorMode !== false ? 'checked' : ''} /><span>开启「✍️ 作者境界」（屏蔽玩家 {{user}} 人设，将输入转为导演大纲）</span></label>
             <label class="checkbox_label"><input type="checkbox" data-setting="foldUserOutlineFloors" ${settings.foldUserOutlineFloors !== false ? 'checked' : ''} /><span>续写完成后自动折叠用户大纲楼层（楼层与章节 1:1 严格对齐）</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="autoDeepRewrite" ${settings.autoDeepRewrite ? 'checked' : ''} /><span>⚡ 续写完成后自动触发深度诊断重塑（带空回/道歉拦截，可在「🩺 精修重塑」指定独立重塑模型）</span></label>
             <label class="checkbox_label"><input type="checkbox" data-setting="enableAutoStateBlock" ${settings.enableAutoStateBlock ? 'checked' : ''} /><span>单次生成末尾自动产出总结、状态与伏笔更新（depth=0 强化 · 0 额外 API）</span></label>
             <label class="checkbox_label"><input type="checkbox" data-setting="syncToWorldInfo" ${settings.syncToWorldInfo ? 'checked' : ''} /><span>自动将提取的状态同步写入酒馆原生世界书</span></label>
         </section>

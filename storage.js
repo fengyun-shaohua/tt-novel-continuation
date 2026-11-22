@@ -31,6 +31,7 @@ export function createEmptyLedger() {
         archiveNeedsResynth: false,
         archiveProcessLog: [],
         draftOutline: null,
+        latestRewriteReport: null,
     };
 }
 
@@ -255,6 +256,7 @@ export async function loadLedger() {
         archiveNeedsResynth: Boolean(raw.archiveNeedsResynth),
         archiveProcessLog: rawLog,
         draftOutline: raw.draftOutline && typeof raw.draftOutline === 'object' ? raw.draftOutline : null,
+        latestRewriteReport: raw.latestRewriteReport && typeof raw.latestRewriteReport === 'object' ? raw.latestRewriteReport : null,
     };
 }
 

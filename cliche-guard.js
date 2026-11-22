@@ -213,6 +213,16 @@ export function validateDraftForRewrite(rawDraftText, { minChars = 120 } = {}) {
         };
     }
 
+    if (/^(?:\[(?:API\s*错误|错误|Error)\]|API\s*Error\s*:)/i.test(storyText) || /(?:安全连接失败：|请求地址:\s*https?:\/\/)/i.test(storyText)) {
+        return {
+            ok: false,
+            reasonCode: 'api_error',
+            reason: '检测到初稿为 API/网络报错提示而非小说正文，已自动拦截，未消耗重写 API',
+            storyText,
+            charCount,
+        };
+    }
+
     if (isModelRefusalText(storyText)) {
         return {
             ok: false,
@@ -384,7 +394,13 @@ export function buildDeepRewritePrompt({
         parts.push('', '【原著灵魂原文范例】：', String(ledger.styleProfile.goldenExcerpts).slice(0, 1000));
     }
 
-    parts.push('', `【待推翻重塑的上一轮初稿正文（共 ${cleanDraft.replace(/\s+/g, '').length} 字）】：`, cleanDraft);
+    parts.push(
+        '',
+        `【待推翻重塑的上一轮初稿正文（共 ${cleanDraft.replace(/\s+/g, '').length} 字）】：`,
+        cleanDraft,
+        '',
+        '【输出标签硬性提醒】：请严格先输出 `<pre>...</pre>`（仅放 5 项精准诊断与重写执行蓝图），紧接空一行后输出 `<content>...</content>`（仅放纯净小说正文，绝不要把“第一部分/深度诊断报告/第二部分”等审稿文字写进正文里）。',
+    );
 
     return {
         systemPrompt,
@@ -395,7 +411,8 @@ export function buildDeepRewritePrompt({
 
 /**
  * Parses `<pre>...</pre>` diagnosis and `<content>...</content>` rewritten prose from Deep Rewrite output,
- * enforcing strict post-rewrite refusal, empty, and truncation guards so broken rewrites never pollute chat swipes.
+ * with Markdown two-part fallback (`### 【第一部分：深度诊断报告】` / `### 【第二部分：...正文】` or `### 第 N 章`)
+ * and strict post-rewrite refusal, empty, leakage, and truncation guards.
  *
  * @param {string} rawOutput
  * @param {number} [originalStoryLength=0]
@@ -408,23 +425,51 @@ export function parseDeepRewriteResponse(rawOutput, originalStoryLength = 0) {
     }
 
     const preMatch = cleaned.match(/<pre\b[^>]*>([\s\S]*?)<\/pre>/i);
-    const diagnosisPre = preMatch ? preMatch[1].trim() : '';
+    let diagnosisPre = preMatch ? preMatch[1].trim() : '';
 
-    // Support both closed `<content>...</content>` and truncated unclosed trailing `<content>...`
+    // 1) Primary: explicit `<content>...</content>` (or truncated unclosed `<content>...`)
     const contentMatch = cleaned.match(/<content\b[^>]*>([\s\S]*?)(?:<\/content>|$)/i);
     let rewrittenContent = '';
     if (contentMatch && contentMatch[1].trim()) {
         rewrittenContent = contentMatch[1].trim();
     } else if (preMatch) {
-        // Fallback: everything after `</pre>` if model omitted `<content>` wrapper
+        // 2) Fallback: everything after `</pre>` when `<content>` wrapper was omitted
         const afterPreIdx = preMatch.index + preMatch[0].length;
         rewrittenContent = cleaned.slice(afterPreIdx).replace(/<\/?content\b[^>]*>/gi, '').trim();
     } else {
-        rewrittenContent = cleaned;
+        // 3) Fallback: Markdown two-part format (e.g. `### 【第一部分：深度诊断报告】 ... --- ### 【第二部分：...正文】`)
+        const part2HeadingRe = /(?:^|\n)(?:[-*_]{3,}\s*\n+)?[ \t]*(?:#{1,4}\s*|\*{2}\s*)?【?(?:第[二2]部分[：:\s]*[^\n]*|推翻重塑(?:后)?(?:的)?(?:完整)?(?:章节)?正文[^\n]*|重写(?:后)?(?:的)?(?:完整)?(?:章节)?正文[^\n]*|正式正文[^\n]*|最终正文[^\n]*)】?\*{0,2}[ \t]*(?:\n|$)/i;
+        const part2Match = cleaned.match(part2HeadingRe);
+        if (part2Match) {
+            diagnosisPre = cleaned.slice(0, part2Match.index).replace(/\n[-*_]{3,}\s*$/, '').trim();
+            rewrittenContent = cleaned.slice(part2Match.index + part2Match[0].length).trim();
+        } else {
+            // 4) Fallback: starts with diagnosis block then transitions into `### 第 N 章`
+            const looksLikeDiagLead = /^(?:#{1,4}\s*)?【?(?:第[一1]部分|深度诊断|病灶诊断|重写诊断|1\.\s*\*{0,2}(?:角色|人物))/i.test(cleaned);
+            if (looksLikeDiagLead) {
+                const chSplitRe = /\n(?:[-*_]{3,}\s*\n+)?(?=#{1,4}\s*第\s*[0-9一二三四五六七八九十百千]+\s*[章节回])/;
+                const chMatch = cleaned.match(chSplitRe);
+                if (chMatch) {
+                    diagnosisPre = cleaned.slice(0, chMatch.index).replace(/\n[-*_]{3,}\s*$/, '').trim();
+                    rewrittenContent = cleaned.slice(chMatch.index + chMatch[0].length).trim();
+                } else {
+                    throw new Error('重写模型仅输出了诊断报告、未分离出正文段落，已保留原初稿未覆盖');
+                }
+            } else {
+                rewrittenContent = cleaned;
+            }
+        }
     }
 
-    // Strip any accidental `<novel_state>` or nested wrapper from rewritten story prose
-    rewrittenContent = cleanDistillProse(rewrittenContent);
+    // Strip any accidental leading Part-2 wrapper heading, HTML comments, or nested shells from story prose
+    rewrittenContent = cleanDistillProse(rewrittenContent)
+        .replace(/^(?:#{1,4}\s*|\*{2}\s*)?【?(?:第[二2]部分[：:\s]*[^\n]*|推翻重塑(?:后)?(?:的)?(?:完整)?(?:章节)?正文[^\n]*|重写(?:后)?(?:的)?(?:完整)?(?:章节)?正文[^\n]*)】?\*{0,2}\s*\n+/i, '')
+        .trim();
+
+    if (/^(?:#{1,4}\s*)?【?(?:第[一1]部分|深度诊断报告|病灶诊断)/i.test(rewrittenContent)) {
+        throw new Error('检测到诊断报告混入正文开头且未能分离正文，已保留原初稿未覆盖');
+    }
+
     const rewrittenChars = rewrittenContent.replace(/\s+/g, '').length;
 
     if (!rewrittenContent || rewrittenChars === 0) {

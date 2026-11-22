@@ -294,9 +294,10 @@ export function selectDistillationSamples(chapters, cutoffChapterIndex) {
  */
 export function cleanDistillProse(rawText) {
     return stripNonStoryBlocks(rawText)
+        .replace(/<!--[\s\S]*?-->/g, '')
         .replace(/^```(?:xml|html|markdown|md|txt)?\s*\n?/i, '')
         .replace(/\n?```\s*$/i, '')
-        .replace(/<\/?(?:soliumbra_reply|game|reply|output)\b[^>]*>/gi, '')
+        .replace(/<\/?(?:soliumbra_reply|game|reply|output|think|think_nya|thinking|thought|cot|reasoning)\b[^>]*>/gi, '')
         .trim();
 }
 

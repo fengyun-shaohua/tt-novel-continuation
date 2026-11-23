@@ -8,7 +8,7 @@
 
 import { stripNonStoryBlocks } from './parser.js';
 import { isModelRefusalText } from './story-archiver.js';
-import { cleanDistillProse } from './style-distiller.js';
+import { cleanDistillProse, throwIfAborted } from './style-distiller.js';
 
 const PACE_LABELS = Object.freeze({
     slow: '温水煮青蛙（稳步铺垫、日常推进与暗线反差，放大信息差，暂不彻底摊牌）',
@@ -20,9 +20,19 @@ const PACE_LABELS = Object.freeze({
  * Resolves the latest chapter ending (either latest continued chapter or cutoff original chapter)
  * so the Director Outline always connects seamlessly to the exact last sentence.
  */
-export function resolveLatestChapterAnchor(novelData, continuedChapters = []) {
+export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { excludeFlashback = true } = {}) {
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
-    const origCutoffCh = (novelData?.chapters || []).find(c => c && Number(c.index) === cutoff) || null;
+    const eligibleOriginals = (novelData?.chapters || [])
+        .filter(c => {
+            if (!c || Number(c.index) > cutoff) return false;
+            if (c.timelineRole === 'skip') return false;
+            if (excludeFlashback && c.timelineRole === 'flashback') return false;
+            return true;
+        })
+        .sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
+    const origCutoffCh = eligibleOriginals.length > 0
+        ? eligibleOriginals[eligibleOriginals.length - 1]
+        : ((novelData?.chapters || []).find(c => c && Number(c.index) === cutoff) || null);
     const sortedContinued = [...(continuedChapters || [])]
         .filter(c => c && String(c.content || '').trim())
         .sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
@@ -145,8 +155,16 @@ export function buildDirectorOutlinePrompt({
     sceneCount = 4,
     chapterCount = 1,
     paceMode = 'slow',
+    worldInfoContext = '',
 }) {
-    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters);
+    const narrativeCfg = ledger?.narrativeConfig || {};
+    const excludeFlashback = narrativeCfg.excludeFlashbackFromAnchor !== false;
+    const strictPov = narrativeCfg.povMode === 'strict_limited' && Boolean(String(narrativeCfg.povCharacter || '').trim());
+    const povChar = strictPov ? String(narrativeCfg.povCharacter).trim() : '';
+    const povPersonLabel = narrativeCfg.povPerson === 'first_person'
+        ? '第一人称限制视角'
+        : (narrativeCfg.povPerson === 'third_limited' ? '第三人称限制视角' : '跟随原著人称的限制视角');
+    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback });
     const targetChapters = Math.max(1, Math.min(8, Number(chapterCount) || 1));
     const targetScenes = Math.max(2, Math.min(6, Number(sceneCount) || 4));
     const paceDesc = PACE_LABELS[paceMode] || PACE_LABELS.slow;
@@ -166,7 +184,13 @@ export function buildDirectorOutlinePrompt({
         '2. 只写【时间地点、出场人物、客观事件节拍、对话试探焦点、关键信息差、微动作切入点】，严禁在大纲里塞入网文八股情绪形容词（严禁写“邪魅霸道、声音沙哑、喉结滚动、空气仿佛凝固、一丝不易察觉”等词，以免污染下游执笔模型的文风）！',
         '3. 每个登场人物的反应与说话方式必须 100% 遵循《核心人物防 OOC 档案》——寡言角色就安排极简短句或沉默动作，松弛算计角色绝不写成阴鸷霸总！',
         '4. 若一次规划多章，必须合理拆解节奏与递进层次（起承转合、章末留钩、下章紧接上章结尾，绝不把所有剧情和伏笔堆在第 1 章写完，也不得重复水戏）！',
-        '5. 严格按要求的 `<chapter_outline index="章号" title="章节简短标题">...</chapter_outline>` 标签输出每一章，不要输出额外寒暄或解释。',
+        ...(strictPov ? [
+            `5. 【严格单视角（Limited POV）铁律】：全部分镜必须严格锁定在「${povChar}」的${povPersonLabel}感官、行踪与可达信息范围内！严禁安排「${povChar}既不在场、也无录像/通讯/第三人转述渠道」的他人独处密室镜头；幕后阴谋只能通过「${povChar}」可察觉的破绽、异常数据、人物微反应或收到的信息侧面呈现！`,
+        ] : []),
+        ...(narrativeCfg.strictTimelineOrder !== false ? [
+            '6. 【时间线单向推进红线】：严禁时间倒流或无新因果地重复规划编年史中已经完成过的同类重大桥段，每一章都必须在最新时间点之后向前推进！',
+        ] : []),
+        '7. 严格按要求的 `<chapter_outline index="章号" title="章节简短标题">...</chapter_outline>` 标签输出每一章，不要输出额外寒暄或解释。',
     ].join('\n');
 
     const parts = [
@@ -191,19 +215,46 @@ export function buildDirectorOutlinePrompt({
 
     const characters = Array.isArray(ledger?.characters) ? ledger.characters : [];
     if (characters.length > 0) {
-        parts.push('', '【核心人物灵魂与防 OOC 红线（大纲中所有人物行为必须严格遵守）】：');
+        parts.push('', '【核心人物灵魂、当前着装与防 OOC 红线（大纲中所有人物行为与衣着必须严格遵守）】：');
         for (const ch of characters.slice(0, 10)) {
+            const appearPart = ch.currentAppearance ? ` ｜ 当前外观/着装=${ch.currentAppearance}` : '';
             parts.push(
-                `- ${ch.name}${ch.role ? `（${ch.role}）` : ''}：当前处境=${ch.currentSituation || '见前文'} ｜ 真实言行=${ch.voiceAndQuotes || '见原著'} ｜ 🚫OOC红线=${ch.oocRedLines || '严格贴合原著'}`,
+                `- ${ch.name}${ch.role ? `（${ch.role}）` : ''}：当前处境=${ch.currentSituation || '见前文'}${appearPart} ｜ 真实言行=${ch.voiceAndQuotes || '见原著'} ｜ 🚫OOC红线=${ch.oocRedLines || '严格贴合原著'}`,
             );
         }
     }
 
-    const chronicle = Array.isArray(ledger?.chronicle) ? ledger.chronicle.slice(-12) : [];
-    if (chronicle.length > 0) {
-        parts.push('', '【近期剧情编年史与现有信息差】：');
-        for (const evt of chronicle) {
-            parts.push(`- (${evt.chapterRange}) ${evt.title}：${evt.summary}${evt.infoGap ? ` ｜ 信息差：${evt.infoGap}` : ''}`);
+    if (worldInfoContext && String(worldInfoContext).trim()) {
+        const wiRule = narrativeCfg.worldInfoPriority === 'wi_strict'
+            ? '严格遵循世界书中的角色外貌、常服着装与世界观硬设定，不得擅自改穿其他衣服或违背设定'
+            : '世界书提供世界观、能力与外貌底骨；若本小说正文已明确改写或剧情换装，则以小说最新状态为准，严禁混搭两套服饰';
+        parts.push(
+            '',
+            `【已激活酒馆世界书设定（${wiRule}）】：`,
+            String(worldInfoContext).trim(),
+        );
+    }
+
+    const allChronicle = Array.isArray(ledger?.chronicle) ? ledger.chronicle : [];
+    const mainChronicle = allChronicle.filter(e => e && e.timelinePhase !== 'flashback').slice(-12);
+    const flashbackChronicle = allChronicle.filter(e => e && e.timelinePhase === 'flashback').slice(-6);
+    if (mainChronicle.length > 0) {
+        parts.push('', strictPov
+            ? `【主线近期编年史（已发生且不可重复；仅「${povChar}已知」可直接入镜）】：`
+            : '【近期剧情编年史与现有信息差（已发生的重大节点严禁重复规划）】：');
+        for (const evt of mainChronicle) {
+            const knownPart = strictPov && evt.povKnown ? ` ｜ ${povChar}已知：${evt.povKnown}` : '';
+            const blindPart = strictPov && evt.povBlindspot ? ` ｜ 🔒幕后盲区（不可直接切视角写）：${evt.povBlindspot}` : '';
+            const gapPart = (!knownPart && !blindPart && evt.infoGap) ? ` ｜ 信息差：${evt.infoGap}` : '';
+            parts.push(`- (${evt.chapterRange}) ${evt.title}：${evt.summary}${knownPart}${blindPart}${gapPart}`);
+        }
+    }
+    if (flashbackChronicle.length > 0) {
+        parts.push('', strictPov
+            ? `【🔒 倒叙/他视角幕后逻辑黑盒（仅供维持逻辑一致性参考，严禁切去写「${povChar}」看不到的独处镜头，也严禁让「${povChar}」未卜先知）】：`
+            : '【倒叙/补完视角参考（时间已属过去，勿当成最新时间点往回倒退）】：');
+        for (const evt of flashbackChronicle) {
+            parts.push(`- (${evt.chapterRange}·倒叙/他视角) ${evt.title}：${evt.summary}`);
         }
     }
 
@@ -266,8 +317,11 @@ export async function generateDirectorOutline({
     sceneCount = 4,
     chapterCount = 1,
     paceMode = 'slow',
+    worldInfoContext = '',
     callModel,
+    signal = null,
 }) {
+    throwIfAborted(signal);
     if (typeof callModel !== 'function') {
         throw new Error('缺少可用的模型调用函数 callModel');
     }
@@ -281,6 +335,7 @@ export async function generateDirectorOutline({
         sceneCount,
         chapterCount,
         paceMode,
+        worldInfoContext,
     });
 
     const raw = await callModel({
@@ -288,6 +343,7 @@ export async function generateDirectorOutline({
         systemPrompt,
         prompt,
     });
+    throwIfAborted(signal);
 
     const cleanedRaw = cleanDistillProse(raw);
     const hasOutlineTags = /<(?:chapter_outline|director_outline)\b/i.test(cleanedRaw);

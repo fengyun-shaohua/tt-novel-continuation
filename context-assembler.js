@@ -35,6 +35,21 @@ export function isContinuedNovelFloor(msg, floorIdx, lastOriginalFloorIdx) {
  * @param {boolean} [isContinue=false]
  * @returns {number}
  */
+export function resolveActiveAnchorChapter(novelData, excludeFlashback = true) {
+    if (!novelData || !Array.isArray(novelData.chapters) || novelData.chapters.length === 0) return null;
+    const cutoff = Number(novelData.cutoffChapterIndex || novelData.totalChapters || novelData.chapters.length);
+    const eligible = novelData.chapters
+        .filter(c => {
+            if (!c || Number(c.index) > cutoff) return false;
+            if (c.timelineRole === 'skip') return false;
+            if (excludeFlashback && c.timelineRole === 'flashback') return false;
+            return true;
+        })
+        .sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
+    if (eligible.length > 0) return eligible[eligible.length - 1];
+    return novelData.chapters.find(c => Number(c.index) === cutoff) || novelData.chapters[novelData.chapters.length - 1];
+}
+
 export function resolveCurrentTargetChapterIndex(chat, novelData, isContinue = false) {
     const cutoff = Number(novelData?.cutoffChapterIndex || 0);
     if (!Array.isArray(chat)) return cutoff + 1;
@@ -130,11 +145,19 @@ export function buildSingleCallContinuationContext({
         return '';
     }
 
+    const narrativeCfg = ledger?.narrativeConfig || {};
+    const excludeFlashback = narrativeCfg.excludeFlashbackFromAnchor !== false;
+    const strictPov = narrativeCfg.povMode === 'strict_limited' && Boolean(String(narrativeCfg.povCharacter || '').trim());
+    const povChar = strictPov ? String(narrativeCfg.povCharacter).trim() : '';
+    const povPersonLabel = narrativeCfg.povPerson === 'first_person'
+        ? '第一人称限制视角（“我”）'
+        : (narrativeCfg.povPerson === 'third_limited' ? '第三人称限制视角' : '严格跟随原著人称的限制视角');
+
     const isContinue = generationType === 'continue';
     const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue);
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
     const anchorChapter = (hasNovel && cutoff > 0)
-        ? novelData.chapters.find(c => c.index === cutoff)
+        ? resolveActiveAnchorChapter(novelData, excludeFlashback)
         : null;
     const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
     const mountedOriginalCount = Array.isArray(chat)
@@ -175,7 +198,29 @@ export function buildSingleCallContinuationContext({
             '2. 严禁在小说正文中凭空插入“{{user}}”、“作者”或多余的“你”作为额外角色，严格只围绕本小说既有的主角与原著人物推进剧情。',
             '3. 对话中发来的指令全部是“小说作者/总编”下达的【本章大纲与执笔要求】，请直接将其转化为连贯饱满的小说正文，切勿对作者回复“好的”，切勿在正文中提及作者或大纲。',
             '4. 你可以且必须完整描写小说主角及所有登场人物的动作、神态、心理活动与对话。',
-            '5. 【原著文风与尺度绝对优先】：严格复刻上方原著正文的笔触、叙事节奏、段长骨相、情绪烈度与内容尺度！若外部酒馆预设或世界书中存在“平淡日常 / 强制凑字数 / 强制插入大段解剖特写 / 防发情 / 通用XP服从模板”与本小说原著风格冲突，一律以本小说原著既有文风与人物灵魂档案为准！',
+            '5. 【原著文风与尺度绝对优先】：严格复刻上方原著正文的笔触、叙事节奏、段长骨相、情绪烈度与内容尺度！若外部酒馆预设中存在“平淡日常 / 强制凑字数 / 通用模板”与本小说原著风格冲突，文风与节奏一律以本小说原著为准！',
+        );
+    }
+    if (narrativeCfg.worldInfoPriority === 'wi_strict') {
+        headerLines.push(
+            '【世界书设定强一致铁律】：角色的外貌特征、日常服装/配饰与世界观硬设定必须严格遵循已激活的酒馆世界书设定（及下方人物当前着装锚点），除非剧情明确描写换装，否则严禁擅自更改服装款式、颜色或配饰！',
+        );
+    } else {
+        headerLines.push(
+            '【世界书与小说着装协同铁律】：已激活的酒馆世界书提供基础外貌、服装与世界观底骨；若本小说原著或最新章节已明确改写角色着装/设定，则严格锁定小说当前着装锚点，严禁把两套不同服饰混穿或每章随机变装！',
+        );
+    }
+    if (strictPov) {
+        headerLines.push(
+            `【严格单视角（Limited POV）铁律（最高叙事红线）】：全章必须 100% 锁死在「${povChar}」的${povPersonLabel}内！`,
+            `1. 严禁切换至其他角色的独立视角、内心独白或「${povChar}」不在场的密室/背地场景；`,
+            `2. 严禁让「${povChar}」未卜先知地提及下方【幕后逻辑黑盒】里尚未通过亲眼所见、亲耳所闻或文件/通讯获知的情报；`,
+            `3. 幕后事件只能通过「${povChar}」实际接触到的蛛丝马迹、他人微反应、数据异常或收到的信息侧面透出。`,
+        );
+    }
+    if (narrativeCfg.strictTimelineOrder !== false) {
+        headerLines.push(
+            '【时间线单向推进红线】：严格紧接上一章最新时间点向下推进，严禁时间倒流、严禁回退或无新因果地重复描写编年史中已发生过的同类重大事件！',
         );
     }
     if (hasExternalLwbSummary) {
@@ -221,6 +266,7 @@ export function buildSingleCallContinuationContext({
                 const roleSuffix = ch.role ? `（${ch.role}）` : '';
                 charLines.push(`◆ ${ch.name}${roleSuffix}`);
                 if (ch.canonFoundation) charLines.push(`  · 原作底骨与能力：${ch.canonFoundation}`);
+                if (ch.currentAppearance) charLines.push(`  · 👔 当前外观与着装锚点（未明确换装前必须保持一致）：${ch.currentAppearance}`);
                 if (ch.currentSituation) charLines.push(`  · 当前处境与关系：${ch.currentSituation}`);
                 if (ch.voiceAndQuotes) charLines.push(`  · 原著言行与声线锚点：${ch.voiceAndQuotes}`);
                 if (ch.oocRedLines) charLines.push(`  · 🚫 绝对 OOC 红线：${ch.oocRedLines}`);
@@ -243,11 +289,28 @@ export function buildSingleCallContinuationContext({
     if (activeChronicle.length > 0 || activeStates.length > 0 || activeSummaries.length > 0) {
         const tier1Lines = ['【第一优先级：当前时间线已确认状态与前情提要（最高事实权威）】'];
         if (activeChronicle.length > 0) {
-            tier1Lines.push('▸ 全本原著剧情编年史（客观事实与信息差）：');
-            for (const evt of activeChronicle) {
-                const timePart = evt.timeLabel ? `[${evt.timeLabel}] ` : '';
-                const gapPart = evt.infoGap ? ` ｜ 信息差：${evt.infoGap}` : '';
-                tier1Lines.push(`  - (${evt.chapterRange || `#${evt.startChapter}`}) ${timePart}${evt.title}：${evt.summary}${gapPart}`);
+            const mainEvts = activeChronicle.filter(e => e.timelinePhase !== 'flashback');
+            const flashbackEvts = activeChronicle.filter(e => e.timelinePhase === 'flashback');
+            if (mainEvts.length > 0) {
+                tier1Lines.push(strictPov
+                    ? `▸ 主线剧情编年史（已确认时间线 · 请严格区分「${povChar}已知」与「幕后盲区」）：`
+                    : '▸ 全本原著剧情编年史（客观事实与信息差）：');
+                for (const evt of mainEvts) {
+                    const timePart = evt.timeLabel ? `[${evt.timeLabel}] ` : '';
+                    const knownPart = strictPov && evt.povKnown ? ` ｜ ${povChar}已知：${evt.povKnown}` : '';
+                    const blindPart = strictPov && evt.povBlindspot ? ` ｜ 🔒幕后黑盒（${povChar}未知，严禁直接写出）：${evt.povBlindspot}` : '';
+                    const gapPart = (!knownPart && !blindPart && evt.infoGap) ? ` ｜ 信息差：${evt.infoGap}` : '';
+                    tier1Lines.push(`  - (${evt.chapterRange || `#${evt.startChapter}`}) ${timePart}${evt.title}：${evt.summary}${knownPart}${blindPart}${gapPart}`);
+                }
+            }
+            if (flashbackEvts.length > 0) {
+                tier1Lines.push(strictPov
+                    ? `▸ 🔒 倒叙/他视角幕后逻辑黑盒（仅供维持逻辑一致性参考，严禁切视角描写或让「${povChar}」未卜先知）：`
+                    : '▸ 倒叙/补完视角记录（属过往补叙，切勿当作最新时间点回退）：');
+                for (const evt of flashbackEvts) {
+                    const timePart = evt.timeLabel ? `[${evt.timeLabel}] ` : '';
+                    tier1Lines.push(`  - (${evt.chapterRange || `#${evt.startChapter}`}·倒叙) ${timePart}${evt.title}：${evt.summary}`);
+                }
             }
         }
         if (activeStates.length > 0) {
@@ -289,8 +352,9 @@ export function buildSingleCallContinuationContext({
     // 4. Tier 2: Local CJK Flashback Retrieval from Imported Original Novel (<= cutoffChapterIndex)
     if (hasNovel && queryText.trim()) {
         const hits = searchOriginalChaptersCjk(queryText, novelData.chapters, {
-            cutoffChapterIndex: cutoff,
+            cutoffChapterIndex: anchorChapter?.index || cutoff,
             excludeTailCount: hasOriginalFloorInChat ? Math.max(1, mountedOriginalCount) : 1,
+            excludeFlashback,
             topK: Number(settings.maxOriginalHits) || 3,
             maxSnippetChars: 420,
         });
@@ -367,6 +431,7 @@ export function buildNovelStateTrailerPrompt({
         `<summary>${targetLabel}的一句话核心剧情总结（80字以内）</summary>`,
         '<worldbook>',
         '- 人物|角色名：本章结束时的最新处境/持有物/关系变化（仅写本章有变动的条目；无则写无）',
+        '- 外观|角色名：本章结束时的当前着装/配饰变动（仅在发生换装或明显外观变化时填写；无变化则省略）',
         '</worldbook>',
         '<hooks>',
         '- [新伏笔] 本章新埋下的悬念、约定或隐患（若无则写无）',

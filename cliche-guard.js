@@ -154,7 +154,14 @@ export function buildAntiClichePromptGuidance(customBlacklistText = '') {
  *   customBlacklistText?: string,
  * }} params
  */
-export function buildSurgicalDeclichePrompt({ storyText, scanReport, styleProfile = null, customBlacklistText = '' }) {
+export function buildSurgicalDeclichePrompt({
+    storyText,
+    scanReport,
+    styleProfile = null,
+    customBlacklistText = '',
+    worldInfoContext = '',
+    narrativeConfig = null,
+}) {
     const flaggedLines = (scanReport?.hits || [])
         .slice(0, 24)
         .map((h, i) => `${i + 1}. 命中【${h.matchedText}】→ 原句片段：${h.snippet}`)
@@ -180,6 +187,19 @@ export function buildSurgicalDeclichePrompt({ storyText, scanReport, styleProfil
     }
     if (styleProfile?.goldenExcerpts) {
         promptParts.push('', '【原著灵魂原文范例（模仿其简洁节奏）】：', String(styleProfile.goldenExcerpts).slice(0, 1400));
+    }
+    if (worldInfoContext && String(worldInfoContext).trim()) {
+        promptParts.push(
+            '',
+            `【已激活酒馆世界书设定（精修时严禁擅自改动角色外貌、服装与世界观专有设定）】：`,
+            String(worldInfoContext).trim().slice(0, 6000),
+        );
+    }
+    if (narrativeConfig?.povMode === 'strict_limited' && narrativeConfig?.povCharacter) {
+        promptParts.push(
+            '',
+            `【单视角保护】：本书严格锁定「${narrativeConfig.povCharacter}」视角，精修时严禁引入其他人物的内心独白或上帝视角旁白。`,
+        );
     }
 
     promptParts.push('', '【待精修章节正文】：', String(storyText || '').trim());
@@ -292,7 +312,12 @@ export function buildDeepRewritePrompt({
     scanReport = null,
     customBlacklistText = '',
     extraDirective = '',
+    worldInfoContext = '',
+    narrativeConfig = null,
 }) {
+    const activeCfg = narrativeConfig || ledger?.narrativeConfig || {};
+    const strictPov = activeCfg.povMode === 'strict_limited' && Boolean(String(activeCfg.povCharacter || '').trim());
+    const povChar = strictPov ? String(activeCfg.povCharacter).trim() : '';
     const cleanDraft = cleanDistillProse(draftText);
     const driftSummary = buildDraftDriftSummary(cleanDraft, ledger?.styleProfile);
     const flaggedCliches = (scanReport?.hits || [])
@@ -320,7 +345,9 @@ export function buildDeepRewritePrompt({
         '   - 诊断初稿是否只是机械照念大纲、原地水戏或落入廉价桥段。',
         '   - 在不破坏上章承接、不篡改本章大纲既定结果的前提下，构思 1-2 个合乎情理的细节变量（如环境反作用、小插曲、角色私心与顾虑，或更巧妙的切镜视角），让场景自然生长。',
         '',
-        '4. 设定融入与文风骨相（去科普、去 AI 味、对齐原著段长）',
+        '4. 设定融入、着装与文风骨相（查世界书一致、去科普、去 AI 味、对齐原著段长）',
+        '   - 核对初稿中人物的外貌、日常着装/配饰及世界观设定是否与下方《已激活酒馆世界书》及《角色当前外观与着装锚点》保持一致，严禁擅自变装或混搭不同服饰！',
+        ...(strictPov ? [`   - 核查严格单视角边界：严禁出现「${povChar}」不在场的他人独处镜头、其他角色内心独白或未获知情报的未卜先知！`] : []),
         '   - 结合本地客观物理统计偏差与八股命中清单，排查生硬的“说明书式科普”、脱离原著骨相的冗长灌水段落。',
         '   - 清理高频网文套路（机械微表情模板、强行排比升华、过度堆砌比喻、结尾强行抛问句等）。',
         '',
@@ -371,12 +398,31 @@ export function buildDeepRewritePrompt({
 
     const characters = Array.isArray(ledger?.characters) ? ledger.characters : [];
     if (characters.length > 0) {
-        parts.push('', '【核心人物 4 维灵魂与防 OOC 档案（第 1、2 项诊断的硬裁判依据）】：');
+        parts.push('', '【核心人物 4 维灵魂、当前着装与防 OOC 档案（第 1、2、4 项诊断的硬裁判依据）】：');
         for (const ch of characters.slice(0, 8)) {
+            const appearPart = ch.currentAppearance ? ` ｜ 👔当前外观与着装=${ch.currentAppearance}` : '';
             parts.push(
-                `- ${ch.name}${ch.role ? `（${ch.role}）` : ''}：当前处境=${ch.currentSituation || '见前文'} ｜ 原著声线与原话=${ch.voiceAndQuotes || '见原著'} ｜ 🚫OOC红线=${ch.oocRedLines || '严格贴合原著'}`,
+                `- ${ch.name}${ch.role ? `（${ch.role}）` : ''}：当前处境=${ch.currentSituation || '见前文'}${appearPart} ｜ 原著声线与原话=${ch.voiceAndQuotes || '见原著'} ｜ 🚫OOC红线=${ch.oocRedLines || '严格贴合原著'}`,
             );
         }
+    }
+
+    if (worldInfoContext && String(worldInfoContext).trim()) {
+        const wiRule = activeCfg.worldInfoPriority === 'wi_strict'
+            ? '严格遵循世界书中的角色外貌、日常服装与世界观硬设定，重写时若初稿衣服/设定穿帮必须立刻纠偏'
+            : '世界书提供角色基础外貌与世界观底骨；若本小说已明确改写着装或剧情换装，则锁定人物当前着装锚点，严禁混搭两套衣服';
+        parts.push(
+            '',
+            `【已激活酒馆世界书设定（${wiRule}）】：`,
+            String(worldInfoContext).trim(),
+        );
+    }
+
+    if (strictPov) {
+        parts.push(
+            '',
+            `【严格单视角（Limited POV）硬红线】：全章必须 100% 锁定在「${povChar}」的感官与已知信息范围内！若初稿切去了他人独处视角、泄露了「${povChar}」不可能知道的幕后信息，重写时必须删改并重构为仅通过「${povChar}」可感知的细节与线索推进。`,
+        );
     }
 
     const chronicle = Array.isArray(ledger?.chronicle) ? ledger.chronicle.slice(-8) : [];

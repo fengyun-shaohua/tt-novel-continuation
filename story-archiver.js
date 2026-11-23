@@ -9,7 +9,7 @@
  * through `callModel` (which applies the chosen API + Tavern preset).
  */
 
-import { cleanDistillProse, runBoundedPool } from './style-distiller.js';
+import { cleanDistillProse, isAbortError, runBoundedPool, throwIfAborted } from './style-distiller.js';
 
 const REFUSAL_PATTERNS = [
     /抱歉[，,。!！\s]*(?:我)?(?:无法|不能|不便)/i,
@@ -104,7 +104,7 @@ export function planArchiveBatches(
     { startChapter = 1, endChapter = Infinity, targetBatchChars = 15000, maxBatches = 15 } = {},
 ) {
     const selected = (chapters || [])
-        .filter(c => c && Number(c.index) >= startChapter && Number(c.index) <= endChapter)
+        .filter(c => c && Number(c.index) >= startChapter && Number(c.index) <= endChapter && c.timelineRole !== 'skip')
         .sort((a, b) => a.index - b.index);
 
     if (selected.length === 0) return [];
@@ -112,6 +112,7 @@ export function planArchiveBatches(
     const normalized = selected.map(ch => ({
         index: Number(ch.index),
         title: String(ch.title || `第 ${ch.index} 章`),
+        timelineRole: ch.timelineRole === 'flashback' ? 'flashback' : 'main',
         content: cleanTagText(ch.content || ''),
     })).filter(ch => ch.content.length > 0);
 
@@ -127,7 +128,10 @@ export function planArchiveBatches(
     const flush = () => {
         if (bucket.length === 0) return;
         const text = bucket
-            .map(ch => `【第 ${ch.index} 章 · ${ch.title}】\n${ch.content}`)
+            .map(ch => {
+                const roleTag = ch.timelineRole === 'flashback' ? ' [倒叙/他视角补完]' : '';
+                return `【第 ${ch.index} 章 · ${ch.title}${roleTag}】\n${ch.content}`;
+            })
             .join('\n\n');
         batches.push({
             batchIndex: batches.length + 1,
@@ -166,9 +170,13 @@ export function parseChronicleEvents(rawText) {
         const title = extractInner(block, 'title');
         const range = extractInner(block, 'chapters') || extractInner(block, 'range');
         const timeLabel = extractInner(block, 'time');
+        const pov = extractInner(block, 'pov');
+        const timelinePhaseRaw = extractInner(block, 'timeline_phase');
         const participantsRaw = extractInner(block, 'participants');
         const summary = extractInner(block, 'summary');
         const infoGap = extractInner(block, 'info_gap');
+        const povKnown = extractInner(block, 'pov_known');
+        const povBlindspot = extractInner(block, 'pov_blindspot');
         if (!title && !summary) continue;
 
         const nums = [...range.matchAll(/\d+/g)].map(m => Number(m[0])).filter(n => n > 0);
@@ -177,6 +185,7 @@ export function parseChronicleEvents(rawText) {
         const participants = participantsRaw
             ? participantsRaw.split(/[、,，/｜|\s]+/).map(s => s.trim()).filter(Boolean)
             : [];
+        const timelinePhase = /flashback|倒叙|插叙|补完|外传|他视角/i.test(timelinePhaseRaw) ? 'flashback' : 'main';
 
         events.push({
             id: `evt_${startChapter}_${endChapter}_${i + 1}`,
@@ -185,9 +194,13 @@ export function parseChronicleEvents(rawText) {
             startChapter,
             endChapter,
             timeLabel: isPlaceholder(timeLabel) ? '' : timeLabel,
+            pov: isPlaceholder(pov) ? '' : pov,
+            timelinePhase,
             participants,
             summary: summary || title,
             infoGap: isPlaceholder(infoGap) ? '' : infoGap,
+            povKnown: isPlaceholder(povKnown) ? '' : povKnown,
+            povBlindspot: isPlaceholder(povBlindspot) ? '' : povBlindspot,
         });
     }
 
@@ -204,7 +217,7 @@ export function parseCharacterProfiles(rawText, updatedChapter = 1) {
     const characters = [];
     const seen = new Set();
 
-    const pushChar = ({ name, role, canonFoundation, currentSituation, voiceAndQuotes, oocRedLines }) => {
+    const pushChar = ({ name, role, canonFoundation, currentAppearance, currentSituation, voiceAndQuotes, oocRedLines }) => {
         const cleanName = String(name || '').replace(/^[#*\-\d.、\s]+/, '').replace(/[*：:]+$/, '').trim();
         if (!cleanName || isPlaceholder(cleanName) || cleanName.length > 36) return;
         const normKey = cleanName.toLowerCase();
@@ -216,6 +229,7 @@ export function parseCharacterProfiles(rawText, updatedChapter = 1) {
             name: cleanName,
             role: isPlaceholder(role) ? '' : String(role || '').trim(),
             canonFoundation: isPlaceholder(canonFoundation) ? '' : String(canonFoundation || '').trim(),
+            currentAppearance: isPlaceholder(currentAppearance) ? '' : String(currentAppearance || '').trim(),
             currentSituation: isPlaceholder(currentSituation) ? '' : String(currentSituation || '').trim(),
             voiceAndQuotes: isPlaceholder(voiceAndQuotes) ? '' : String(voiceAndQuotes || '').trim(),
             oocRedLines: isPlaceholder(oocRedLines) ? '' : String(oocRedLines || '').trim(),
@@ -228,6 +242,7 @@ export function parseCharacterProfiles(rawText, updatedChapter = 1) {
             name: extractInner(block, 'name'),
             role: extractInner(block, 'role'),
             canonFoundation: extractInner(block, 'canon_foundation'),
+            currentAppearance: extractInner(block, 'current_appearance'),
             currentSituation: extractInner(block, 'current_situation'),
             voiceAndQuotes: extractInner(block, 'voice_and_quotes'),
             oocRedLines: extractInner(block, 'ooc_red_lines'),
@@ -371,20 +386,34 @@ const SYNTH_SYSTEM_PROMPT = [
 /**
  * Reads a single chapter batch slice, inspects it for refusals/errors, and returns a persisted slice record.
  */
-export async function readSingleArchiveBatch({ novelTitle, batch, totalBatches, callModel }) {
+export async function readSingleArchiveBatch({
+    novelTitle,
+    batch,
+    totalBatches,
+    narrativeConfig = null,
+    callModel,
+    signal = null,
+}) {
+    throwIfAborted(signal);
+    const povChar = narrativeConfig?.povMode === 'strict_limited' && narrativeConfig?.povCharacter
+        ? String(narrativeConfig.povCharacter).trim()
+        : '';
     try {
         const raw = await callModel({
             stage: `archive_batch_${batch.batchIndex}`,
             systemPrompt: READER_SYSTEM_PROMPT,
             prompt: [
                 `正在对《${novelTitle || '小说'}》第 ${batch.startChapter}~${batch.endChapter} 章（切片 ${batch.batchIndex}/${totalBatches}，约 ${batch.charCount} 字）做高精度剧情事实梳理与人物建档。`,
-                '【硬性要求】：逐章/逐场如实写清具体发生了什么、人物态度与底线变化到哪一步、筹码/约定具体是什么、关键原话与信息差；严禁使用“亲密互动”“越界接触”“某些事情”等模糊词一笔带过！',
+                '【硬性要求】：逐章/逐场如实写清具体发生了什么、人物态度与底线变化到哪一步、筹码/约定具体是什么、关键原话、当前着装与信息差；严禁使用模糊词一笔带过！',
+                povChar
+                    ? `【单视角信息隔离重点】：本书锁定主视角人物为「${povChar}」。请注明每段剧情的叙事视角、属于主线推进还是倒叙/他视角补完，并写清「${povChar}明确已知的事实」与「${povChar}尚不知情的幕后盲区」。`
+                    : '',
                 '请从下方正文提炼 4 项精细笔记，严格使用以下标签输出：',
                 '<batch_events>',
-                '（按章节顺序详实列出本切片每个核心事件：具体章号 | 时间/地点 | 出场人物 | 具体发生了什么、关键对话/交易条件、人物底线或关系推进的具体结果 | 信息差/谁知情谁不知情）',
+                '（按章节顺序详实列出本切片每个核心事件：具体章号 | 叙事视角与时间线属性（主线/倒叙） | 时间/地点 | 出场人物 | 具体发生了什么、关键对话/交易条件、人物底线或关系推进的具体结果 | 信息差：谁知情、谁被蒙在鼓里）',
                 '</batch_events>',
                 '<batch_characters>',
-                '（逐个列出本切片登场的主要人物：姓名 | 身份与原作能力线索 | 本段具体关系进度、底线变化与筹码变动 | 2~3句最能体现声线的原著原话 | 真实性格底色与行为分寸观察）',
+                '（逐个列出本切片登场的主要人物：姓名 | 身份与原作能力线索 | 当前外观与常服/着装细节 | 本段具体关系进度、底线变化与筹码变动 | 2~3句最能体现声线的原著原话 | 真实性格底色与行为分寸观察）',
                 '</batch_characters>',
                 '<batch_hooks>',
                 '（本切片埋下的未解伏笔/约定/把柄/暗线，以及被回收解决的旧伏笔，注明具体章号）',
@@ -395,8 +424,9 @@ export async function readSingleArchiveBatch({ novelTitle, batch, totalBatches, 
                 '',
                 '【本切片原文】：',
                 batch.text,
-            ].join('\n'),
+            ].filter(Boolean).join('\n'),
         });
+        throwIfAborted(signal);
 
         const notes = cleanTagText(raw);
         const quality = inspectBatchExtractionQuality(notes);
@@ -412,6 +442,9 @@ export async function readSingleArchiveBatch({ novelTitle, batch, totalBatches, 
             updatedAt: Date.now(),
         };
     } catch (error) {
+        if (isAbortError(error) || signal?.aborted) {
+            throw error;
+        }
         return {
             batchIndex: batch.batchIndex,
             startChapter: batch.startChapter,
@@ -482,11 +515,19 @@ export async function synthesizeArchiveFromBatches({
     novelTitle,
     batches,
     existingLedger = null,
+    narrativeConfig = null,
+    worldInfoContext = '',
     mode = 'full',
     callModel,
     maxConcurrency = 2,
+    signal = null,
     onProgress = () => {},
 }) {
+    throwIfAborted(signal);
+    const activeCfg = narrativeConfig || existingLedger?.narrativeConfig || null;
+    const povChar = activeCfg?.povMode === 'strict_limited' && activeCfg?.povCharacter
+        ? String(activeCfg.povCharacter).trim()
+        : '';
     const okBatches = (batches || [])
         .filter(b => b && b.status === 'ok' && String(b.notes || '').trim())
         .sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0));
@@ -537,10 +578,16 @@ export async function synthesizeArchiveFromBatches({
                     '<event>',
                     `<chapters>#${winStart}-#${Math.min(winEnd, winStart + 4)}</chapters>`,
                     '<time>时间阶段或场景背景</time>',
+                    '<pov>本段实际叙事视角人物（如主视角/多视角/具体角色名）</pov>',
+                    '<timeline_phase>main（主线推进）或 flashback（倒叙/插叙/他视角补完）</timeline_phase>',
                     '<title>简短精准的事件标题</title>',
                     '<participants>人物A、人物B</participants>',
                     '<summary>150~300字详实、具体、不回避关键节点的经过、底线/关系变化、筹码变动与确切结果</summary>',
                     '<info_gap>当前关键信息差（例如：谁还不知道某事、谁暗中做了什么；无则写无）</info_gap>',
+                    ...(povChar ? [
+                        `<pov_known>「${povChar}」在此阶段明确亲眼/亲耳/经由文件通讯获知的事实（无则写无）</pov_known>`,
+                        `<pov_blindspot>「${povChar}」此时尚不知情、仅在幕后或他视角发生的事实（无则写无）</pov_blindspot>`,
+                    ] : []),
                     '</event>',
                     '</chronicle>',
                     '<hooks>',
@@ -581,15 +628,19 @@ export async function synthesizeArchiveFromBatches({
                     '<name>人物姓名</name>',
                     '<role>身份定位（简短一行）</role>',
                     '<canon_foundation>原作/游戏世界观硬设定底骨、专业能力、过往履历与性格底色</canon_foundation>',
+                    `<current_appearance>截至第${maxCoveredChapter}章的稳定外貌特征与当前常服/着装锚点（如发色瞳色、常穿服饰与配饰；若已激活世界书与本小说有差异，按设定优先级清晰写定一套，避免后续混穿）</current_appearance>`,
                     `<current_situation>在本小说当前时间线（截至第${maxCoveredChapter}章）的真实处境、底线演进进度、手中筹码、被掣肘之处与对各方的具体态度</current_situation>`,
                     '<voice_and_quotes>原著真实说话长度、寡言/碎碎念习惯、行动分寸与微表情特征；并直接摘录 2~3 句原著真实原话或内心独白</voice_and_quotes>',
                     '<ooc_red_lines>绝对 OOC 红线：明确指出最容易把该角色写崩的 2~4 个误区</ooc_red_lines>',
                     '</character>',
                     '</characters>',
                     '',
+                    worldInfoContext
+                        ? `\n【已激活酒馆世界书参考（设定优先级：${activeCfg?.worldInfoPriority === 'wi_strict' ? '严格遵循世界书外貌/服装与硬设定' : '世界书提供基础底骨，若小说正文已改写则以小说为准'}）】：\n${String(worldInfoContext).slice(0, 6000)}\n`
+                        : '',
                     '【全部正常切片分析笔记】：',
                     charNotesInput,
-                ].join('\n'),
+                ].filter(Boolean).join('\n'),
             });
 
             completedSynth += 1;
@@ -602,7 +653,8 @@ export async function synthesizeArchiveFromBatches({
         },
     ];
 
-    const results = await runBoundedPool(synthTasks, concurrency);
+    const results = await runBoundedPool(synthTasks, concurrency, { signal });
+    throwIfAborted(signal);
     const chronicleChunks = results.filter(r => r.kind === 'chronicle');
     const charactersRaw = results.find(r => r.kind === 'characters')?.raw || '';
 
@@ -683,11 +735,16 @@ export async function runStoryAndCharacterArchivePipeline({
     novelData,
     continuedChapters = [],
     existingLedger = null,
+    narrativeConfig = null,
+    worldInfoContext = '',
     mode = 'full',
     callModel,
     maxConcurrency = 2,
+    signal = null,
+    onSliceCompleted = null,
     onProgress = () => {},
 }) {
+    throwIfAborted(signal);
     if (typeof callModel !== 'function') {
         throw new Error('缺少可用的模型调用函数 callModel');
     }
@@ -743,8 +800,13 @@ export async function runStoryAndCharacterArchivePipeline({
             novelTitle: novelData?.title,
             batch,
             totalBatches: batchIndexOffset + batchesToRun.length,
+            narrativeConfig: narrativeConfig || existingLedger?.narrativeConfig || null,
             callModel,
+            signal,
         });
+        if (typeof onSliceCompleted === 'function') {
+            try { await onSliceCompleted(resultSlice); } catch { /* ignore incremental save error */ }
+        }
         completedSteps += 1;
         const statusIcon = resultSlice.status === 'ok' ? '✅' : (resultSlice.status === 'refused' ? '⚠️' : '❌');
         const entry = {
@@ -764,7 +826,8 @@ export async function runStoryAndCharacterArchivePipeline({
         return resultSlice;
     });
 
-    const newSliceResults = await runBoundedPool(batchTasks, concurrency);
+    const newSliceResults = await runBoundedPool(batchTasks, concurrency, { signal });
+    throwIfAborted(signal);
     const allSlices = [...existingBatches, ...newSliceResults].sort((a, b) => a.batchIndex - b.batchIndex);
     const failedCount = allSlices.filter(b => b.status !== 'ok').length;
 
@@ -772,9 +835,12 @@ export async function runStoryAndCharacterArchivePipeline({
         novelTitle: novelData?.title,
         batches: allSlices,
         existingLedger,
+        narrativeConfig: narrativeConfig || existingLedger?.narrativeConfig || null,
+        worldInfoContext,
         mode: isIncremental ? 'incremental' : 'full',
         callModel,
         maxConcurrency: concurrency,
+        signal,
         onProgress: ({ step, totalSteps: synthTotal, label, logEntry }) => {
             onProgress({
                 step: batchesToRun.length + step,
@@ -808,10 +874,13 @@ export async function rerunArchiveBatches({
     continuedChapters = [],
     existingBatches = [],
     targetBatchIndices = [],
+    narrativeConfig = null,
     callModel,
     maxConcurrency = 2,
+    signal = null,
     onProgress = () => {},
 }) {
+    throwIfAborted(signal);
     if (typeof callModel !== 'function') {
         throw new Error('缺少可用的模型调用函数 callModel');
     }
@@ -852,7 +921,9 @@ export async function rerunArchiveBatches({
                 text,
             },
             totalBatches,
+            narrativeConfig,
             callModel,
+            signal,
         });
         doneCount += 1;
         const icon = updated.status === 'ok' ? '✅' : (updated.status === 'refused' ? '⚠️' : '❌');
@@ -864,7 +935,8 @@ export async function rerunArchiveBatches({
         return updated;
     });
 
-    const refreshed = await runBoundedPool(tasks, concurrency);
+    const refreshed = await runBoundedPool(tasks, concurrency, { signal });
+    throwIfAborted(signal);
     const byIdx = new Map(existingBatches.map(b => [b.batchIndex, b]));
     for (const item of refreshed) {
         byIdx.set(item.batchIndex, item);

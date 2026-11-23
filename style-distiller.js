@@ -15,20 +15,58 @@
 import { stripNonStoryBlocks } from './parser.js';
 
 /**
+ * Creates a standardized AbortError used across all cancellable background pipelines.
+ * @param {string} [message='任务已被用户手动停止']
+ * @returns {Error}
+ */
+export function createAbortError(message = '任务已被用户手动停止') {
+    const err = new Error(message);
+    err.name = 'AbortError';
+    err.code = 'TASK_ABORTED';
+    return err;
+}
+
+/**
+ * Checks whether an error represents a user-initiated task cancellation.
+ * @param {any} err
+ * @returns {boolean}
+ */
+export function isAbortError(err) {
+    return Boolean(
+        err
+        && (err.name === 'AbortError' || err.code === 'TASK_ABORTED' || err.code === 20),
+    );
+}
+
+/**
+ * Throws an AbortError immediately when the given AbortSignal has been aborted.
+ * @param {AbortSignal | null | undefined} signal
+ */
+export function throwIfAborted(signal) {
+    if (signal?.aborted) {
+        throw createAbortError();
+    }
+}
+
+/**
  * Runs an array of async task factories with strict bounded concurrency (`<= maxConcurrency`).
+ * Supports cooperative cancellation via `{ signal }`: once aborted, workers stop pulling new tasks.
  *
  * @template T
  * @param {Array<() => Promise<T>>} taskFns
  * @param {number} [maxConcurrency=2]
+ * @param {{ signal?: AbortSignal | null }} [options]
  * @returns {Promise<T[]>}
  */
-export async function runBoundedPool(taskFns, maxConcurrency = 2) {
+export async function runBoundedPool(taskFns, maxConcurrency = 2, { signal = null } = {}) {
+    throwIfAborted(signal);
     const limit = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
     const results = new Array(taskFns.length);
     let nextIndex = 0;
 
     async function worker() {
         while (nextIndex < taskFns.length) {
+            throwIfAborted(signal);
             const current = nextIndex;
             nextIndex += 1;
             results[current] = await taskFns[current]();
@@ -37,6 +75,7 @@ export async function runBoundedPool(taskFns, maxConcurrency = 2) {
 
     const workers = Array.from({ length: Math.min(limit, taskFns.length) }, () => worker());
     await Promise.all(workers);
+    throwIfAborted(signal);
     return results;
 }
 
@@ -44,12 +83,12 @@ export async function runBoundedPool(taskFns, maxConcurrency = 2) {
  * Computes objective, deterministic statistical style metrics from chapters `1 .. cutoffChapterIndex`.
  * Zero API calls, zero hallucination.
  *
- * @param {Array<{ index: number, title: string, content: string }>} chapters
+ * @param {Array<{ index: number, title: string, content: string, timelineRole?: string }>} chapters
  * @param {number} cutoffChapterIndex
  */
 export function computeLocalStyleFingerprint(chapters, cutoffChapterIndex) {
     const allowed = (chapters || []).filter(
-        c => c && c.index >= 1 && (!cutoffChapterIndex || c.index <= cutoffChapterIndex),
+        c => c && c.index >= 1 && (!cutoffChapterIndex || c.index <= cutoffChapterIndex) && c.timelineRole !== 'skip',
     );
     const fullText = allowed.map(c => String(c.content || '')).join('\n\n').trim();
     const compact = fullText.replace(/\s+/g, '');
@@ -170,7 +209,7 @@ export function formatFingerprintText(fp) {
  */
 export function selectDistillationSamples(chapters, cutoffChapterIndex) {
     const allowed = (chapters || [])
-        .filter(c => c && c.index >= 1 && (!cutoffChapterIndex || c.index <= cutoffChapterIndex))
+        .filter(c => c && c.index >= 1 && (!cutoffChapterIndex || c.index <= cutoffChapterIndex) && c.timelineRole !== 'skip')
         .sort((a, b) => a.index - b.index);
 
     if (allowed.length === 0) {
@@ -620,8 +659,10 @@ export async function runStyleDistillationPipeline({
     rounds = 2,
     existingProfile = null,
     evaluateOnly = false,
+    signal = null,
     onProgress = () => {},
 }) {
+    throwIfAborted(signal);
     if (!novelData?.chapters?.length) {
         throw new Error('请先导入原著小说后再进行文风蒸馏');
     }
@@ -722,7 +763,7 @@ export async function runStyleDistillationPipeline({
                     trainTextCombined,
                 ].join('\n'),
             }),
-        ], concurrency);
+        ], concurrency, { signal });
 
         const syntaxNotes = stripNonStoryBlocks(anatomySyntaxRaw);
         const dialogueNotes = extractTaggedSection(anatomyDialogueRaw, 'dialogue_pacing');
@@ -798,7 +839,7 @@ export async function runStyleDistillationPipeline({
                     samples.holdouts[0].text,
                 ].join('\n'),
             }),
-        ], concurrency);
+        ], concurrency, { signal });
 
         currentStyleCard = extractTaggedSection(draftCardRaw, 'style_dna');
         preStrippedOutlines.set(0, stripNonStoryBlocks(dryOutline1Raw));
@@ -831,6 +872,7 @@ export async function runStyleDistillationPipeline({
     };
 
     for (let offset = 0; offset < loopCount; offset += 1) {
+        throwIfAborted(signal);
         const roundNum = startRoundIdx + offset + 1;
         const holdoutIdx = activeHoldoutCursor % samples.holdouts.length;
         const holdout = samples.holdouts[holdoutIdx];
@@ -901,7 +943,8 @@ export async function runStyleDistillationPipeline({
             }));
         }
 
-        const [blindRewriteRaw, prefetchedOutlineRaw] = await runBoundedPool(roundTasks, concurrency);
+        const [blindRewriteRaw, prefetchedOutlineRaw] = await runBoundedPool(roundTasks, concurrency, { signal });
+        throwIfAborted(signal);
         const blindRewrite = cleanDistillProse(blindRewriteRaw);
         if (shouldPrefetchNextOutline && prefetchedOutlineRaw) {
             preStrippedOutlines.set(nextHoldoutIdx, cleanDistillProse(prefetchedOutlineRaw));
@@ -1095,7 +1138,8 @@ export async function runStyleDistillationPipeline({
  *   callModel: (args: { prompt: string, systemPrompt: string, stage: string }) => Promise<string>,
  * }} params
  */
-export async function compressAndDeoverfitStyleCard({ novelTitle, styleCard, fingerprintText = '', callModel }) {
+export async function compressAndDeoverfitStyleCard({ novelTitle, styleCard, fingerprintText = '', callModel, signal = null }) {
+    throwIfAborted(signal);
     if (!styleCard || !String(styleCard).trim()) {
         throw new Error('当前没有可提纯瘦身的文风圣经');
     }

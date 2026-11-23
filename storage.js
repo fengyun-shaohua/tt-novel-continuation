@@ -18,6 +18,78 @@ const CHAT_SCOPE_META_KEY = 'novelContinuationScopeId';
 
 const memoryStoreCache = new Map();
 
+export const DEFAULT_NARRATIVE_CONFIG = Object.freeze({
+    povMode: 'auto', // 'auto' | 'strict_limited'
+    povCharacter: '',
+    povPerson: 'follow_original', // 'follow_original' | 'first_person' | 'third_limited'
+    worldInfoMode: 'bridge', // 'bridge' | 'off'
+    worldInfoPriority: 'novel_over_wi', // 'novel_over_wi' | 'wi_strict'
+    worldInfoBudgetChars: 12000,
+    strictTimelineOrder: true,
+    excludeFlashbackFromAnchor: true,
+});
+
+export function normalizeNarrativeConfig(raw = null) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const povMode = src.povMode === 'strict_limited' ? 'strict_limited' : 'auto';
+    const povPerson = ['follow_original', 'first_person', 'third_limited'].includes(src.povPerson)
+        ? src.povPerson
+        : 'follow_original';
+    const worldInfoMode = src.worldInfoMode === 'off' ? 'off' : 'bridge';
+    const worldInfoPriority = src.worldInfoPriority === 'wi_strict' ? 'wi_strict' : 'novel_over_wi';
+    const budget = Number(src.worldInfoBudgetChars);
+    const worldInfoBudgetChars = Number.isFinite(budget)
+        ? Math.max(2000, Math.min(40000, Math.round(budget)))
+        : DEFAULT_NARRATIVE_CONFIG.worldInfoBudgetChars;
+    return {
+        povMode,
+        povCharacter: String(src.povCharacter || '').trim(),
+        povPerson,
+        worldInfoMode,
+        worldInfoPriority,
+        worldInfoBudgetChars,
+        strictTimelineOrder: src.strictTimelineOrder !== false,
+        excludeFlashbackFromAnchor: src.excludeFlashbackFromAnchor !== false,
+    };
+}
+
+export function normalizeTimelineRole(role) {
+    return (role === 'flashback' || role === 'skip') ? role : 'main';
+}
+
+export function reindexNovelChapters(novelData) {
+    if (!novelData || !Array.isArray(novelData.chapters)) return novelData;
+    const prevCutoff = Number(novelData.cutoffChapterIndex || novelData.chapters.length || 0);
+    const prevViewing = Number(novelData.viewingChapterIndex || prevCutoff || 1);
+    const chapters = novelData.chapters
+        .filter(c => c && typeof c === 'object')
+        .map((c, idx) => {
+            const content = String(c.content || '').trim();
+            return {
+                ...c,
+                index: idx + 1,
+                title: String(c.title || `第 ${idx + 1} 章`).trim() || `第 ${idx + 1} 章`,
+                content,
+                wordCount: content.replace(/\s+/g, '').length,
+                timelineRole: normalizeTimelineRole(c.timelineRole),
+            };
+        });
+    const totalChapters = chapters.length;
+    const cutoffChapterIndex = totalChapters > 0
+        ? Math.max(1, Math.min(prevCutoff || totalChapters, totalChapters))
+        : 0;
+    const viewingChapterIndex = totalChapters > 0
+        ? Math.max(1, Math.min(prevViewing || cutoffChapterIndex, totalChapters))
+        : 0;
+    return {
+        ...novelData,
+        chapters,
+        totalChapters,
+        cutoffChapterIndex,
+        viewingChapterIndex,
+    };
+}
+
 export function createEmptyLedger() {
     return {
         summaries: [],
@@ -26,6 +98,7 @@ export function createEmptyLedger() {
         worldStates: [],
         hooks: [],
         styleProfile: null,
+        narrativeConfig: normalizeNarrativeConfig(),
         lastArchivedChapter: 0,
         archiveBatches: [],
         archiveNeedsResynth: false,
@@ -194,7 +267,9 @@ export async function loadNovelData() {
         viewingChapterIndex: Number.isFinite(data.viewingChapterIndex) && data.viewingChapterIndex > 0
             ? data.viewingChapterIndex
             : (data.cutoffChapterIndex || data.chapters.length),
-        chapters: data.chapters,
+        chapters: data.chapters.map(c => (c && typeof c === 'object'
+            ? { ...c, timelineRole: normalizeTimelineRole(c.timelineRole) }
+            : c)),
     };
 }
 
@@ -251,6 +326,7 @@ export async function loadLedger() {
         worldStates: Array.isArray(raw.worldStates) ? raw.worldStates : [],
         hooks: Array.isArray(raw.hooks) ? raw.hooks : [],
         styleProfile: raw.styleProfile && typeof raw.styleProfile === 'object' ? raw.styleProfile : null,
+        narrativeConfig: normalizeNarrativeConfig(raw.narrativeConfig),
         lastArchivedChapter: Number(raw.lastArchivedChapter || 0),
         archiveBatches,
         archiveNeedsResynth: Boolean(raw.archiveNeedsResynth),
@@ -315,6 +391,7 @@ export async function mergeArchivedDataIntoLedger(archiveResult, { mode = 'full'
                     ...prev,
                     role: ch.role || prev.role,
                     canonFoundation: ch.canonFoundation || prev.canonFoundation,
+                    currentAppearance: ch.currentAppearance || prev.currentAppearance || '',
                     currentSituation: ch.currentSituation || prev.currentSituation,
                     voiceAndQuotes: ch.voiceAndQuotes || prev.voiceAndQuotes,
                     oocRedLines: ch.oocRedLines || prev.oocRedLines,
@@ -456,6 +533,19 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
             floorIndex,
             updatedAt: now,
         });
+    }
+
+    // Sync explicit appearance/clothing updates back to matching character profiles
+    const appearList = Array.isArray(extracted.appearanceUpdates) ? extracted.appearanceUpdates : [];
+    for (const ap of appearList) {
+        if (!ap?.name || !ap?.appearance) continue;
+        const targetChar = (ledger.characters || []).find(
+            c => c?.name && String(c.name).trim().toLowerCase() === String(ap.name).trim().toLowerCase(),
+        );
+        if (targetChar) {
+            targetChar.currentAppearance = ap.appearance;
+            targetChar.updatedChapter = Math.max(Number(targetChar.updatedChapter || 0), chapterIndex);
+        }
     }
 
     for (const hook of extracted.hooks || []) {

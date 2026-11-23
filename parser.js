@@ -409,12 +409,14 @@ export function extractNovelStateBlock(rawMessageText) {
             cleanText: raw,
             summary: '',
             worldUpdates: [],
+            appearanceUpdates: [],
             hooks: [],
         };
     }
 
     let summary = '';
     const worldUpdates = [];
+    const appearanceUpdates = [];
     const hooks = [];
 
     for (const inner of innerBlocks) {
@@ -423,13 +425,31 @@ export function extractNovelStateBlock(rawMessageText) {
             summary = summaryMatch[1].trim();
         }
 
-        const worldMatch = inner.match(/<worldbook>([\s\S]*?)(?:<\/worldbook>|<hooks>|$)/i);
+        const worldMatch = inner.match(/<worldbook>([\s\S]*?)(?:<\/worldbook>|<appearance>|<hooks>|$)/i);
         if (worldMatch && worldMatch[1].trim()) {
             const lines = worldMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
             for (const line of lines) {
                 if (isEmptyPlaceholder(line)) continue;
                 const parsed = parseWorldUpdateLine(line);
-                if (parsed && !isEmptyPlaceholder(parsed.state)) worldUpdates.push(parsed);
+                if (parsed && !isEmptyPlaceholder(parsed.state)) {
+                    if (/^(?:外观|着装|衣着|服装|穿搭|外貌|装扮)$/.test(parsed.category)) {
+                        appearanceUpdates.push({ name: parsed.name, appearance: parsed.state });
+                    }
+                    worldUpdates.push(parsed);
+                }
+            }
+        }
+
+        const appearMatch = inner.match(/<appearance>([\s\S]*?)(?:<\/appearance>|<hooks>|$)/i);
+        if (appearMatch && appearMatch[1].trim()) {
+            const lines = appearMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
+            for (const line of lines) {
+                if (isEmptyPlaceholder(line)) continue;
+                const parsed = parseWorldUpdateLine(line);
+                if (parsed && !isEmptyPlaceholder(parsed.state)) {
+                    appearanceUpdates.push({ name: parsed.name, appearance: parsed.state });
+                    worldUpdates.push({ category: '外观', name: parsed.name, state: parsed.state });
+                }
             }
         }
 
@@ -458,6 +478,7 @@ export function extractNovelStateBlock(rawMessageText) {
         cleanText,
         summary,
         worldUpdates,
+        appearanceUpdates,
         hooks,
     };
 }
@@ -548,6 +569,41 @@ function buildSearchableParagraphWindows(content) {
 }
 
 /**
+ * Parses a human chapter range spec such as `78-135, 140, 145~150` into sorted unique chapter indices.
+ *
+ * @param {string} rangeText
+ * @param {number} [maxChapter=Infinity]
+ * @returns {number[]}
+ */
+export function parseChapterRangeSpec(rangeText, maxChapter = Infinity) {
+    const raw = String(rangeText || '').trim();
+    if (!raw) return [];
+    const upper = Number.isFinite(maxChapter) && maxChapter > 0 ? Math.floor(maxChapter) : Infinity;
+    const set = new Set();
+    const parts = raw.split(/[,，、;\s]+/).map(s => s.trim()).filter(Boolean);
+    for (const part of parts) {
+        const rangeMatch = part.match(/^#?(\d+)\s*[-~—至到]\s*#?(\d+)$/);
+        if (rangeMatch) {
+            let start = Number(rangeMatch[1]);
+            let end = Number(rangeMatch[2]);
+            if (start > end) [start, end] = [end, start];
+            const clampedStart = Math.max(1, start);
+            const clampedEnd = Math.min(upper, end);
+            for (let i = clampedStart; i <= clampedEnd; i += 1) {
+                set.add(i);
+            }
+            continue;
+        }
+        const singleMatch = part.match(/^#?(\d+)$/);
+        if (singleMatch) {
+            const n = Number(singleMatch[1]);
+            if (n >= 1 && n <= upper) set.add(n);
+        }
+    }
+    return [...set].sort((a, b) => a - b);
+}
+
+/**
  * Local zero-API CJK search over novel chapters with Pagekin-style timeline cutoff protection.
  */
 export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
@@ -559,6 +615,11 @@ export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
     const maxAllowedChapter = Math.max(0, cutoff - excludeTail);
     const topK = Number(options.topK ?? 3);
     const maxSnippetChars = Number(options.maxSnippetChars ?? 420);
+    const excludedRoles = new Set(
+        Array.isArray(options.excludeTimelineRoles)
+            ? options.excludeTimelineRoles
+            : (options.excludeFlashback ? ['flashback', 'skip'] : ['skip']),
+    );
 
     const { exactTerms, bigrams } = extractCjkQueryTokens(queryText);
     if (exactTerms.length === 0 && bigrams.length === 0) return [];
@@ -567,6 +628,7 @@ export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
 
     for (const chapter of chapters) {
         if (chapter.index > maxAllowedChapter) continue;
+        if (chapter.timelineRole && excludedRoles.has(chapter.timelineRole)) continue;
         const windows = buildSearchableParagraphWindows(chapter.content);
 
         let bestPara = '';

@@ -3,7 +3,7 @@ import { getContext } from '/scripts/extensions.js';
 import { isBoundedChatSurfaceView, jumpBoundedChatSurfaceToMessage, resetChatSurfaceView } from '/script.js';
 import { DEFAULT_CLICHE_TERMS } from './cliche-guard.js';
 import { isContinuedNovelFloor } from './context-assembler.js';
-import { loadCanonDb, loadLedger, loadNovelData, saveLedger } from './storage.js';
+import { loadCanonDb, loadLedger, loadNovelData, normalizeNarrativeConfig, saveCanonDb, saveLedger } from './storage.js';
 
 const PROGRESS_META_KEY = 'novel_continuation_progress';
 const TOC_PAGE_LIMIT = 100;
@@ -14,6 +14,14 @@ let memoryFilter = 'all';
 let showAllOriginalChapters = false;
 let editingCharacterId = null;
 let editingEventId = null;
+let editingHookId = null;
+let editingWorldStateId = null;
+let editingSummaryChapter = null;
+let editingCanonId = null;
+let canonSearchQuery = '';
+let editingChapterIndex = null;
+let addingChapterOpen = false;
+let tocBulkRangeText = '';
 
 let cachedNovelData = null;
 let cachedLedger = null;
@@ -326,6 +334,22 @@ function renderWorkbench() {
     else if (activeTab === 'cliche') renderClicheTab(bodyEl);
     else if (activeTab === 'toc') renderTocTab(bodyEl);
     else if (activeTab === 'settings') renderSettingsTab(bodyEl);
+
+    bodyEl.querySelectorAll('[data-action="stop-task"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const key = btn.getAttribute('data-task');
+            if (key) handlers.onStopTask?.(key);
+        });
+    });
+}
+
+function renderTaskProgressBanner(taskKey, task) {
+    if (!task?.text && !task?.running) return '';
+    const cls = task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok');
+    const stopBtn = task.running
+        ? `<button type="button" class="menu_button tt-novel-btn-sm tt-novel-btn-stop" data-action="stop-task" data-task="${escapeHtml(taskKey)}">⏹ 停止任务</button>`
+        : '';
+    return `<div class="tt-novel-banner ${cls} tt-novel-banner-row"><span class="tt-novel-banner-text">${escapeHtml(task.text || '任务运行中…')}</span>${stopBtn}</div>`;
 }
 
 /* ==========================================================================
@@ -346,11 +370,16 @@ function renderOutlineTab(bodyEl) {
         ? `自动承接【${cachedAnchorInfo.anchorTitle}】结尾${cachedAnchorInfo.shortClosing ? `（“……${cachedAnchorInfo.shortClosing.slice(-36)}”）` : ''} → 策划第 ${cachedAnchorInfo.nextChapterIndex} ${cachedAnchorInfo.chapterUnit}`
         : '请先导入原著小说';
 
-    const readyMeta = `已自动挂载：${ledger.characters?.length || 0} 人物防 OOC 档案 · ${ledger.chronicle?.length || 0} 条编年史 · ${openHooks.length} 条待填伏笔 · ${ledger.styleProfile?.styleCard ? `文风圣经(${String(ledger.styleProfile.styleCard).length}字)` : '未蒸馏文风'}`;
+    const nCfg = normalizeNarrativeConfig(ledger.narrativeConfig);
+    const povSummary = nCfg.povMode === 'strict_limited' && nCfg.povCharacter
+        ? `严格单视角(${nCfg.povCharacter})`
+        : '跟随原著视角';
+    const wiSummary = nCfg.worldInfoMode === 'off'
+        ? '世界书关闭'
+        : (nCfg.worldInfoPriority === 'wi_strict' ? '世界书强一致' : '世界书兜底');
+    const readyMeta = `已挂载：${ledger.characters?.length || 0} 人物 · ${ledger.chronicle?.length || 0} 编年史 · ${openHooks.length} 伏笔 · ${povSummary} · ${wiSummary}`;
 
-    const progressHtml = task.text
-        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
-        : '';
+    const progressHtml = renderTaskProgressBanner('outline', task);
 
     const hookPickerHtml = openHooks.length === 0
         ? '<div class="tt-novel-muted">当前暂无待填伏笔（可去「📚 剧情与人物」全本归档或手动添加伏笔）。</div>'
@@ -403,6 +432,8 @@ function renderOutlineTab(bodyEl) {
                         <button type="button" class="menu_button tt-novel-btn-sm" data-action="toggle-outline-sent" data-id="${escapeHtml(ch.id)}">
                             ${ch.sent ? '↩️ 标为待写' : '✅ 标为已写'}
                         </button>
+                        <button type="button" class="tt-novel-mini-icon-btn" data-action="move-outline-up" data-id="${escapeHtml(ch.id)}" title="上移" ${idx === 0 ? 'disabled' : ''}>⬆️</button>
+                        <button type="button" class="tt-novel-mini-icon-btn" data-action="move-outline-down" data-id="${escapeHtml(ch.id)}" title="下移" ${idx === savedChapters.length - 1 ? 'disabled' : ''}>⬇️</button>
                         <button type="button" class="tt-novel-mini-icon-btn" data-action="del-outline-ch" data-id="${escapeHtml(ch.id)}" title="删除此章大纲">🗑️</button>
                     </div>
                 </div>
@@ -462,7 +493,10 @@ function renderOutlineTab(bodyEl) {
         <section class="tt-novel-section">
             <div class="tt-novel-card-head">
                 <div class="tt-novel-section-title">📋 分章导演大纲队列（共 ${savedChapters.length} 章 · 可逐章微调并一键续写）</div>
-                ${savedChapters.length > 0 ? '<button type="button" id="tt-novel-outline-save-all" class="menu_button tt-novel-btn-sm">💾 保存全部修改</button>' : ''}
+                <div class="tt-novel-card-actions">
+                    <button type="button" id="tt-novel-outline-add-ch" class="menu_button tt-novel-btn-sm">+ 新增一章</button>
+                    ${savedChapters.length > 0 ? '<button type="button" id="tt-novel-outline-save-all" class="menu_button tt-novel-btn-sm">💾 保存全部修改</button>' : ''}
+                </div>
             </div>
             <div class="tt-novel-card-stack">${chapterCardsHtml}</div>
         </section>
@@ -580,6 +614,38 @@ function renderOutlineTab(bodyEl) {
         });
     });
 
+    bodyEl.querySelector('#tt-novel-outline-add-ch')?.addEventListener('click', async () => {
+        const edited = collectEditedChapters();
+        const maxIdx = edited.reduce((m, c) => Math.max(m, Number(c.chapterIndex || 0)), Number(cachedAnchorInfo?.prevChapterIndex || 0));
+        const nextIdx = maxIdx + 1;
+        const unit = cachedAnchorInfo?.chapterUnit || '章';
+        const title = window.prompt('请输入新增大纲章节标题（可留空使用默认）：', `第 ${nextIdx} ${unit} · 新剧情`);
+        if (title === null) return;
+        edited.push({
+            id: `outline_ch_manual_${Date.now()}`,
+            chapterIndex: nextIdx,
+            title: title.trim() || `第 ${nextIdx} ${unit}`,
+            text: `【${title.trim() || `第 ${nextIdx} ${unit}`} 分镜大纲】\n1. （时间·地点）`,
+            sent: false,
+        });
+        await persistDraftChapters(edited);
+        renderWorkbench();
+    });
+
+    bodyEl.querySelectorAll('[data-action="move-outline-up"], [data-action="move-outline-down"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const dir = btn.getAttribute('data-action') === 'move-outline-up' ? -1 : 1;
+            const edited = collectEditedChapters();
+            const pos = edited.findIndex(c => c.id === id);
+            const swap = pos + dir;
+            if (pos < 0 || swap < 0 || swap >= edited.length) return;
+            [edited[pos], edited[swap]] = [edited[swap], edited[pos]];
+            await persistDraftChapters(edited);
+            renderWorkbench();
+        });
+    });
+
     bodyEl.querySelectorAll('[data-action="del-outline-ch"]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const id = btn.getAttribute('data-id');
@@ -595,11 +661,14 @@ function renderOutlineTab(bodyEl) {
    ========================================================================== */
 function renderMemoryTab(bodyEl) {
     const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], worldStates: [], summaries: [], archiveBatches: [] };
+    const canonDb = cachedCanonDb || { sources: [], items: [] };
+    const nCfg = normalizeNarrativeConfig(ledger.narrativeConfig);
     const chars = ledger.characters || [];
     const chronicle = ledger.chronicle || [];
     const hooks = ledger.hooks || [];
     const worldStates = ledger.worldStates || [];
     const summaries = ledger.summaries || [];
+    const canonItems = canonDb.items || [];
     const batches = ledger.archiveBatches || [];
     const failedBatches = batches.filter(b => b.status !== 'ok');
     const okBatchCount = batches.length - failedBatches.length;
@@ -608,9 +677,72 @@ function renderMemoryTab(bodyEl) {
     const task = liveTaskState.memory;
     const processLogs = task.running && task.logs.length > 0 ? task.logs : (ledger.archiveProcessLog || []);
 
-    const progressHtml = task.text
-        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
-        : '';
+    const progressHtml = renderTaskProgressBanner('memory', task);
+
+    const povBadge = nCfg.povMode === 'strict_limited' && nCfg.povCharacter
+        ? `🔒 单视角：${nCfg.povCharacter}`
+        : '👁️ 跟随原著视角';
+    const wiBadge = nCfg.worldInfoMode === 'off'
+        ? '🌐 后台世界书：关'
+        : `🌐 后台世界书：${nCfg.worldInfoPriority === 'wi_strict' ? '严格遵循世界书' : '小说优先·世界书兜底'}`;
+
+    const narrativeConfigHtml = `
+        <details class="tt-novel-fold-card tt-novel-narrative-box">
+            <summary>
+                🧭 本书叙事视角、时间线与世界书规则（${escapeHtml(povBadge)} · ${escapeHtml(wiBadge)}）
+            </summary>
+            <div class="tt-novel-edit-grid" style="margin-top: 8px;">
+                <div class="tt-novel-row-3">
+                    <label>叙事视角模式：
+                        <select id="tt-novel-ncfg-pov-mode" class="text_pole">
+                            <option value="auto" ${nCfg.povMode === 'auto' ? 'selected' : ''}>自动 / 跟随原著（兼容多视角）</option>
+                            <option value="strict_limited" ${nCfg.povMode === 'strict_limited' ? 'selected' : ''}>严格限制单视角（Limited POV）</option>
+                        </select>
+                    </label>
+                    <label>锁定视角人物（单视角必填）：
+                        <input type="text" id="tt-novel-ncfg-pov-char" class="text_pole" value="${escapeHtml(nCfg.povCharacter || '')}" placeholder="例如：博士 / 我 / 主角名" />
+                    </label>
+                    <label>单视角人称：
+                        <select id="tt-novel-ncfg-pov-person" class="text_pole">
+                            <option value="follow_original" ${nCfg.povPerson === 'follow_original' ? 'selected' : ''}>跟随原著人称</option>
+                            <option value="first_person" ${nCfg.povPerson === 'first_person' ? 'selected' : ''}>第一人称（“我”）</option>
+                            <option value="third_limited" ${nCfg.povPerson === 'third_limited' ? 'selected' : ''}>第三人称限制视角</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="tt-novel-row-3">
+                    <label>后台任务贯通酒馆世界书：
+                        <select id="tt-novel-ncfg-wi-mode" class="text_pole">
+                            <option value="bridge" ${nCfg.worldInfoMode !== 'off' ? 'selected' : ''}>开启（重塑/大纲/归档自动读取）</option>
+                            <option value="off" ${nCfg.worldInfoMode === 'off' ? 'selected' : ''}>关闭（仅用插件台账与补充库）</option>
+                        </select>
+                    </label>
+                    <label>世界书与小说设定冲突时：
+                        <select id="tt-novel-ncfg-wi-priority" class="text_pole">
+                            <option value="novel_over_wi" ${nCfg.worldInfoPriority !== 'wi_strict' ? 'selected' : ''}>小说改写优先，世界书兜底（不混穿）</option>
+                            <option value="wi_strict" ${nCfg.worldInfoPriority === 'wi_strict' ? 'selected' : ''}>严格遵循酒馆世界书（外观/常服锁死）</option>
+                        </select>
+                    </label>
+                    <label>后台世界书最大注入字数：
+                        <input type="number" id="tt-novel-ncfg-wi-budget" class="text_pole" min="2000" max="40000" step="1000" value="${Number(nCfg.worldInfoBudgetChars || 12000)}" />
+                    </label>
+                </div>
+                <div class="tt-novel-row-2">
+                    <label class="tt-novel-check-row">
+                        <input type="checkbox" id="tt-novel-ncfg-strict-tl" ${nCfg.strictTimelineOrder !== false ? 'checked' : ''} />
+                        <span>严格单向推进时间线（禁止大纲/正文倒流或重复已发生重大桥段）</span>
+                    </label>
+                    <label class="tt-novel-check-row">
+                        <input type="checkbox" id="tt-novel-ncfg-skip-fb" ${nCfg.excludeFlashbackFromAnchor !== false ? 'checked' : ''} />
+                        <span>续写锚点与检索自动跳过「倒叙/他视角」章节（可在「📑 目录」按区间标注）</span>
+                    </label>
+                </div>
+                <div class="tt-novel-action-bar">
+                    <button type="button" id="tt-novel-ncfg-save" class="menu_button tt-novel-btn-sm tt-novel-btn-primary">💾 保存本书叙事与世界书规则</button>
+                </div>
+            </div>
+        </details>
+    `;
 
     const failedRangeText = failedBatches.map(b => `第${b.startChapter}~${b.endChapter}章`).join('、');
     const sliceManagerHtml = batches.length > 0
@@ -621,7 +753,7 @@ function renderMemoryTab(bodyEl) {
             </summary>
             <div class="tt-novel-slice-body">
                 ${failedBatches.length > 0 ? `<div class="tt-novel-banner is-warn">⚠️ 以下切片疑似模型道歉或失败，尚未纳入总账：<b>${escapeHtml(failedRangeText)}</b>。可直接在下方点「🔄 重跑此切片」，或去「⚙️ 设置」换自定义 API / 调整预设后再重跑！</div>` : ''}
-                ${ledger.archiveNeedsResynth ? '<div class="tt-novel-banner is-running">💡 已有切片完成重跑更新，请点击下方「🔁 用当前切片重新合稿总账」将新内容合并进编年史与人物卡。</div>' : ''}
+                ${ledger.archiveNeedsResynth ? '<div class="tt-novel-banner is-running">💡 已有切片完成更新，请点击下方「🔁 用当前切片重新合稿总账」将新内容合并进编年史与人物卡。</div>' : ''}
                 <div class="tt-novel-action-bar">
                     ${failedBatches.length > 0 ? `<button type="button" id="tt-novel-rerun-failed-slices" class="menu_button tt-novel-btn-sm tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>⚡ 一键重跑全部失败切片 (${failedBatches.length})</button>` : ''}
                     <button type="button" id="tt-novel-resynth-slices" class="menu_button tt-novel-btn-sm ${(ledger.archiveNeedsResynth || chars.length === 0) ? 'tt-novel-btn-primary' : ''}" ${task.running || okBatchCount === 0 ? 'disabled' : ''}>
@@ -674,7 +806,7 @@ function renderMemoryTab(bodyEl) {
         : '';
 
     const charCardsHtml = chars.length === 0
-        ? '<div class="tt-novel-empty">尚未生成核心人物档案。点击上方「📚 全本通读归档」自动按原著提取 4 维灵魂与防 OOC 红线（全程套用所选预设，不拒答）。</div>'
+        ? '<div class="tt-novel-empty">尚未生成核心人物档案。点击上方「📚 全本通读归档」自动按原著提取 4 维灵魂与防 OOC 红线，或点「+ 人物」手动新增。</div>'
         : chars.map(ch => {
             if (editingCharacterId === ch.id) {
                 return `
@@ -682,8 +814,9 @@ function renderMemoryTab(bodyEl) {
                         <div class="tt-novel-edit-grid">
                             <input type="text" class="text_pole" data-field="name" value="${escapeHtml(ch.name)}" placeholder="人物姓名" />
                             <input type="text" class="text_pole" data-field="role" value="${escapeHtml(ch.role || '')}" placeholder="身份定位" />
-                            <label>🎮 原作/游戏设定底骨与能力：<textarea class="text_pole" rows="2" data-field="canonFoundation">${escapeHtml(ch.canonFoundation || '')}</textarea></label>
-                            <label>🎭 同人当前处境与关系：<textarea class="text_pole" rows="2" data-field="currentSituation">${escapeHtml(ch.currentSituation || '')}</textarea></label>
+                            <label>👔 当前外观与着装锚点（续写与重塑强制保持一致）：<textarea class="text_pole" rows="2" data-field="currentAppearance" placeholder="发色/瞳色/当前日常服装与配饰...">${escapeHtml(ch.currentAppearance || '')}</textarea></label>
+                            <label>🎮 原作/世界观设定底骨与能力：<textarea class="text_pole" rows="2" data-field="canonFoundation">${escapeHtml(ch.canonFoundation || '')}</textarea></label>
+                            <label>🎭 当前处境与关系：<textarea class="text_pole" rows="2" data-field="currentSituation">${escapeHtml(ch.currentSituation || '')}</textarea></label>
                             <label>🗣️ 原著真实言行与原话锚点：<textarea class="text_pole" rows="2" data-field="voiceAndQuotes">${escapeHtml(ch.voiceAndQuotes || '')}</textarea></label>
                             <label>🚫 绝对 OOC 红线：<textarea class="text_pole" rows="2" data-field="oocRedLines">${escapeHtml(ch.oocRedLines || '')}</textarea></label>
                         </div>
@@ -706,6 +839,7 @@ function renderMemoryTab(bodyEl) {
                             <button type="button" class="tt-novel-mini-icon-btn" data-action="del-char" data-id="${escapeHtml(ch.id)}" title="删除">🗑️</button>
                         </div>
                     </div>
+                    ${ch.currentAppearance ? `<div class="tt-novel-char-row is-appear"><span>👔 当前着装</span><p>${escapeHtml(ch.currentAppearance)}</p></div>` : ''}
                     ${ch.canonFoundation ? `<div class="tt-novel-char-row is-canon"><span>🎮 原作底骨</span><p>${escapeHtml(ch.canonFoundation)}</p></div>` : ''}
                     ${ch.currentSituation ? `<div class="tt-novel-char-row is-sit"><span>🎭 当前处境</span><p>${escapeHtml(ch.currentSituation)}</p></div>` : ''}
                     ${ch.voiceAndQuotes ? `<div class="tt-novel-char-row is-voice"><span>🗣️ 言行原话</span><p>${escapeHtml(ch.voiceAndQuotes)}</p></div>` : ''}
@@ -715,20 +849,29 @@ function renderMemoryTab(bodyEl) {
         }).join('');
 
     const chronicleHtml = chronicle.length === 0
-        ? '<div class="tt-novel-empty">暂无全本剧情编年史。点击「📚 全本通读归档」后，会按时间顺序生成客观、无 RPG 标签污染的剧情时间轴。</div>'
+        ? '<div class="tt-novel-empty">暂无全本剧情编年史。可点「📚 全本通读归档」自动生成，或点「+ 事件」手动录入。</div>'
         : chronicle.map(evt => {
             if (editingEventId === evt.id) {
                 return `
                     <div class="tt-novel-card is-editing" data-evt-id="${escapeHtml(evt.id)}">
                         <div class="tt-novel-edit-grid">
-                            <div class="tt-novel-row-2">
+                            <div class="tt-novel-row-3">
                                 <input type="text" class="text_pole" data-field="chapterRange" value="${escapeHtml(evt.chapterRange || '')}" placeholder="章号如 #1-#7" />
                                 <input type="text" class="text_pole" data-field="timeLabel" value="${escapeHtml(evt.timeLabel || '')}" placeholder="时间阶段" />
+                                <select class="text_pole" data-field="timelinePhase">
+                                    <option value="main" ${evt.timelinePhase !== 'flashback' ? 'selected' : ''}>主线推进</option>
+                                    <option value="flashback" ${evt.timelinePhase === 'flashback' ? 'selected' : ''}>倒叙/他视角补完</option>
+                                </select>
                             </div>
-                            <input type="text" class="text_pole" data-field="title" value="${escapeHtml(evt.title || '')}" placeholder="事件标题" />
+                            <div class="tt-novel-row-2">
+                                <input type="text" class="text_pole" data-field="title" value="${escapeHtml(evt.title || '')}" placeholder="事件标题" />
+                                <input type="text" class="text_pole" data-field="pov" value="${escapeHtml(evt.pov || '')}" placeholder="叙事视角（可留空）" />
+                            </div>
                             <input type="text" class="text_pole" data-field="participants" value="${escapeHtml((evt.participants || []).join('、'))}" placeholder="出场人物（顿号分隔）" />
                             <textarea class="text_pole" rows="3" data-field="summary" placeholder="客观剧情经过与结果">${escapeHtml(evt.summary || '')}</textarea>
-                            <input type="text" class="text_pole" data-field="infoGap" value="${escapeHtml(evt.infoGap || '')}" placeholder="信息差（谁还不知道什么）" />
+                            <input type="text" class="text_pole" data-field="infoGap" value="${escapeHtml(evt.infoGap || '')}" placeholder="通用信息差（谁还不知道什么）" />
+                            <input type="text" class="text_pole" data-field="povKnown" value="${escapeHtml(evt.povKnown || '')}" placeholder="主视角人物明确已知的事实（单视角模式可选）" />
+                            <input type="text" class="text_pole" data-field="povBlindspot" value="${escapeHtml(evt.povBlindspot || '')}" placeholder="主视角盲区/幕后黑盒（严禁切视角或未卜先知）" />
                         </div>
                         <div class="tt-novel-card-actions">
                             <button type="button" class="menu_button tt-novel-btn-sm" data-action="save-evt" data-id="${escapeHtml(evt.id)}">💾 保存</button>
@@ -742,35 +885,63 @@ function renderMemoryTab(bodyEl) {
                     <div class="tt-novel-card-head">
                         <div class="tt-novel-timeline-meta">
                             <span class="tt-novel-chip is-gold">${escapeHtml(evt.chapterRange || `#${evt.startChapter || 1}`)}</span>
+                            ${evt.timelinePhase === 'flashback' ? '<span class="tt-novel-chip is-warn">倒叙/他视角</span>' : ''}
+                            ${evt.pov ? `<span class="tt-novel-chip">视角:${escapeHtml(evt.pov)}</span>` : ''}
                             <strong>${escapeHtml(evt.title)}</strong>
                             ${evt.timeLabel ? `<span class="tt-novel-muted">${escapeHtml(evt.timeLabel)}</span>` : ''}
                         </div>
                         <div class="tt-novel-card-actions">
-                            <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-evt" data-id="${escapeHtml(evt.id)}">✏️</button>
-                            <button type="button" class="tt-novel-mini-icon-btn" data-action="del-evt" data-id="${escapeHtml(evt.id)}">🗑️</button>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-evt" data-id="${escapeHtml(evt.id)}" title="编辑事件">✏️</button>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="del-evt" data-id="${escapeHtml(evt.id)}" title="删除事件">🗑️</button>
                         </div>
                     </div>
                     ${(evt.participants || []).length > 0 ? `<div class="tt-novel-chip-row">${evt.participants.map(p => `<span class="tt-novel-chip">${escapeHtml(p)}</span>`).join('')}</div>` : ''}
                     <div class="tt-novel-card-text">${escapeHtml(evt.summary)}</div>
+                    ${evt.povKnown ? `<div class="tt-novel-infogap">👁️ 视角已知：${escapeHtml(evt.povKnown)}</div>` : ''}
+                    ${evt.povBlindspot ? `<div class="tt-novel-infogap">🔒 幕后黑盒：${escapeHtml(evt.povBlindspot)}</div>` : ''}
                     ${evt.infoGap ? `<div class="tt-novel-infogap">🔍 信息差：${escapeHtml(evt.infoGap)}</div>` : ''}
                 </div>
             `;
         }).join('');
 
-    const renderHookItem = (h) => `
-        <div class="tt-novel-hook-row ${h.status === 'pinned' ? 'is-pinned' : ''} ${h.status === 'resolved' ? 'is-resolved' : ''}">
-            <div class="tt-novel-hook-text">
-                <span class="tt-novel-chip">#${Number(h.plantedChapter || 1)}</span>
-                <span>${escapeHtml(h.content)}</span>
-                ${h.resolvedChapter ? `<span class="tt-novel-muted">（已于第${h.resolvedChapter}章回收）</span>` : ''}
+    const renderHookItem = (h) => {
+        if (editingHookId === h.id) {
+            return `
+                <div class="tt-novel-card is-editing" data-hook-id="${escapeHtml(h.id)}">
+                    <div class="tt-novel-edit-grid">
+                        <div class="tt-novel-row-2">
+                            <input type="number" class="text_pole" data-field="plantedChapter" min="1" value="${Number(h.plantedChapter || 1)}" placeholder="埋下章号" />
+                            <select class="text_pole" data-field="status">
+                                <option value="open" ${h.status === 'open' ? 'selected' : ''}>🔮 长期暗线</option>
+                                <option value="pinned" ${h.status === 'pinned' ? 'selected' : ''}>🎯 本章重点推进</option>
+                                <option value="resolved" ${h.status === 'resolved' ? 'selected' : ''}>✅ 已回收</option>
+                            </select>
+                        </div>
+                        <textarea class="text_pole" rows="2" data-field="content" placeholder="伏笔内容">${escapeHtml(h.content || '')}</textarea>
+                    </div>
+                    <div class="tt-novel-card-actions">
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="save-hook" data-id="${escapeHtml(h.id)}">💾 保存</button>
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="cancel-hook">取消</button>
+                    </div>
+                </div>
+            `;
+        }
+        return `
+            <div class="tt-novel-hook-row ${h.status === 'pinned' ? 'is-pinned' : ''} ${h.status === 'resolved' ? 'is-resolved' : ''}">
+                <div class="tt-novel-hook-text">
+                    <span class="tt-novel-chip">#${Number(h.plantedChapter || 1)}</span>
+                    <span>${escapeHtml(h.content)}</span>
+                    ${h.resolvedChapter ? `<span class="tt-novel-muted">（已于第${h.resolvedChapter}章回收）</span>` : ''}
+                </div>
+                <div class="tt-novel-card-actions">
+                    ${h.status !== 'resolved' ? `<button type="button" class="tt-novel-mini-icon-btn" data-action="pin-hook" data-id="${escapeHtml(h.id)}" title="切换是否本章重点推进">${h.status === 'pinned' ? '🎯' : '📌'}</button>` : ''}
+                    <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-hook" data-id="${escapeHtml(h.id)}" title="编辑伏笔">✏️</button>
+                    <button type="button" class="tt-novel-mini-icon-btn" data-action="resolve-hook" data-id="${escapeHtml(h.id)}" title="${h.status === 'resolved' ? '重新打开伏笔' : '标记已填坑'}">${h.status === 'resolved' ? '↩️' : '✅'}</button>
+                    <button type="button" class="tt-novel-mini-icon-btn" data-action="del-hook" data-id="${escapeHtml(h.id)}" title="删除伏笔">🗑️</button>
+                </div>
             </div>
-            <div class="tt-novel-card-actions">
-                ${h.status !== 'resolved' ? `<button type="button" class="tt-novel-mini-icon-btn" data-action="pin-hook" data-id="${escapeHtml(h.id)}" title="切换是否本章重点推进">${h.status === 'pinned' ? '🎯' : '📌'}</button>` : ''}
-                <button type="button" class="tt-novel-mini-icon-btn" data-action="resolve-hook" data-id="${escapeHtml(h.id)}" title="${h.status === 'resolved' ? '重新打开伏笔' : '标记已填坑'}">${h.status === 'resolved' ? '↩️' : '✅'}</button>
-                <button type="button" class="tt-novel-mini-icon-btn" data-action="del-hook" data-id="${escapeHtml(h.id)}" title="删除伏笔">🗑️</button>
-            </div>
-        </div>
-    `;
+        `;
+    };
 
     const hooksHtml = hooks.length === 0
         ? '<div class="tt-novel-empty">暂无伏笔记录。续写时会自动通过末段指令提取新伏笔与已填坑，也可以点击上方「+ 伏笔」手动埋线。</div>'
@@ -779,17 +950,134 @@ function renderMemoryTab(bodyEl) {
             ${resolvedHooks.length > 0 ? `<details class="tt-novel-fold-card"><summary>已回收伏笔（${resolvedHooks.length}）</summary>${resolvedHooks.map(renderHookItem).join('')}</details>` : ''}
         `;
 
-    const worldAndSumsHtml = (worldStates.length === 0 && summaries.length === 0)
-        ? '<div class="tt-novel-empty">暂无势力/物品状态或单章续写摘要。</div>'
-        : `
-            ${worldStates.length > 0 ? `<div class="tt-novel-chip-list">${worldStates.map(w => `<div class="tt-novel-state-row"><span class="tt-novel-chip">[${escapeHtml(w.category || '状态')}] ${escapeHtml(w.name)}</span><span>${escapeHtml(w.state)}</span></div>`).join('')}</div>` : ''}
-            ${summaries.length > 0 ? `<div class="tt-novel-subhead">📝 近期续写单章摘要（${summaries.length}）</div>${summaries.slice(-10).map(s => `<div class="tt-novel-state-row"><span class="tt-novel-chip is-gold">第${s.chapterIndex}章</span><span>${escapeHtml(s.summary)}</span></div>`).join('')}` : ''}
+    const worldRowsHtml = worldStates.map((w, idx) => {
+        const wsId = w.id || `ws_idx_${idx}`;
+        if (editingWorldStateId === wsId) {
+            return `
+                <div class="tt-novel-card is-editing" data-ws-id="${escapeHtml(wsId)}">
+                    <div class="tt-novel-edit-grid">
+                        <div class="tt-novel-row-3">
+                            <input type="text" class="text_pole" data-field="category" value="${escapeHtml(w.category || '人物')}" placeholder="分类（人物/外观/物品/势力）" />
+                            <input type="text" class="text_pole" data-field="name" value="${escapeHtml(w.name || '')}" placeholder="条目名" />
+                            <input type="number" class="text_pole" data-field="effectiveChapter" min="1" value="${Number(w.effectiveChapter || 1)}" placeholder="生效章号" />
+                        </div>
+                        <textarea class="text_pole" rows="2" data-field="state" placeholder="最新状态描述">${escapeHtml(w.state || '')}</textarea>
+                    </div>
+                    <div class="tt-novel-card-actions">
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="save-ws" data-id="${escapeHtml(wsId)}">💾 保存</button>
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="cancel-ws">取消</button>
+                    </div>
+                </div>
+            `;
+        }
+        return `
+            <div class="tt-novel-state-row tt-novel-state-crud-row">
+                <div class="tt-novel-state-main">
+                    <span class="tt-novel-chip">[${escapeHtml(w.category || '状态')}] ${escapeHtml(w.name)}</span>
+                    <span class="tt-novel-muted">#${Number(w.effectiveChapter || 1)}</span>
+                    <span>${escapeHtml(w.state)}</span>
+                </div>
+                <div class="tt-novel-card-actions">
+                    <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-ws" data-id="${escapeHtml(wsId)}" title="编辑状态">✏️</button>
+                    <button type="button" class="tt-novel-mini-icon-btn" data-action="del-ws" data-id="${escapeHtml(wsId)}" title="删除状态">🗑️</button>
+                </div>
+            </div>
         `;
+    }).join('');
+
+    const summaryRowsHtml = summaries.map(sum => {
+        const chNum = Number(sum.chapterIndex || 0);
+        if (editingSummaryChapter === chNum) {
+            return `
+                <div class="tt-novel-card is-editing" data-sum-ch="${chNum}">
+                    <div class="tt-novel-edit-grid">
+                        <div class="tt-novel-row-2">
+                            <input type="number" class="text_pole" data-field="chapterIndex" min="1" value="${chNum}" placeholder="章号" />
+                            <input type="text" class="text_pole" data-field="title" value="${escapeHtml(sum.title || '')}" placeholder="章节标题" />
+                        </div>
+                        <textarea class="text_pole" rows="2" data-field="summary" placeholder="单章摘要">${escapeHtml(sum.summary || '')}</textarea>
+                    </div>
+                    <div class="tt-novel-card-actions">
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="save-sum" data-ch="${chNum}">💾 保存</button>
+                        <button type="button" class="menu_button tt-novel-btn-sm" data-action="cancel-sum">取消</button>
+                    </div>
+                </div>
+            `;
+        }
+        return `
+            <div class="tt-novel-state-row tt-novel-state-crud-row">
+                <div class="tt-novel-state-main">
+                    <span class="tt-novel-chip is-gold">第${chNum}章</span>
+                    ${sum.title ? `<strong>${escapeHtml(sum.title)}</strong>` : ''}
+                    <span>${escapeHtml(sum.summary)}</span>
+                </div>
+                <div class="tt-novel-card-actions">
+                    <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-sum" data-ch="${chNum}" title="编辑摘要">✏️</button>
+                    <button type="button" class="tt-novel-mini-icon-btn" data-action="del-sum" data-ch="${chNum}" title="删除摘要">🗑️</button>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    const worldAndSumsHtml = (worldStates.length === 0 && summaries.length === 0)
+        ? '<div class="tt-novel-empty">暂无势力/物品状态或单章续写摘要。可点下方按钮手动新增。</div>'
+        : `
+            ${worldStates.length > 0 ? `<div class="tt-novel-chip-list">${worldRowsHtml}</div>` : ''}
+            ${summaries.length > 0 ? `<div class="tt-novel-subhead">📝 续写单章摘要（${summaries.length}）</div><div class="tt-novel-chip-list">${summaryRowsHtml}</div>` : ''}
+        `;
+
+    const canonQ = canonSearchQuery.trim().toLowerCase();
+    const filteredCanon = canonQ
+        ? canonItems.filter(it =>
+            `${it.title || ''} ${it.category || ''} ${(it.keywords || []).join(' ')} ${it.content || ''}`.toLowerCase().includes(canonQ),
+        )
+        : canonItems;
+    const canonHtml = canonItems.length === 0
+        ? '<div class="tt-novel-empty">当前补充设定库为空。可在「⚙️ 设置」批量导入 JSON/TXT 设定集，或点「+ 新增设定」手动添加单条世界观/外传设定。</div>'
+        : (filteredCanon.length === 0
+            ? '<div class="tt-novel-empty">未匹配到符合关键词的设定条目。</div>'
+            : filteredCanon.slice(0, 60).map(it => {
+                if (editingCanonId === it.id) {
+                    return `
+                        <div class="tt-novel-card is-editing" data-canon-id="${escapeHtml(it.id)}">
+                            <div class="tt-novel-edit-grid">
+                                <div class="tt-novel-row-2">
+                                    <input type="text" class="text_pole" data-field="title" value="${escapeHtml(it.title || '')}" placeholder="设定标题" />
+                                    <input type="text" class="text_pole" data-field="category" value="${escapeHtml(it.category || '原作设定')}" placeholder="分类" />
+                                </div>
+                                <input type="text" class="text_pole" data-field="keywords" value="${escapeHtml((it.keywords || []).join('、'))}" placeholder="触发关键词（顿号/逗号分隔）" />
+                                <textarea class="text_pole" rows="3" data-field="content" placeholder="设定内容">${escapeHtml(it.content || '')}</textarea>
+                            </div>
+                            <div class="tt-novel-card-actions">
+                                <button type="button" class="menu_button tt-novel-btn-sm" data-action="save-canon" data-id="${escapeHtml(it.id)}">💾 保存</button>
+                                <button type="button" class="menu_button tt-novel-btn-sm" data-action="cancel-canon">取消</button>
+                            </div>
+                        </div>
+                    `;
+                }
+                return `
+                    <div class="tt-novel-card">
+                        <div class="tt-novel-card-head">
+                            <div class="tt-novel-timeline-meta">
+                                <span class="tt-novel-chip">${escapeHtml(it.category || '原作设定')}</span>
+                                <strong>${escapeHtml(it.title || '未命名设定')}</strong>
+                            </div>
+                            <div class="tt-novel-card-actions">
+                                <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-canon" data-id="${escapeHtml(it.id)}" title="编辑设定">✏️</button>
+                                <button type="button" class="tt-novel-mini-icon-btn" data-action="del-canon" data-id="${escapeHtml(it.id)}" title="删除设定">🗑️</button>
+                            </div>
+                        </div>
+                        ${(it.keywords || []).length > 0 ? `<div class="tt-novel-chip-row">${it.keywords.slice(0, 8).map(k => `<span class="tt-novel-chip is-gold">${escapeHtml(k)}</span>`).join('')}</div>` : ''}
+                        <div class="tt-novel-card-text">${escapeHtml(String(it.content || '').slice(0, 320))}${String(it.content || '').length > 320 ? '……' : ''}</div>
+                    </div>
+                `;
+            }).join(''));
 
     const showChars = memoryFilter === 'all' || memoryFilter === 'chars';
     const showChronicle = memoryFilter === 'all' || memoryFilter === 'chronicle';
     const showHooks = memoryFilter === 'all' || memoryFilter === 'hooks';
     const showWorld = memoryFilter === 'all' || memoryFilter === 'world';
+    const showCanon = memoryFilter === 'canon';
 
     bodyEl.innerHTML = `
         <div class="tt-novel-action-bar">
@@ -800,23 +1088,68 @@ function renderMemoryTab(bodyEl) {
                 ⚡ 增量补总结新章
             </button>
             <button type="button" id="tt-novel-add-char" class="menu_button">+ 人物</button>
+            <button type="button" id="tt-novel-add-evt" class="menu_button">+ 事件</button>
             <button type="button" id="tt-novel-add-hook" class="menu_button">+ 伏笔</button>
+            <button type="button" id="tt-novel-add-ws" class="menu_button">+ 状态</button>
+            <button type="button" id="tt-novel-add-canon" class="menu_button">+ 设定</button>
         </div>
+        ${narrativeConfigHtml}
         <div class="tt-novel-subfilter">
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'all' ? 'active' : ''}" data-filter="all">全部总览</button>
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'chars' ? 'active' : ''}" data-filter="chars">👤 人物 (${chars.length})</button>
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'chronicle' ? 'active' : ''}" data-filter="chronicle">📜 编年史 (${chronicle.length})</button>
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'hooks' ? 'active' : ''}" data-filter="hooks">🎯 伏笔 (${openHooks.length})</button>
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'world' ? 'active' : ''}" data-filter="world">🌍 状态 (${worldStates.length + summaries.length})</button>
+            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'canon' ? 'active' : ''}" data-filter="canon">📖 设定库 (${canonItems.length})</button>
         </div>
         ${progressHtml}
         ${sliceManagerHtml}
         ${logHtml}
-        ${showChars ? `<section class="tt-novel-section"><div class="tt-novel-section-title">👤 核心人物 4 维灵魂与防 OOC 档案（已归档至第 ${ledger.lastArchivedChapter || 0} 章）</div><div class="tt-novel-card-grid">${charCardsHtml}</div></section>` : ''}
-        ${showChronicle ? `<section class="tt-novel-section"><div class="tt-novel-section-title">📜 全本剧情编年史（无 RP 标签 · 保留信息差）</div><div class="tt-novel-card-stack">${chronicleHtml}</div></section>` : ''}
-        ${showHooks ? `<section class="tt-novel-section"><div class="tt-novel-section-title">🎯 伏笔与暗线追踪（点 🎯 设为本章重点推进）</div><div class="tt-novel-card-stack">${hooksHtml}</div></section>` : ''}
-        ${showWorld ? `<section class="tt-novel-section"><div class="tt-novel-section-title">🌍 势力 / 物品 / 单章状态记录</div><div class="tt-novel-card-stack">${worldAndSumsHtml}</div></section>` : ''}
+        ${showChars ? `<section class="tt-novel-section"><div class="tt-novel-section-title">👤 核心人物 4 维灵魂、当前着装与防 OOC 档案（已归档至第 ${ledger.lastArchivedChapter || 0} 章）</div><div class="tt-novel-card-grid">${charCardsHtml}</div></section>` : ''}
+        ${showChronicle ? `<section class="tt-novel-section"><div class="tt-novel-section-title">📜 全本剧情编年史（无 RP 标签 · 保留视角与信息差）</div><div class="tt-novel-card-stack">${chronicleHtml}</div></section>` : ''}
+        ${showHooks ? `<section class="tt-novel-section"><div class="tt-novel-section-title">🎯 伏笔与暗线追踪（点 🎯 设为本章重点推进 · 点 ✏️ 修改）</div><div class="tt-novel-card-stack">${hooksHtml}</div></section>` : ''}
+        ${showWorld ? `
+            <section class="tt-novel-section">
+                <div class="tt-novel-card-head">
+                    <div class="tt-novel-section-title">🌍 势力 / 物品 / 外观 / 单章状态记录</div>
+                    <div class="tt-novel-card-actions">
+                        <button type="button" id="tt-novel-add-ws-inline" class="menu_button tt-novel-btn-sm">+ 状态</button>
+                        <button type="button" id="tt-novel-add-sum-inline" class="menu_button tt-novel-btn-sm">+ 单章摘要</button>
+                    </div>
+                </div>
+                <div class="tt-novel-card-stack">${worldAndSumsHtml}</div>
+            </section>
+        ` : ''}
+        ${showCanon ? `
+            <section class="tt-novel-section">
+                <div class="tt-novel-card-head">
+                    <div class="tt-novel-section-title">📖 补充设定数据库（共 ${canonItems.length} 条 · 显示 ${Math.min(filteredCanon.length, 60)} 条）</div>
+                    <button type="button" id="tt-novel-add-canon-inline" class="menu_button tt-novel-btn-sm">+ 新增设定</button>
+                </div>
+                <input type="search" id="tt-novel-canon-search" class="text_pole" value="${escapeHtml(canonSearchQuery)}" placeholder="搜索设定标题、分类或关键词..." style="margin-bottom: 8px;" />
+                <div class="tt-novel-card-stack">${canonHtml}</div>
+            </section>
+        ` : ''}
     `;
+
+    bodyEl.querySelector('#tt-novel-ncfg-save')?.addEventListener('click', async () => {
+        const patch = {
+            povMode: String(bodyEl.querySelector('#tt-novel-ncfg-pov-mode')?.value || 'auto'),
+            povCharacter: String(bodyEl.querySelector('#tt-novel-ncfg-pov-char')?.value || '').trim(),
+            povPerson: String(bodyEl.querySelector('#tt-novel-ncfg-pov-person')?.value || 'follow_original'),
+            worldInfoMode: String(bodyEl.querySelector('#tt-novel-ncfg-wi-mode')?.value || 'bridge'),
+            worldInfoPriority: String(bodyEl.querySelector('#tt-novel-ncfg-wi-priority')?.value || 'novel_over_wi'),
+            worldInfoBudgetChars: Number(bodyEl.querySelector('#tt-novel-ncfg-wi-budget')?.value || 12000),
+            strictTimelineOrder: Boolean(bodyEl.querySelector('#tt-novel-ncfg-strict-tl')?.checked),
+            excludeFlashbackFromAnchor: Boolean(bodyEl.querySelector('#tt-novel-ncfg-skip-fb')?.checked),
+        };
+        if (patch.povMode === 'strict_limited' && !patch.povCharacter) {
+            globalThis.toastr?.warning?.('已选「严格限制单视角」，请填写视角人物名称（如主角名）', '小说续写阅读器');
+            return;
+        }
+        await handlers.onUpdateNarrativeConfig?.(patch);
+        globalThis.toastr?.success?.('已保存本书叙事视角、时间线与世界书规则！', '小说续写阅读器');
+    });
 
     bodyEl.querySelector('#tt-novel-run-archive-full')?.addEventListener('click', () => handlers.onRunArchive?.('full'));
     bodyEl.querySelector('#tt-novel-run-archive-inc')?.addEventListener('click', () => handlers.onRunArchive?.('incremental'));
@@ -844,6 +1177,7 @@ function renderMemoryTab(bodyEl) {
             name: name.trim(),
             role: '',
             canonFoundation: '',
+            currentAppearance: '',
             currentSituation: '',
             voiceAndQuotes: '',
             oocRedLines: '',
@@ -852,6 +1186,34 @@ function renderMemoryTab(bodyEl) {
         cur.characters.push(newChar);
         await saveLedger(cur);
         editingCharacterId = newChar.id;
+        if (memoryFilter !== 'all' && memoryFilter !== 'chars') memoryFilter = 'chars';
+        await refreshReaderWidgets();
+    });
+
+    bodyEl.querySelector('#tt-novel-add-evt')?.addEventListener('click', async () => {
+        const title = window.prompt('请输入新增编年史事件标题：');
+        if (!title || !title.trim()) return;
+        const cur = await loadLedger();
+        const chIdx = Number(cachedNovelData?.cutoffChapterIndex || 1);
+        const newEvt = {
+            id: `evt_manual_${Date.now()}`,
+            title: title.trim(),
+            chapterRange: `#${chIdx}`,
+            startChapter: chIdx,
+            endChapter: chIdx,
+            timeLabel: '',
+            pov: nCfg.povCharacter || '',
+            timelinePhase: 'main',
+            participants: [],
+            summary: '',
+            infoGap: '',
+            povKnown: '',
+            povBlindspot: '',
+        };
+        cur.chronicle.push(newEvt);
+        await saveLedger(cur);
+        editingEventId = newEvt.id;
+        if (memoryFilter !== 'all' && memoryFilter !== 'chronicle') memoryFilter = 'chronicle';
         await refreshReaderWidgets();
     });
 
@@ -868,6 +1230,74 @@ function renderMemoryTab(bodyEl) {
         await saveLedger(cur);
         await refreshReaderWidgets();
     });
+
+    const addWorldStateFlow = async () => {
+        const name = window.prompt('请输入状态条目名（例如角色名、物品名或势力名）：');
+        if (!name || !name.trim()) return;
+        const cur = await loadLedger();
+        const chIdx = Number(cachedNovelData?.cutoffChapterIndex || 1);
+        const newWs = {
+            id: `ws_manual_${Date.now()}`,
+            category: '人物',
+            name: name.trim(),
+            state: '',
+            effectiveChapter: chIdx,
+            updatedAt: Date.now(),
+        };
+        cur.worldStates.push(newWs);
+        await saveLedger(cur);
+        editingWorldStateId = newWs.id;
+        memoryFilter = 'world';
+        await refreshReaderWidgets();
+    };
+    bodyEl.querySelector('#tt-novel-add-ws')?.addEventListener('click', addWorldStateFlow);
+    bodyEl.querySelector('#tt-novel-add-ws-inline')?.addEventListener('click', addWorldStateFlow);
+
+    bodyEl.querySelector('#tt-novel-add-sum-inline')?.addEventListener('click', async () => {
+        const rawCh = window.prompt('请输入摘要对应的章号：', String(Number(cachedNovelData?.cutoffChapterIndex || 1) + 1));
+        const chNum = Number(rawCh);
+        if (!Number.isFinite(chNum) || chNum < 1) return;
+        const cur = await loadLedger();
+        cur.summaries = cur.summaries.filter(x => Number(x.chapterIndex) !== chNum);
+        cur.summaries.push({
+            chapterIndex: chNum,
+            floorIndex: null,
+            title: `第 ${chNum} 章`,
+            summary: '',
+            updatedAt: Date.now(),
+        });
+        cur.summaries.sort((a, b) => a.chapterIndex - b.chapterIndex);
+        await saveLedger(cur);
+        editingSummaryChapter = chNum;
+        memoryFilter = 'world';
+        await refreshReaderWidgets();
+    });
+
+    const addCanonFlow = async () => {
+        const title = window.prompt('请输入新增设定条目标题：');
+        if (!title || !title.trim()) return;
+        const curCanon = await loadCanonDb();
+        const newItem = {
+            id: `canon_manual_${Date.now()}`,
+            title: title.trim(),
+            category: '原作设定',
+            keywords: [title.trim()],
+            content: '',
+            source: '手动录入',
+        };
+        curCanon.items.unshift(newItem);
+        await saveCanonDb(curCanon);
+        editingCanonId = newItem.id;
+        memoryFilter = 'canon';
+        await refreshReaderWidgets();
+    };
+    bodyEl.querySelector('#tt-novel-add-canon')?.addEventListener('click', addCanonFlow);
+    bodyEl.querySelector('#tt-novel-add-canon-inline')?.addEventListener('click', addCanonFlow);
+
+    bodyEl.querySelector('#tt-novel-canon-search')?.addEventListener('input', debounce((e) => {
+        canonSearchQuery = String(e.target.value || '');
+        renderWorkbench();
+    }, 180));
 
     // Character CRUD bindings
     bodyEl.querySelectorAll('[data-action="edit-char"]').forEach(btn => {
@@ -893,6 +1323,7 @@ function renderMemoryTab(bodyEl) {
                 const val = (f) => String(card.querySelector(`[data-field="${f}"]`)?.value || '').trim();
                 target.name = val('name') || target.name;
                 target.role = val('role');
+                target.currentAppearance = val('currentAppearance');
                 target.canonFoundation = val('canonFoundation');
                 target.currentSituation = val('currentSituation');
                 target.voiceAndQuotes = val('voiceAndQuotes');
@@ -935,12 +1366,23 @@ function renderMemoryTab(bodyEl) {
             const target = cur.chronicle.find(e => e.id === id);
             if (target) {
                 const val = (f) => String(card.querySelector(`[data-field="${f}"]`)?.value || '').trim();
-                target.chapterRange = val('chapterRange') || target.chapterRange;
+                const rangeStr = val('chapterRange') || target.chapterRange;
+                const nums = [...rangeStr.matchAll(/\d+/g)].map(m => Number(m[0])).filter(n => n > 0);
+                target.chapterRange = rangeStr;
+                if (nums.length > 0) {
+                    target.startChapter = nums[0];
+                    target.endChapter = nums[nums.length - 1];
+                }
                 target.timeLabel = val('timeLabel');
+                target.timelinePhase = val('timelinePhase') === 'flashback' ? 'flashback' : 'main';
+                target.pov = val('pov');
                 target.title = val('title') || target.title;
                 target.participants = val('participants').split(/[、,，\s]+/).filter(Boolean);
                 target.summary = val('summary') || target.summary;
                 target.infoGap = val('infoGap');
+                target.povKnown = val('povKnown');
+                target.povBlindspot = val('povBlindspot');
+                cur.chronicle.sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0));
                 await saveLedger(cur);
             }
             editingEventId = null;
@@ -957,7 +1399,44 @@ function renderMemoryTab(bodyEl) {
         });
     });
 
-    // Hook bindings
+    // Hook CRUD bindings
+    bodyEl.querySelectorAll('[data-action="edit-hook"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingHookId = btn.getAttribute('data-id');
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="cancel-hook"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingHookId = null;
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="save-hook"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const card = bodyEl.querySelector(`.tt-novel-card[data-hook-id="${CSS.escape(id)}"]`);
+            if (!card) return;
+            const cur = await loadLedger();
+            const target = cur.hooks.find(h => h.id === id);
+            if (target) {
+                const content = String(card.querySelector('[data-field="content"]')?.value || '').trim();
+                const planted = Number(card.querySelector('[data-field="plantedChapter"]')?.value || target.plantedChapter || 1);
+                const status = String(card.querySelector('[data-field="status"]')?.value || target.status || 'open');
+                if (content) target.content = content;
+                if (Number.isFinite(planted) && planted >= 1) target.plantedChapter = planted;
+                target.status = status;
+                if (status === 'resolved' && !target.resolvedChapter) {
+                    target.resolvedChapter = Number(cachedNovelData?.cutoffChapterIndex || planted);
+                } else if (status !== 'resolved') {
+                    delete target.resolvedChapter;
+                }
+                await saveLedger(cur);
+            }
+            editingHookId = null;
+            await refreshReaderWidgets();
+        });
+    });
     bodyEl.querySelectorAll('[data-action="pin-hook"]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const id = btn.getAttribute('data-id');
@@ -994,6 +1473,141 @@ function renderMemoryTab(bodyEl) {
             const cur = await loadLedger();
             cur.hooks = cur.hooks.filter(h => h.id !== id);
             await saveLedger(cur);
+            await refreshReaderWidgets();
+        });
+    });
+
+    // WorldState CRUD bindings
+    bodyEl.querySelectorAll('[data-action="edit-ws"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingWorldStateId = btn.getAttribute('data-id');
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="cancel-ws"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingWorldStateId = null;
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="save-ws"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const card = bodyEl.querySelector(`.tt-novel-card[data-ws-id="${CSS.escape(id)}"]`);
+            if (!card) return;
+            const cur = await loadLedger();
+            const idx = cur.worldStates.findIndex((w, i) => (w.id || `ws_idx_${i}`) === id);
+            if (idx >= 0) {
+                const val = (f) => String(card.querySelector(`[data-field="${f}"]`)?.value || '').trim();
+                const ch = Number(val('effectiveChapter')) || 1;
+                cur.worldStates[idx] = {
+                    ...cur.worldStates[idx],
+                    id: cur.worldStates[idx].id || id,
+                    category: val('category') || '人物',
+                    name: val('name') || cur.worldStates[idx].name,
+                    state: val('state'),
+                    effectiveChapter: Math.max(1, ch),
+                    updatedAt: Date.now(),
+                };
+                await saveLedger(cur);
+            }
+            editingWorldStateId = null;
+            await refreshReaderWidgets();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="del-ws"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const cur = await loadLedger();
+            cur.worldStates = cur.worldStates.filter((w, i) => (w.id || `ws_idx_${i}`) !== id);
+            await saveLedger(cur);
+            await refreshReaderWidgets();
+        });
+    });
+
+    // Summary CRUD bindings
+    bodyEl.querySelectorAll('[data-action="edit-sum"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingSummaryChapter = Number(btn.getAttribute('data-ch'));
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="cancel-sum"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingSummaryChapter = null;
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="save-sum"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const origCh = Number(btn.getAttribute('data-ch'));
+            const card = bodyEl.querySelector(`.tt-novel-card[data-sum-ch="${origCh}"]`);
+            if (!card) return;
+            const cur = await loadLedger();
+            const target = cur.summaries.find(x => Number(x.chapterIndex) === origCh);
+            if (target) {
+                const val = (f) => String(card.querySelector(`[data-field="${f}"]`)?.value || '').trim();
+                const newCh = Number(val('chapterIndex')) || origCh;
+                target.chapterIndex = Math.max(1, newCh);
+                target.title = val('title') || `第 ${target.chapterIndex} 章`;
+                target.summary = val('summary');
+                target.updatedAt = Date.now();
+                cur.summaries.sort((a, b) => a.chapterIndex - b.chapterIndex);
+                await saveLedger(cur);
+            }
+            editingSummaryChapter = null;
+            await refreshReaderWidgets();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="del-sum"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const chNum = Number(btn.getAttribute('data-ch'));
+            const cur = await loadLedger();
+            cur.summaries = cur.summaries.filter(x => Number(x.chapterIndex) !== chNum);
+            await saveLedger(cur);
+            await refreshReaderWidgets();
+        });
+    });
+
+    // Canon DB CRUD bindings
+    bodyEl.querySelectorAll('[data-action="edit-canon"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingCanonId = btn.getAttribute('data-id');
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="cancel-canon"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            editingCanonId = null;
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="save-canon"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const card = bodyEl.querySelector(`.tt-novel-card[data-canon-id="${CSS.escape(id)}"]`);
+            if (!card) return;
+            const curCanon = await loadCanonDb();
+            const target = curCanon.items.find(it => it.id === id);
+            if (target) {
+                const val = (f) => String(card.querySelector(`[data-field="${f}"]`)?.value || '').trim();
+                target.title = val('title') || target.title;
+                target.category = val('category') || '原作设定';
+                const kws = val('keywords').split(/[、,，;；\s]+/).map(k => k.trim()).filter(Boolean);
+                target.keywords = kws.length > 0 ? kws : [target.title];
+                target.content = val('content');
+                await saveCanonDb(curCanon);
+            }
+            editingCanonId = null;
+            await refreshReaderWidgets();
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="del-canon"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            const curCanon = await loadCanonDb();
+            curCanon.items = curCanon.items.filter(it => it.id !== id);
+            await saveCanonDb(curCanon);
             await refreshReaderWidgets();
         });
     });
@@ -1067,9 +1681,7 @@ function renderStyleTab(bodyEl) {
             `;
         }).join('');
 
-    const progressHtml = task.text
-        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
-        : '';
+    const progressHtml = renderTaskProgressBanner('style', task);
 
     const cardLen = sp?.styleCard ? String(sp.styleCard).length : 0;
     const isBloatedCard = cardLen > 3500;
@@ -1178,9 +1790,7 @@ function renderClicheTab(bodyEl) {
     const rewriteCustomModels = Array.isArray(settings.rewriteCustomApiModelsCache) ? settings.rewriteCustomApiModelsCache : [];
     const savedRewriteCustomModel = String(settings.rewriteCustomApiModel || '');
 
-    const progressHtml = task.text
-        ? `<div class="tt-novel-banner ${task.error ? 'is-error' : (task.running ? 'is-running' : 'is-ok')}">${escapeHtml(task.text)}</div>`
-        : '';
+    const progressHtml = renderTaskProgressBanner('cliche', task);
 
     let rewriteModelConfigHtml = `<div class="tt-novel-muted">当前重塑将跟随后台设置：<code>${escapeHtml(meta.activeModel || '当前酒馆模型')}</code> · 预设：<code>${escapeHtml(meta.presetLabel || '当前酒馆预设')}</code></div>`;
     if (rewriteMode === 'tavern_override') {
@@ -1441,12 +2051,55 @@ function renderTocTab(bodyEl) {
         });
     });
 
+    const addChapterHtml = addingChapterOpen
+        ? `
+        <div class="tt-novel-card is-editing" style="margin-bottom: 10px;">
+            <div class="tt-novel-section-title">➕ 手动新增原著章节</div>
+            <div class="tt-novel-edit-grid">
+                <div class="tt-novel-row-2">
+                    <input type="text" id="tt-novel-newch-title" class="text_pole" placeholder="章节标题（例如：第 78 章 新的开始）" />
+                    <select id="tt-novel-newch-role" class="text_pole">
+                        <option value="main">主线正叙</option>
+                        <option value="flashback">倒叙 / 他视角补完</option>
+                        <option value="skip">跳过 / 废稿</option>
+                    </select>
+                </div>
+                <textarea id="tt-novel-newch-content" class="text_pole" rows="5" placeholder="粘贴或输入章节正文..."></textarea>
+            </div>
+            <div class="tt-novel-card-actions">
+                <button type="button" id="tt-novel-newch-save" class="menu_button tt-novel-btn-sm tt-novel-btn-primary">💾 保存章节</button>
+                <button type="button" id="tt-novel-newch-cancel" class="menu_button tt-novel-btn-sm">取消</button>
+            </div>
+        </div>
+        `
+        : '';
+
+    const bulkToolsHtml = novel?.chapters?.length
+        ? `
+        <details class="tt-novel-fold-card" style="margin-bottom: 8px;">
+            <summary>🛠️ 按章号区间批量标注 / 删除（可快速标记倒叙卷、他视角或剔除多余章节）</summary>
+            <div class="tt-novel-edit-grid" style="margin-top: 8px;">
+                <input type="text" id="tt-novel-toc-bulk-range" class="text_pole" value="${escapeHtml(tocBulkRangeText)}" placeholder="输入章号或区间，如：78-135 或 10, 22-25" />
+                <div class="tt-novel-action-bar">
+                    <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_flashback">⏪ 设为倒叙/他视角</button>
+                    <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_main">▶️ 设为主线正叙</button>
+                    <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_skip">⏭️ 设为跳过</button>
+                    <button type="button" class="menu_button tt-novel-btn-sm tt-novel-btn-stop" data-bulk-action="delete">🗑️ 批量删除</button>
+                </div>
+            </div>
+        </details>
+        `
+        : '';
+
     bodyEl.innerHTML = `
         <div class="tt-novel-toc-jumps">
             <button type="button" id="tt-novel-jump-cutoff" class="tt-novel-jump-btn">📍 跳至断更处</button>
             <button type="button" id="tt-novel-jump-latest" class="tt-novel-jump-btn">🔥 跳至最新章</button>
             <button type="button" id="tt-novel-jump-saved" class="tt-novel-jump-btn">🔖 上次阅读</button>
+            <button type="button" id="tt-novel-toc-add-ch" class="tt-novel-jump-btn">➕ 新增章节</button>
         </div>
+        ${addChapterHtml}
+        ${bulkToolsHtml}
         <input type="search" id="tt-novel-toc-search" class="text_pole" placeholder="搜索章节标题或原著关键词..." />
         <div id="tt-novel-toc-list" class="tt-novel-toc-list-inline"></div>
     `;
@@ -1459,7 +2112,10 @@ function renderTocTab(bodyEl) {
 
         if (novel?.chapters?.length) {
             const cutoff = novel.cutoffChapterIndex || novel.totalChapters;
-            rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（共 ${novel.totalChapters} 章 · 当前锚点 #${cutoff}）</div>`);
+            const fbCount = novel.chapters.filter(c => c.timelineRole === 'flashback').length;
+            const skipCount = novel.chapters.filter(c => c.timelineRole === 'skip').length;
+            const extraMeta = `${fbCount > 0 ? ` · ${fbCount}章倒叙` : ''}${skipCount > 0 ? ` · ${skipCount}章跳过` : ''}`;
+            rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（共 ${novel.totalChapters} 章 · 当前锚点 #${cutoff}${extraMeta}）</div>`);
             let visible = novel.chapters;
             if (q) {
                 const titleHits = novel.chapters.filter(ch => ch.title.toLowerCase().includes(q));
@@ -1473,21 +2129,50 @@ function renderTocTab(bodyEl) {
                 rows.push(`<button type="button" id="tt-novel-toc-show-all" class="tt-novel-jump-btn">展开全部 ${novel.chapters.length} 章</button>`);
             }
             for (const ch of visible) {
+                if (editingChapterIndex === ch.index) {
+                    rows.push(`
+                        <div class="tt-novel-card is-editing" data-edit-ch="${ch.index}">
+                            <div class="tt-novel-edit-grid">
+                                <div class="tt-novel-row-2">
+                                    <input type="text" class="text_pole" data-field="title" value="${escapeHtml(ch.title)}" placeholder="章节标题" />
+                                    <select class="text_pole" data-field="timelineRole">
+                                        <option value="main" ${ch.timelineRole !== 'flashback' && ch.timelineRole !== 'skip' ? 'selected' : ''}>▶️ 主线正叙</option>
+                                        <option value="flashback" ${ch.timelineRole === 'flashback' ? 'selected' : ''}>⏪ 倒叙 / 他视角补完</option>
+                                        <option value="skip" ${ch.timelineRole === 'skip' ? 'selected' : ''}>⏭️ 跳过 / 废稿</option>
+                                    </select>
+                                </div>
+                                <textarea class="text_pole" rows="6" data-field="content">${escapeHtml(ch.content || '')}</textarea>
+                            </div>
+                            <div class="tt-novel-card-actions">
+                                <button type="button" class="menu_button tt-novel-btn-sm tt-novel-btn-primary" data-action="save-orig-ch" data-orig-index="${ch.index}">💾 保存章节</button>
+                                <button type="button" class="menu_button tt-novel-btn-sm" data-action="cancel-orig-ch">取消</button>
+                            </div>
+                        </div>
+                    `);
+                    continue;
+                }
                 const mountedFloor = originalFloorByChapter.get(ch.index);
                 const isCutoff = ch.index === cutoff;
                 const isAfter = ch.index > cutoff;
+                const role = ch.timelineRole || 'main';
                 const tagClass = isAfter ? 'masked' : (isCutoff ? 'cutoff' : 'orig');
-                const tagText = isAfter ? '屏蔽' : (isCutoff ? '夺舍点' : '原著');
+                const tagText = isAfter ? '屏蔽' : (isCutoff ? '夺舍点' : `#${ch.index}`);
+                const roleChip = role === 'flashback'
+                    ? '<span class="tt-novel-chip is-warn">倒叙</span>'
+                    : (role === 'skip' ? '<span class="tt-novel-chip is-danger">跳过</span>' : '');
                 rows.push(`
                     <div class="tt-novel-toc-item ${isCutoff ? 'is-cutoff' : ''} ${isAfter ? 'is-masked' : ''}">
                         <div class="tt-novel-toc-item-main" data-action="view-orig" data-orig-index="${ch.index}">
                             <span class="tt-novel-toc-tag ${tagClass}">${tagText}</span>
+                            ${roleChip}
                             <span class="tt-novel-toc-name">${escapeHtml(ch.title)}</span>
                             <span class="tt-novel-toc-meta">${mountedFloor !== undefined ? `#${mountedFloor}` : `${ch.wordCount}字`}</span>
                         </div>
                         <div class="tt-novel-toc-actions">
                             <button type="button" class="tt-novel-view-btn" data-action="view-orig" data-orig-index="${ch.index}">阅读</button>
                             <button type="button" class="tt-novel-cutoff-btn" data-action="cutoff-here" data-orig-index="${ch.index}">夺舍</button>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-orig-ch" data-orig-index="${ch.index}" title="编辑此章">✏️</button>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="del-orig-ch" data-orig-index="${ch.index}" title="删除此章">🗑️</button>
                         </div>
                     </div>
                 `);
@@ -1547,9 +2232,82 @@ function renderTocTab(bodyEl) {
                 await refreshReaderWidgets();
             });
         });
+        listEl.querySelectorAll('[data-action="edit-orig-ch"]').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                editingChapterIndex = Number(btn.getAttribute('data-orig-index'));
+                paintList(q);
+            });
+        });
+        listEl.querySelectorAll('[data-action="cancel-orig-ch"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                editingChapterIndex = null;
+                paintList(q);
+            });
+        });
+        listEl.querySelectorAll('[data-action="save-orig-ch"]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const idx = Number(btn.getAttribute('data-orig-index'));
+                const card = listEl.querySelector(`[data-edit-ch="${idx}"]`);
+                if (!card) return;
+                const title = String(card.querySelector('[data-field="title"]')?.value || '').trim();
+                const timelineRole = String(card.querySelector('[data-field="timelineRole"]')?.value || 'main');
+                const content = String(card.querySelector('[data-field="content"]')?.value || '').trim();
+                editingChapterIndex = null;
+                await handlers.onEditOriginalChapter?.(idx, { title, timelineRole, content });
+            });
+        });
+        listEl.querySelectorAll('[data-action="del-orig-ch"]').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const idx = Number(btn.getAttribute('data-orig-index'));
+                if (!window.confirm(`确定删除原著第 ${idx} 章吗？删除后后续章号将自动顺延重排。`)) return;
+                await handlers.onDeleteOriginalChapter?.(idx);
+            });
+        });
     };
 
     paintList('');
+
+    bodyEl.querySelector('#tt-novel-toc-add-ch')?.addEventListener('click', () => {
+        addingChapterOpen = !addingChapterOpen;
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-newch-cancel')?.addEventListener('click', () => {
+        addingChapterOpen = false;
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-newch-save')?.addEventListener('click', async () => {
+        const title = String(bodyEl.querySelector('#tt-novel-newch-title')?.value || '').trim();
+        const timelineRole = String(bodyEl.querySelector('#tt-novel-newch-role')?.value || 'main');
+        const content = String(bodyEl.querySelector('#tt-novel-newch-content')?.value || '').trim();
+        if (!content) {
+            globalThis.toastr?.warning?.('请输入章节正文', '小说续写阅读器');
+            return;
+        }
+        addingChapterOpen = false;
+        await handlers.onAddOriginalChapter?.({ title, timelineRole, content });
+    });
+
+    const bulkInput = bodyEl.querySelector('#tt-novel-toc-bulk-range');
+    bulkInput?.addEventListener('input', (e) => {
+        tocBulkRangeText = String(e.target.value || '');
+    });
+    bodyEl.querySelectorAll('[data-bulk-action]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const action = btn.getAttribute('data-bulk-action');
+            const rangeText = String(bulkInput?.value || '').trim();
+            tocBulkRangeText = rangeText;
+            if (!rangeText) {
+                globalThis.toastr?.warning?.('请先输入章号区间（例如：78-135）', '小说续写阅读器');
+                return;
+            }
+            if (action === 'delete' && !window.confirm(`确定批量删除区间 [${rangeText}] 的原著章节吗？此操作不可撤销。`)) {
+                return;
+            }
+            await handlers.onBulkUpdateOriginalChapters?.({ rangeText, action });
+        });
+    });
 
     bodyEl.querySelector('#tt-novel-toc-search')?.addEventListener('input', debounce((e) => {
         paintList(String(e.target.value || ''));

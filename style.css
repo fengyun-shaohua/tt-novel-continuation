@@ -1047,3 +1047,68 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     gap: 8px;
     margin-top: 6px;
 }
+
+/* v1.6.0 Universal POV / WorldInfo / Stop / CRUD Additions */
+.tt-novel-banner-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.tt-novel-banner-text {
+    flex: 1 1 200px;
+    min-width: 0;
+}
+
+.tt-novel-btn-stop {
+    background: rgba(214, 72, 72, 0.22) !important;
+    border: 1px solid rgba(242, 107, 107, 0.55) !important;
+    color: #ffd4d4 !important;
+    flex-shrink: 0;
+}
+
+.tt-novel-btn-stop:hover {
+    background: rgba(214, 72, 72, 0.36) !important;
+}
+
+.tt-novel-state-crud-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.tt-novel-state-main {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.tt-novel-char-row.is-appear {
+    border-left: 3px solid #6ec6ff;
+    padding-left: 8px;
+}
+
+.tt-novel-chip.is-warn {
+    background: rgba(235, 168, 52, 0.2);
+    border-color: rgba(235, 168, 52, 0.45);
+    color: #ffe2a8;
+}
+
+.tt-novel-check-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    cursor: pointer;
+}
+
+.tt-novel-narrative-box {
+    margin: 8px 0;
+}

@@ -2,6 +2,7 @@ import { extension_settings, getContext } from '/scripts/extensions.js';
 import { extension_prompt_roles, extension_prompt_types } from '/scripts/extension-prompts.js';
 import { oai_settings } from '/scripts/openai.js';
 import { getPresetManager } from '/scripts/preset-manager.js';
+import { getWorldInfoPrompt } from '/scripts/world-info.js';
 import { deleteMessage, resetChatSurfaceView } from '/script.js';
 import { escapeHtml } from '/scripts/utils.js';
 import {
@@ -17,7 +18,13 @@ import {
     isContinuedNovelFloor,
     resolveCurrentTargetChapterIndex,
 } from './context-assembler.js';
-import { extractNovelStateBlock, parseNovelTxt, parseSupplementaryDatabase, stripNonStoryBlocks } from './parser.js';
+import {
+    extractNovelStateBlock,
+    parseChapterRangeSpec,
+    parseNovelTxt,
+    parseSupplementaryDatabase,
+    stripNonStoryBlocks,
+} from './parser.js';
 import { generateDirectorOutline, resolveLatestChapterAnchor } from './outline-director.js';
 import {
     applyReaderBodyClasses,
@@ -40,7 +47,10 @@ import {
     loadLedger,
     loadNovelData,
     mergeArchivedDataIntoLedger,
+    normalizeNarrativeConfig,
+    normalizeTimelineRole,
     pruneLedgerAfterChapter,
+    reindexNovelChapters,
     saveCanonDb,
     saveLedger,
     saveNovelData,
@@ -54,7 +64,10 @@ import {
 import {
     buildDistillationPresetMessages,
     compressAndDeoverfitStyleCard,
+    createAbortError,
+    isAbortError,
     runStyleDistillationPipeline,
+    throwIfAborted,
 } from './style-distiller.js';
 
 const SETTINGS_KEY = 'novel_continuation';
@@ -323,7 +336,8 @@ async function onMessageReceived(messageId, type) {
 
         context.updateMessageBlock?.(messageId, msg);
 
-        const firstLine = extracted.cleanText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
+        const pureStoryText = stripNonStoryBlocks(extracted.cleanText).replace(/<\/?game>/gi, '').trim();
+        const firstLine = pureStoryText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
         const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
 
         await applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle, messageId);
@@ -453,7 +467,14 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
     const focusTarget = focusChapterIndex
         ? Math.min(maxChapter, Math.max(1, focusChapterIndex))
         : maxChapter;
-    const selectedChapters = novelData.chapters.filter(c => c.index >= 1 && c.index <= maxChapter);
+    const ledgerForMount = await loadLedger();
+    const excludeFlashback = ledgerForMount?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
+    const selectedChapters = novelData.chapters.filter(c => {
+        if (!c || c.index < 1 || c.index > maxChapter) return false;
+        if (c.timelineRole === 'skip') return false;
+        if (excludeFlashback && c.timelineRole === 'flashback') return false;
+        return true;
+    });
 
     const continuedTail = context.chat.filter(
         (m, idx) => m?.extra?.novelContinuationOrigin === 'continued' || (idx > 0 && m?.is_user),
@@ -678,7 +699,94 @@ function extractChatCompletionText(data) {
     return '';
 }
 
-async function callCustomOpenAiViaHost({ baseUrl, apiKey, model, temperature, messages }) {
+const activeTaskControllers = new Map();
+
+function beginBackgroundTaskController(taskKey) {
+    const prev = activeTaskControllers.get(taskKey);
+    if (prev) {
+        try { prev.abort(); } catch { /* ignore */ }
+    }
+    const ctrl = new AbortController();
+    activeTaskControllers.set(taskKey, ctrl);
+    return ctrl;
+}
+
+function endBackgroundTaskController(taskKey, ctrl) {
+    if (activeTaskControllers.get(taskKey) === ctrl) {
+        activeTaskControllers.delete(taskKey);
+    }
+}
+
+function stopBackgroundTask(taskKey) {
+    const ctrl = activeTaskControllers.get(taskKey);
+    if (ctrl) {
+        try { ctrl.abort(); } catch { /* ignore */ }
+        activeTaskControllers.delete(taskKey);
+    }
+    try {
+        getContext()?.stopGeneration?.();
+    } catch {
+        // Ignore if Tavern is not generating
+    }
+    if (taskKey === 'cliche') {
+        deepRewriteInFlight = false;
+    }
+    updateLiveProgress(taskKey, {
+        isRunning: false,
+        isError: false,
+        text: '⏹ 任务已手动停止（已完成的进度与切片均已安全保留）。',
+    });
+    globalThis.toastr?.info?.('已发送停止信号，当前后台任务将立即中止', '小说续写阅读器');
+}
+
+async function collectActivatedTavernWorldInfo({ novelData = null, ledger = null, extraTexts = [] } = {}) {
+    const cfg = normalizeNarrativeConfig(ledger?.narrativeConfig);
+    if (cfg.worldInfoMode === 'off') return '';
+    if (typeof getWorldInfoPrompt !== 'function') return '';
+    try {
+        const context = getContext();
+        const chat = Array.isArray(context?.chat) ? context.chat : [];
+        const scanTexts = [];
+        for (const extra of extraTexts || []) {
+            const clean = stripNonStoryBlocks(String(extra || '')).trim();
+            if (clean) scanTexts.push(clean.slice(-2000));
+        }
+        for (let i = chat.length - 1; i >= 0 && scanTexts.length < 6; i -= 1) {
+            const clean = stripNonStoryBlocks(String(chat[i]?.mes || '')).trim();
+            if (clean) scanTexts.push(clean.slice(-1500));
+        }
+        const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
+        const anchor = cutoff > 0
+            ? (novelData?.chapters || []).find(c => Number(c.index) === cutoff)
+            : null;
+        if (anchor?.content) {
+            scanTexts.push(stripNonStoryBlocks(anchor.content).slice(-1200));
+        }
+        const charNames = (ledger?.characters || []).map(c => c?.name).filter(Boolean);
+        if (charNames.length > 0) {
+            scanTexts.push(charNames.join(' '));
+        }
+        if (scanTexts.length === 0) return '';
+
+        const maxCtx = Math.max(8192, Number(oai_settings?.openai_max_context) || 65536);
+        const wiRes = await getWorldInfoPrompt(scanTexts, maxCtx, true);
+        const combined = [
+            String(wiRes?.worldInfoBefore || '').trim(),
+            String(wiRes?.worldInfoAfter || '').trim(),
+        ].filter(Boolean).join('\n\n').trim();
+        if (!combined) return '';
+
+        const budget = cfg.worldInfoBudgetChars || 12000;
+        if (combined.length <= budget) return combined;
+        return `${combined.slice(0, budget)}\n……（世界书条目较长，已按 ${budget} 字预算截断）`;
+    } catch (err) {
+        console.warn('[小说续写阅读器] 读取酒馆世界书失败（已安全忽略）：', err);
+        return '';
+    }
+}
+
+async function callCustomOpenAiViaHost({ baseUrl, apiKey, model, temperature, messages, signal = null }) {
+    throwIfAborted(signal);
     const context = getContext();
     const headers = typeof context?.getRequestHeaders === 'function'
         ? { ...context.getRequestHeaders(), 'Content-Type': 'application/json' }
@@ -687,6 +795,7 @@ async function callCustomOpenAiViaHost({ baseUrl, apiKey, model, temperature, me
     const response = await fetch('/api/backends/chat-completions/generate', {
         method: 'POST',
         headers,
+        signal: signal || undefined,
         body: JSON.stringify({
             chat_completion_source: 'custom',
             custom_url: '',
@@ -813,7 +922,7 @@ function getAvailableTavernModelsForActiveSource() {
  * 3) Director Outline Generator (`outline-director.js`)
  * 4) Deep Diagnosis & Rewrite / Surgical De-Cliché (`cliche-guard.js`, supporting dedicated rewrite model override!)
  */
-function createPresetModelCaller({ role = 'bg' } = {}) {
+function createPresetModelCaller({ role = 'bg', signal = null } = {}) {
     const context = getContext();
     const settings = getSettings();
     const resolvedPreset = resolveSelectedDistillationPreset(settings.distillPresetName);
@@ -848,6 +957,7 @@ function createPresetModelCaller({ role = 'bg' } = {}) {
                 : '当前已选择「自定义 API」，请先在「工作台 → 设置」选择或填写模型名称');
         }
         const callModel = async ({ prompt, systemPrompt }) => {
+            throwIfAborted(signal);
             const messages = resolvedPreset.presetObj
                 ? buildDistillationPresetMessages(resolvedPreset.presetObj, {
                     systemPrompt,
@@ -865,7 +975,9 @@ function createPresetModelCaller({ role = 'bg' } = {}) {
                 model,
                 temperature: settings.bgCustomTemperature,
                 messages,
+                signal,
             });
+            throwIfAborted(signal);
             return String(reply || '');
         };
         return {
@@ -886,6 +998,7 @@ function createPresetModelCaller({ role = 'bg' } = {}) {
     const modelLabel = overrideModel || getActiveApiModelLabel();
 
     const callModel = async ({ prompt, systemPrompt }) => {
+        throwIfAborted(signal);
         const invokeRaw = async () => {
             if (resolvedPreset.presetObj) {
                 const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
@@ -899,8 +1012,28 @@ function createPresetModelCaller({ role = 'bg' } = {}) {
             return String(await context.generateRaw({ prompt, systemPrompt }) || '');
         };
 
+        const runWithAbortRace = async (promise) => {
+            if (!signal) return await promise;
+            if (signal.aborted) throw createAbortError();
+            return await new Promise((resolve, reject) => {
+                const onAbort = () => reject(createAbortError());
+                signal.addEventListener('abort', onAbort, { once: true });
+                promise.then(
+                    (val) => {
+                        signal.removeEventListener('abort', onAbort);
+                        if (signal.aborted) reject(createAbortError());
+                        else resolve(val);
+                    },
+                    (err) => {
+                        signal.removeEventListener('abort', onAbort);
+                        reject(err);
+                    },
+                );
+            });
+        };
+
         if (!overrideModel) {
-            return await invokeRaw();
+            return await runWithAbortRace(invokeRaw());
         }
 
         // One-shot scoped override of `generate_data.model` on Tavern's active connection
@@ -917,7 +1050,7 @@ function createPresetModelCaller({ role = 'bg' } = {}) {
             ev.on?.(evName, modelOverrideHook);
         }
         try {
-            return await invokeRaw();
+            return await runWithAbortRace(invokeRaw());
         } finally {
             if (ev && evName) {
                 ev.removeListener?.(evName, modelOverrideHook);
@@ -1024,20 +1157,27 @@ async function runStoryArchiveTask(mode = 'full') {
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('memory');
     let caller;
     try {
-        caller = createPresetModelCaller();
+        caller = createPresetModelCaller({ signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('memory', ctrl);
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
 
     const existingLedger = await loadLedger();
+    const worldInfoContext = await collectActivatedTavernWorldInfo({ novelData, ledger: existingLedger });
+    const completedSliceBuffer = new Map(
+        (mode === 'incremental' ? (existingLedger.archiveBatches || []) : []).map(b => [b.batchIndex, b]),
+    );
+
     updateLiveProgress('memory', {
         isRunning: true,
         isError: false,
         resetLogs: true,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动${mode === 'incremental' ? '增量' : '全本'}剧情与 4 维人物归档（并发上限 ≤ 2）...`,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动${mode === 'incremental' ? '增量' : '全本'}剧情与 4 维人物归档（并发上限 ≤ 2${worldInfoContext ? ' · 已贯通酒馆世界书' : ''}）...`,
     });
 
     try {
@@ -1045,10 +1185,21 @@ async function runStoryArchiveTask(mode = 'full') {
             novelData: novelData || { title: '当前小说', cutoffChapterIndex: 0, totalChapters: 0, chapters: [] },
             continuedChapters,
             existingLedger,
+            narrativeConfig: existingLedger.narrativeConfig,
+            worldInfoContext,
             mode,
             maxConcurrency: 2,
+            signal: ctrl.signal,
             callModel: caller.callModel,
+            onSliceCompleted: async (slice) => {
+                completedSliceBuffer.set(slice.batchIndex, slice);
+                const latest = await loadLedger();
+                latest.archiveBatches = [...completedSliceBuffer.values()].sort((a, b) => a.batchIndex - b.batchIndex);
+                latest.archiveNeedsResynth = true;
+                await saveLedger(latest);
+            },
             onProgress: ({ step, totalSteps, label, logEntry }) => {
+                if (ctrl.signal.aborted) return;
                 updateLiveProgress('memory', {
                     isRunning: true,
                     text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
@@ -1072,12 +1223,23 @@ async function runStoryArchiveTask(mode = 'full') {
             '小说续写阅读器',
         );
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('memory', {
+                isRunning: false,
+                isError: false,
+                text: `⏹ 归档已手动停止（已完成的 ${completedSliceBuffer.size} 个切片已自动保存，可随时继续或合稿）。`,
+            });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('memory', {
             isRunning: false,
             isError: true,
             text: `❌ 归档失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`归档失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('memory', ctrl);
     }
 }
 
@@ -1092,10 +1254,12 @@ async function runRerunArchiveBatchesTask(targetBatchIndices) {
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('memory');
     let caller;
     try {
-        caller = createPresetModelCaller();
+        caller = createPresetModelCaller({ signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('memory', ctrl);
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
@@ -1112,9 +1276,12 @@ async function runRerunArchiveBatchesTask(targetBatchIndices) {
             continuedChapters,
             existingBatches: ledger.archiveBatches,
             targetBatchIndices: validIndices,
+            narrativeConfig: ledger.narrativeConfig,
             maxConcurrency: 2,
+            signal: ctrl.signal,
             callModel: caller.callModel,
             onProgress: ({ step, totalSteps, label }) => {
+                if (ctrl.signal.aborted) return;
                 updateLiveProgress('memory', {
                     isRunning: true,
                     text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
@@ -1139,12 +1306,19 @@ async function runRerunArchiveBatchesTask(targetBatchIndices) {
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 切片重跑已手动停止。' });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('memory', {
             isRunning: false,
             isError: true,
             text: `❌ 切片重跑失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`切片重跑失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('memory', ctrl);
     }
 }
 
@@ -1156,18 +1330,21 @@ async function runResynthArchiveTask() {
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('memory');
     let caller;
     try {
-        caller = createPresetModelCaller();
+        caller = createPresetModelCaller({ signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('memory', ctrl);
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
 
+    const worldInfoContext = await collectActivatedTavernWorldInfo({ novelData, ledger });
     updateLiveProgress('memory', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 复用现有正常切片重新合稿总账（不重读原文）...`,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 复用现有正常切片重新合稿总账（不重读原文${worldInfoContext ? ' · 已贯通世界书' : ''}）...`,
     });
 
     try {
@@ -1175,10 +1352,14 @@ async function runResynthArchiveTask() {
             novelTitle: novelData?.title || '当前小说',
             batches: ledger.archiveBatches,
             existingLedger: ledger,
+            narrativeConfig: ledger.narrativeConfig,
+            worldInfoContext,
             mode: 'full',
             maxConcurrency: 2,
+            signal: ctrl.signal,
             callModel: caller.callModel,
             onProgress: ({ step, totalSteps, label, logEntry }) => {
+                if (ctrl.signal.aborted) return;
                 updateLiveProgress('memory', {
                     isRunning: true,
                     text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
@@ -1199,12 +1380,19 @@ async function runResynthArchiveTask() {
             '小说续写阅读器',
         );
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 重新合稿已手动停止（原总账与切片均未受损）。' });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('memory', {
             isRunning: false,
             isError: true,
             text: `❌ 重新合稿失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`重新合稿失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('memory', ctrl);
     }
 }
 
@@ -1221,10 +1409,12 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('style');
     let caller;
     try {
-        caller = createPresetModelCaller();
+        caller = createPresetModelCaller({ signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('style', ctrl);
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
@@ -1248,8 +1438,10 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
             rounds,
             existingProfile: (incremental || evaluateOnly) ? ledger.styleProfile : null,
             evaluateOnly,
+            signal: ctrl.signal,
             callModel: caller.callModel,
             onProgress: ({ step, totalSteps, label, logEntry }) => {
+                if (ctrl.signal.aborted) return;
                 updateLiveProgress('style', {
                     isRunning: true,
                     text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
@@ -1278,12 +1470,19 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
             '小说续写阅读器',
         );
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('style', { isRunning: false, isError: false, text: '⏹ 文风蒸馏任务已手动停止（原已保存文风卡未受影响）。' });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('style', {
             isRunning: false,
             isError: true,
             text: `❌ ${evaluateOnly ? '跑分验收' : '蒸馏'}失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`${evaluateOnly ? '跑分验收' : '文风蒸馏'}失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('style', ctrl);
     }
 }
 
@@ -1295,10 +1494,12 @@ async function runCompressStyleCardTask() {
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('style');
     let caller;
     try {
-        caller = createPresetModelCaller();
+        caller = createPresetModelCaller({ signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('style', ctrl);
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
@@ -1315,6 +1516,7 @@ async function runCompressStyleCardTask() {
             novelTitle: sp.title || '当前小说',
             styleCard: sp.styleCard,
             fingerprintText: sp.fingerprintText || '',
+            signal: ctrl.signal,
             callModel: caller.callModel,
         });
         sp.styleCard = compressed;
@@ -1336,12 +1538,19 @@ async function runCompressStyleCardTask() {
         await refreshSettingsStatusCard();
         globalThis.toastr?.success?.(`文风圣经已提纯瘦身：${beforeLen} 字 → ${compressed.length} 字！`, '小说续写阅读器');
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('style', { isRunning: false, isError: false, text: '⏹ 提纯瘦身已手动停止（原文风圣经未改动）。' });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('style', {
             isRunning: false,
             isError: true,
             text: `❌ 提纯瘦身失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`提纯瘦身失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('style', ctrl);
     }
 }
 
@@ -1359,20 +1568,27 @@ async function runGenerateDirectorOutlineTask({
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('outline');
     let caller;
     try {
-        caller = createPresetModelCaller();
+        caller = createPresetModelCaller({ signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('outline', ctrl);
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
 
     const count = Math.max(1, Math.min(8, Number(chapterCount) || 1));
     const ledger = await loadLedger();
+    const worldInfoContext = await collectActivatedTavernWorldInfo({
+        novelData,
+        ledger,
+        extraTexts: [userBrief],
+    });
     updateLiveProgress('outline', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡与所选伏笔策划连续 ${count} 章原味分镜大纲...`,
+        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡${worldInfoContext ? '与酒馆世界书' : ''}策划连续 ${count} 章原味分镜大纲...`,
     });
 
     try {
@@ -1385,6 +1601,8 @@ async function runGenerateDirectorOutlineTask({
             sceneCount,
             chapterCount: count,
             paceMode,
+            worldInfoContext,
+            signal: ctrl.signal,
             callModel: caller.callModel,
         });
 
@@ -1410,12 +1628,19 @@ async function runGenerateDirectorOutlineTask({
         await refreshReaderWidgets();
         globalThis.toastr?.success?.(`${rangeLabel}原味导演大纲已就绪！`, '小说续写阅读器');
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('outline', { isRunning: false, isError: false, text: '⏹ 大纲生成已手动停止（原已保存大纲未改动）。' });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('outline', {
             isRunning: false,
             isError: true,
             text: `❌ 生成大纲失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`生成导演大纲失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('outline', ctrl);
     }
 }
 
@@ -1451,9 +1676,10 @@ function applyDirectorOutlineToChatInput(outlineText, { autoSend = false } = {})
 }
 
 async function getLatestChapterAnchorInfo() {
-    const novelData = await loadNovelData();
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
     const continuedChapters = collectContinuedChaptersFromChat(novelData);
-    return resolveLatestChapterAnchor(novelData, continuedChapters);
+    const excludeFlashback = ledger?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
+    return resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback });
 }
 
 let deepRewriteInFlight = false;
@@ -1500,10 +1726,12 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('cliche');
     let caller;
     try {
-        caller = createPresetModelCaller({ role: 'rewrite' });
+        caller = createPresetModelCaller({ role: 'rewrite', signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('cliche', ctrl);
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
@@ -1538,8 +1766,14 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         const prevContinued = chapterIndex > 0
             ? allContinued.filter(c => Number(c.index) < chapterIndex)
             : allContinued.slice(0, -1);
-        const prevChapterAnchor = resolveLatestChapterAnchor(novelData, prevContinued);
+        const excludeFlashback = ledger?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
+        const prevChapterAnchor = resolveLatestChapterAnchor(novelData, prevContinued, { excludeFlashback });
         const authorOutline = String(msg.extra?.novelAuthorOutline || '').trim();
+        const worldInfoContext = await collectActivatedTavernWorldInfo({
+            novelData,
+            ledger,
+            extraTexts: [draftCheck.storyText, authorOutline],
+        });
 
         const { systemPrompt, prompt, driftSummary } = buildDeepRewritePrompt({
             draftText: draftCheck.storyText,
@@ -1551,6 +1785,8 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
             scanReport: beforeScan,
             customBlacklistText: settings.clicheBlacklist,
             extraDirective,
+            worldInfoContext,
+            narrativeConfig: ledger?.narrativeConfig,
         });
 
         const rawOutput = await caller.callModel({
@@ -1558,6 +1794,7 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
             systemPrompt,
             prompt,
         });
+        throwIfAborted(ctrl.signal);
 
         const { diagnosisPre, rewrittenContent } = parseDeepRewriteResponse(rawOutput, draftCheck.charCount);
         const finalMes = hadGameWrapper ? `<game>\n${rewrittenContent}\n</game>` : rewrittenContent;
@@ -1617,6 +1854,11 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
             '小说续写阅读器',
         );
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('cliche', { isRunning: false, isError: false, text: `⏹ ${modeTag}已手动停止（原初稿已安全保留）。` });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
@@ -1625,6 +1867,7 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         globalThis.toastr?.error?.(`深度重塑失败（原初稿已保留）：${error?.message || error}`, '小说续写阅读器');
     } finally {
         deepRewriteInFlight = false;
+        endBackgroundTaskController('cliche', ctrl);
     }
 }
 
@@ -1651,15 +1894,22 @@ async function runSurgicalDeclicheLatestTask() {
         return;
     }
 
+    const ctrl = beginBackgroundTaskController('cliche');
     let caller;
     try {
-        caller = createPresetModelCaller({ role: 'rewrite' });
+        caller = createPresetModelCaller({ role: 'rewrite', signal: ctrl.signal });
     } catch (err) {
+        endBackgroundTaskController('cliche', ctrl);
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
     }
 
-    const ledger = await loadLedger();
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+    const worldInfoContext = await collectActivatedTavernWorldInfo({
+        novelData,
+        ledger,
+        extraTexts: [draftCheck.storyText],
+    });
     const hadGameWrapper = /<game>[\s\S]*<\/game>/i.test(rawOriginal);
 
     updateLiveProgress('cliche', {
@@ -1674,8 +1924,11 @@ async function runSurgicalDeclicheLatestTask() {
             scanReport: status.report,
             styleProfile: ledger.styleProfile,
             customBlacklistText: getSettings().clicheBlacklist,
+            worldInfoContext,
+            narrativeConfig: ledger?.narrativeConfig,
         });
         const refinedRaw = await caller.callModel({ systemPrompt, prompt });
+        throwIfAborted(ctrl.signal);
         const refinedCheck = validateDraftForRewrite(refinedRaw, {
             minChars: Math.min(120, Math.floor(draftCheck.charCount * 0.35)),
         });
@@ -1711,13 +1964,179 @@ async function runSurgicalDeclicheLatestTask() {
             '小说续写阅读器',
         );
     } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('cliche', { isRunning: false, isError: false, text: '⏹ 局部去八股精修已手动停止（原稿已保留）。' });
+            await refreshReaderWidgets();
+            return;
+        }
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
             text: `❌ 精修失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`局部去八股精修失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('cliche', ctrl);
     }
+}
+
+async function handleUpdateNarrativeConfig(patch = {}) {
+    const ledger = await loadLedger();
+    ledger.narrativeConfig = normalizeNarrativeConfig({
+        ...(ledger.narrativeConfig || {}),
+        ...(patch || {}),
+    });
+    await saveLedger(ledger);
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+}
+
+async function handleEditOriginalChapter(chapterIndex, patch = {}) {
+    const novelData = await loadNovelData();
+    if (!novelData?.chapters?.length) return;
+    const target = novelData.chapters.find(c => Number(c.index) === Number(chapterIndex));
+    if (!target) return;
+    if (patch.title !== undefined) {
+        target.title = String(patch.title || '').trim() || `第 ${target.index} 章`;
+    }
+    if (patch.content !== undefined) {
+        const cleanContent = String(patch.content || '').trim();
+        target.content = cleanContent;
+        target.wordCount = cleanContent.replace(/\s+/g, '').length;
+    }
+    if (patch.timelineRole !== undefined) {
+        target.timelineRole = normalizeTimelineRole(patch.timelineRole);
+    }
+    await saveNovelData(novelData);
+    await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex, {
+        focusChapterIndex: novelData.viewingChapterIndex || novelData.cutoffChapterIndex,
+    });
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    globalThis.toastr?.success?.(`已保存第 ${target.index} 章修改`, '小说续写阅读器');
+}
+
+async function handleAddOriginalChapter({ title = '', content = '', timelineRole = 'main', insertAfterIndex = null } = {}) {
+    const cleanContent = String(content || '').trim();
+    if (!cleanContent) {
+        globalThis.toastr?.warning?.('章节正文不能为空', '小说续写阅读器');
+        return;
+    }
+    const existing = await loadNovelData();
+    const novelData = existing || {
+        title: '新建小说',
+        totalChapters: 0,
+        cutoffChapterIndex: 0,
+        viewingChapterIndex: 1,
+        chapters: [],
+    };
+    const newCh = {
+        index: novelData.chapters.length + 1,
+        title: String(title || '').trim() || `第 ${novelData.chapters.length + 1} 章`,
+        content: cleanContent,
+        wordCount: cleanContent.replace(/\s+/g, '').length,
+        timelineRole: normalizeTimelineRole(timelineRole),
+    };
+    const insertPos = Number.isFinite(Number(insertAfterIndex)) && Number(insertAfterIndex) >= 0
+        ? Math.min(novelData.chapters.length, Math.max(0, Number(insertAfterIndex)))
+        : novelData.chapters.length;
+    novelData.chapters.splice(insertPos, 0, newCh);
+    const reindexed = reindexNovelChapters(novelData);
+    if (!existing) {
+        reindexed.cutoffChapterIndex = reindexed.totalChapters;
+    }
+    await saveNovelData(reindexed);
+    await mountOriginalAnchorChaptersToChat(reindexed, reindexed.cutoffChapterIndex, {
+        focusChapterIndex: Math.min(reindexed.totalChapters, insertPos + 1),
+    });
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    globalThis.toastr?.success?.(`已新增章节（当前共 ${reindexed.totalChapters} 章）`, '小说续写阅读器');
+}
+
+async function handleDeleteOriginalChapter(chapterIndex) {
+    const novelData = await loadNovelData();
+    if (!novelData?.chapters?.length) return;
+    const beforeLen = novelData.chapters.length;
+    novelData.chapters = novelData.chapters.filter(c => Number(c.index) !== Number(chapterIndex));
+    if (novelData.chapters.length === beforeLen) return;
+    if (novelData.chapters.length === 0) {
+        await clearNovelData();
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.info?.('已删除最后一章并清空原著目录', '小说续写阅读器');
+        return;
+    }
+    if (Number(chapterIndex) <= Number(novelData.cutoffChapterIndex || beforeLen)) {
+        novelData.cutoffChapterIndex = Math.max(1, Number(novelData.cutoffChapterIndex || beforeLen) - 1);
+    }
+    const reindexed = reindexNovelChapters(novelData);
+    await saveNovelData(reindexed);
+    await mountOriginalAnchorChaptersToChat(reindexed, reindexed.cutoffChapterIndex, {
+        focusChapterIndex: Math.min(reindexed.cutoffChapterIndex, Math.max(1, Number(chapterIndex) - 1)),
+    });
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    globalThis.toastr?.success?.(`已删除第 ${chapterIndex} 章（剩余 ${reindexed.totalChapters} 章并自动重排）`, '小说续写阅读器');
+}
+
+async function handleBulkUpdateOriginalChapters({ rangeText = '', action = 'mark_flashback' } = {}) {
+    const novelData = await loadNovelData();
+    if (!novelData?.chapters?.length) {
+        globalThis.toastr?.warning?.('当前没有可操作的原著章节', '小说续写阅读器');
+        return;
+    }
+    const indices = parseChapterRangeSpec(rangeText, novelData.chapters.length);
+    if (indices.length === 0) {
+        globalThis.toastr?.warning?.('请输入有效的章号或区间（例如：78-135 或 10, 12-15）', '小说续写阅读器');
+        return;
+    }
+    const targetSet = new Set(indices);
+
+    if (action === 'delete') {
+        const remaining = novelData.chapters.filter(c => !targetSet.has(Number(c.index)));
+        if (remaining.length === 0) {
+            await clearNovelData();
+            await refreshReaderWidgets();
+            await refreshSettingsStatusCard();
+            globalThis.toastr?.info?.(`已批量删除全部 ${indices.length} 章`, '小说续写阅读器');
+            return;
+        }
+        const deletedBeforeCutoff = indices.filter(idx => idx <= Number(novelData.cutoffChapterIndex || novelData.chapters.length)).length;
+        novelData.chapters = remaining;
+        novelData.cutoffChapterIndex = Math.max(1, Number(novelData.cutoffChapterIndex || remaining.length) - deletedBeforeCutoff);
+        const reindexed = reindexNovelChapters(novelData);
+        await saveNovelData(reindexed);
+        await mountOriginalAnchorChaptersToChat(reindexed, reindexed.cutoffChapterIndex, {
+            focusChapterIndex: reindexed.cutoffChapterIndex,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(`已批量删除 ${indices.length} 章（剩余 ${reindexed.totalChapters} 章并已自动重排）`, '小说续写阅读器');
+        return;
+    }
+
+    const roleMap = {
+        mark_main: 'main',
+        mark_flashback: 'flashback',
+        mark_skip: 'skip',
+    };
+    const nextRole = roleMap[action] || 'main';
+    let touched = 0;
+    for (const ch of novelData.chapters) {
+        if (targetSet.has(Number(ch.index))) {
+            ch.timelineRole = nextRole;
+            touched += 1;
+        }
+    }
+    await saveNovelData(novelData);
+    await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex, {
+        focusChapterIndex: novelData.viewingChapterIndex || novelData.cutoffChapterIndex,
+    });
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    const roleName = nextRole === 'flashback' ? '倒叙/他视角' : (nextRole === 'skip' ? '跳过' : '主线正叙');
+    globalThis.toastr?.success?.(`已将 ${touched} 个章节标记为「${roleName}」`, '小说续写阅读器');
 }
 
 /* ==========================================================================
@@ -1878,6 +2297,12 @@ export async function init() {
         getSettings,
         onUpdateSetting: handleUpdateSetting,
         onToggleSetting: handleToggleSetting,
+        onStopTask: stopBackgroundTask,
+        onUpdateNarrativeConfig: handleUpdateNarrativeConfig,
+        onEditOriginalChapter: handleEditOriginalChapter,
+        onAddOriginalChapter: handleAddOriginalChapter,
+        onDeleteOriginalChapter: handleDeleteOriginalChapter,
+        onBulkUpdateOriginalChapters: handleBulkUpdateOriginalChapters,
         onCutoffFromChapter: handleCutoffFromChapter,
         onViewChapter: handleViewOriginalChapter,
         onImportNovelFile: handleImportNovelFile,

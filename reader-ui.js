@@ -3,6 +3,7 @@ import { getContext } from '/scripts/extensions.js';
 import { isBoundedChatSurfaceView, jumpBoundedChatSurfaceToMessage, resetChatSurfaceView } from '/script.js';
 import { DEFAULT_CLICHE_TERMS } from './cliche-guard.js';
 import { isContinuedNovelFloor } from './context-assembler.js';
+import { stripNonStoryBlocks } from './parser.js';
 import { loadCanonDb, loadLedger, loadNovelData, normalizeNarrativeConfig, saveCanonDb, saveLedger } from './storage.js';
 
 const PROGRESS_META_KEY = 'novel_continuation_progress';
@@ -2096,13 +2097,14 @@ function renderTocTab(bodyEl) {
     const aiFloors = [];
     chat.forEach((msg, floorIdx) => {
         if (!isContinuedNovelFloor(msg, floorIdx, lastOrigFloorIdx)) return;
-        const firstLine = String(msg.mes || '').split('\n').map(l => l.trim()).find(Boolean) || '续写章节';
+        const cleanBody = stripNonStoryBlocks(String(msg.mes || '')).replace(/<\/?game>/gi, '').trim();
+        const firstLine = cleanBody.split('\n').map(l => l.trim()).find(Boolean) || '续写章节';
         const cleanHeading = firstLine.replace(/^#+\s*/, '').slice(0, 38);
         aiFloors.push({
             floorIdx,
             title: cleanHeading,
             swipeCount: Array.isArray(msg.swipes) ? msg.swipes.length : 1,
-            wordCount: String(msg.mes || '').replace(/\s+/g, '').length,
+            wordCount: cleanBody.replace(/\s+/g, '').length,
         });
     });
 

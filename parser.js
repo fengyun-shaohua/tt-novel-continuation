@@ -417,9 +417,24 @@ export function extractNovelStateBlock(rawMessageText) {
 
     let summary = '';
     let refCursor = null;
-    const worldUpdates = [];
-    const appearanceUpdates = [];
-    const hooks = [];
+    const worldUpdateMap = new Map();
+    const appearanceUpdateMap = new Map();
+    const hookMap = new Map();
+
+    const recordWorldUpdate = (entry) => {
+        if (!entry?.name || !entry?.state) return;
+        const key = `${entry.category || '状态'}|${entry.name}`;
+        worldUpdateMap.set(key, entry);
+    };
+    const recordAppearanceUpdate = (entry) => {
+        if (!entry?.name || !entry?.appearance) return;
+        appearanceUpdateMap.set(entry.name, entry);
+    };
+    const recordHook = (entry) => {
+        if (!entry?.content) return;
+        const key = `${entry.action}|${entry.content.replace(/\s+/g, '').toLowerCase()}`;
+        if (!hookMap.has(key)) hookMap.set(key, entry);
+    };
 
     for (const inner of innerBlocks) {
         const summaryMatch = inner.match(/<(?:chapter_summary|summary)>([\s\S]*?)(?:<\/(?:chapter_summary|summary)>|$)/i);
@@ -444,9 +459,9 @@ export function extractNovelStateBlock(rawMessageText) {
                 const parsed = parseWorldUpdateLine(line);
                 if (parsed && !isEmptyPlaceholder(parsed.state)) {
                     if (/^(?:外观|着装|衣着|服装|穿搭|外貌|装扮)$/.test(parsed.category)) {
-                        appearanceUpdates.push({ name: parsed.name, appearance: parsed.state });
+                        recordAppearanceUpdate({ name: parsed.name, appearance: parsed.state });
                     }
-                    worldUpdates.push(parsed);
+                    recordWorldUpdate(parsed);
                 }
             }
         }
@@ -458,8 +473,8 @@ export function extractNovelStateBlock(rawMessageText) {
                 if (isEmptyPlaceholder(line)) continue;
                 const parsed = parseWorldUpdateLine(line);
                 if (parsed && !isEmptyPlaceholder(parsed.state)) {
-                    appearanceUpdates.push({ name: parsed.name, appearance: parsed.state });
-                    worldUpdates.push({ category: '外观', name: parsed.name, state: parsed.state });
+                    recordAppearanceUpdate({ name: parsed.name, appearance: parsed.state });
+                    recordWorldUpdate({ category: '外观', name: parsed.name, state: parsed.state });
                 }
             }
         }
@@ -473,12 +488,12 @@ export function extractNovelStateBlock(rawMessageText) {
                     const content = line
                         .replace(/^[\[【]?(?:已填坑|已回收|回收伏笔|回收|完成|解决|resolved)[\]】]?[:：\s\-—]*/i, '')
                         .trim();
-                    if (!isEmptyPlaceholder(content)) hooks.push({ action: 'resolve', content });
+                    if (!isEmptyPlaceholder(content)) recordHook({ action: 'resolve', content });
                 } else {
                     const content = line
                         .replace(/^[\[【]?(?:新伏笔|新增伏笔|新增|新线索|埋下|待填|伏笔|open|add)[\]】]?[:：\s\-—]*/i, '')
                         .trim();
-                    if (!isEmptyPlaceholder(content)) hooks.push({ action: 'add', content });
+                    if (!isEmptyPlaceholder(content)) recordHook({ action: 'add', content });
                 }
             }
         }
@@ -488,9 +503,9 @@ export function extractNovelStateBlock(rawMessageText) {
         hasState: true,
         cleanText,
         summary,
-        worldUpdates,
-        appearanceUpdates,
-        hooks,
+        worldUpdates: [...worldUpdateMap.values()],
+        appearanceUpdates: [...appearanceUpdateMap.values()],
+        hooks: [...hookMap.values()],
         refCursor,
     };
 }

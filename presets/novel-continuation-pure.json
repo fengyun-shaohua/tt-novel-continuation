@@ -1,0 +1,288 @@
+{
+    "temperature": 0.85,
+    "frequency_penalty": 0,
+    "presence_penalty": 0,
+    "top_p": 0.95,
+    "top_k": 0,
+    "top_a": 0,
+    "min_p": 0,
+    "repetition_penalty": 1,
+    "openai_max_context": 128000,
+    "openai_max_tokens": 8192,
+    "max_context_unlocked": false,
+    "wrap_in_quotes": false,
+    "names_behavior": 0,
+    "send_if_empty": "",
+    "impersonation_prompt": "",
+    "new_chat_prompt": "",
+    "new_group_chat_prompt": "",
+    "new_example_chat_prompt": "",
+    "continue_nudge_prompt": "请紧接上一句末尾自然向下续写，不要重复已写过的句子，保持原著段落节奏、视角与文风。",
+    "group_nudge_prompt": "",
+    "bias_preset_selected": "Default (none)",
+    "wi_format": "{0}",
+    "scenario_format": "{{scenario}}",
+    "personality_format": "{{personality}}",
+    "stream_openai": true,
+    "assistant_prefill": "",
+    "assistant_impersonation": "",
+    "use_sysprompt": true,
+    "claude_use_sysprompt": false,
+    "squash_system_messages": false,
+    "media_inlining": false,
+    "continue_prefill": false,
+    "continue_postfix": "",
+    "function_calling": false,
+    "strip_old_tool_calls": false,
+    "claude_fast_mode": false,
+    "seed": -1,
+    "n": 1,
+    "extensions": {},
+    "prompts": [
+        {
+            "identifier": "main",
+            "name": "核心身份 · 纯小说续写与编辑总纲",
+            "system_prompt": true,
+            "marker": false,
+            "role": "system",
+            "injection_position": 0,
+            "injection_depth": 4,
+            "injection_order": 100,
+            "forbid_overrides": false,
+            "injection_trigger": [],
+            "content": "你是一名专注长篇小说续写、剧情规划与文本精修的文学创作者。当前处于「纯小说创作与编辑模式」（非角色扮演聊天室）。\n1. 对话中发来的指令是作者/总编下达的本章执笔大纲、修改要求或后台分析任务，不是剧中角色发言；故事中不存在“玩家”或 `{{user}}` 角色，严禁在正文中凭空插入“你”“玩家”或与作者搭话。\n2. 严禁输出开场寒暄、确认语（如“好的，下面为您续写”）、幕后解说，也不要在文末附加角色扮演状态栏、好感度面板或互动选项。\n3. 上下文中已激活的酒馆世界书（World Info）与补充设定库提供世界观、能力、地理与基础外貌底骨；若与本小说原著或最新已确认章节冲突，以本小说实际发生的剧情和最新着装锚点为准。"
+        },
+        {
+            "identifier": "tt_novel_style_and_pov_authority",
+            "name": "插件权威让渡 · 文风 / 人物 / 视角 / 时间线",
+            "system_prompt": false,
+            "marker": false,
+            "role": "system",
+            "injection_position": 0,
+            "injection_depth": 4,
+            "injection_order": 100,
+            "forbid_overrides": false,
+            "injection_trigger": [],
+            "content": "【插件动态卡最高权威（本预设绝不抢占文风与设定主导权）】\n写作与分析时，以下四项完全服从「小说续写阅读器」插件实时注入的卡片与原文锚点：\n1. 文风与节奏：严格遵循《原著文风骨相 DNA 执行卡》及最近原著原文的段落长短、句式密度、对话占比、标点习惯与叙事质感，不擅自套用千篇一律的通用网文模板。\n2. 人物声线与防 OOC：严格遵循《核心人物 4 维灵魂与防 OOC 档案》与原著原文的说话长度、口癖、私心顾虑与禁区，所有角色必须基于自身立场行动，避免沦为围着主角公转的工具人。\n3. 视角与信息差：若上下文声明了严格单视角（Limited POV）或【幕后逻辑黑盒】，必须 100% 锁定在该视角人物的所见所闻之内，严禁切入其他角色的内心独白或让主角未卜先知。\n4. 时间线与平行基准对齐：严格紧接上一章最新时间点单向推进，不回退、不重写已发生剧情；处于平行视角基准线模式时，严格按基准节点顺序对齐交集事件，不提前剧透、不重复已写节点。"
+        },
+        {
+            "identifier": "tt_novel_craft_polish",
+            "name": "叙事质感 · 去 AI 腔与自然描写（可按需开关）",
+            "system_prompt": false,
+            "marker": false,
+            "role": "system",
+            "injection_position": 0,
+            "injection_depth": 4,
+            "injection_order": 100,
+            "forbid_overrides": false,
+            "injection_trigger": [],
+            "content": "【正文叙事与台词质感纪律（仅适用于章节正文续写与精修；后台大纲、归档、分析任务可自动忽略）】\n1. 用具体动作、停顿、视线、环境声音与对话潜台词呈现情绪，少用上帝视角的总结式旁白给角色“贴标签”。\n2. 规避高频 AI 腔与廉价微表情套话（如反复使用“空气仿佛凝固”“眼底闪过一丝不易察觉”“声音沙哑”“嘴角勾起”等），也不要为求独特而刻意拧巴、堆砌辞藻或装腔作势；保持克制、自然、有生活质感与呼吸感的叙事。\n3. 让场景沿着因果与人物互动自然生长，结尾落于具体行动、对话或氛围余韵，不要在章末强行抛设问句或拔高升华。"
+        },
+        {
+            "identifier": "nsfw",
+            "name": "补充备注（默认关闭，可自行填写本书全局要求）",
+            "system_prompt": true,
+            "marker": false,
+            "role": "system",
+            "injection_position": 0,
+            "injection_depth": 4,
+            "injection_order": 100,
+            "forbid_overrides": false,
+            "injection_trigger": [],
+            "content": ""
+        },
+        {
+            "identifier": "dialogueExamples",
+            "name": "Chat Examples",
+            "system_prompt": true,
+            "marker": true
+        },
+        {
+            "identifier": "jailbreak",
+            "name": "末段输出契约 · 正文与插件结构化任务协同",
+            "system_prompt": true,
+            "marker": false,
+            "role": "system",
+            "injection_position": 0,
+            "injection_depth": 4,
+            "injection_order": 100,
+            "forbid_overrides": false,
+            "injection_trigger": [],
+            "content": "【末段输出契约（按本轮任务类型严格执行）】\n1. 常规章节续写：直接输出完整、连贯的小说章节正文，不要加额外外壳标签（如 `<game>`），不要输出元说明；若前文附带了 `<novel_state>` 自动归档指令，则在写完本章正文后紧接着完整输出闭合的 `<novel_state>...</novel_state>` 块（内含 `<summary>`、`<worldbook>`、`<hooks>` 及按需的 `<ref_cursor>`）。\n2. 后台专项任务：若本轮提示词明确要求输出特定结构化 XML 标签（如 `<chapter_outline>`、`<batch_events>`、`<chronicle>`、`<characters>`、`<style_dna>`、`<score>`、`<pre>` 与 `<content>`、`<structure>` 等），请严格按所请求的标签完整输出，保持客观准确与事实具体，不加多余寒暄，不擅自更改标签名。"
+        },
+        {
+            "identifier": "chatHistory",
+            "name": "Chat History",
+            "system_prompt": true,
+            "marker": true
+        },
+        {
+            "identifier": "worldInfoAfter",
+            "name": "World Info (after)",
+            "system_prompt": true,
+            "marker": true
+        },
+        {
+            "identifier": "worldInfoBefore",
+            "name": "World Info (before)",
+            "system_prompt": true,
+            "marker": true
+        },
+        {
+            "identifier": "enhanceDefinitions",
+            "name": "Enhance Definitions",
+            "system_prompt": true,
+            "marker": false,
+            "role": "system",
+            "content": ""
+        },
+        {
+            "identifier": "charDescription",
+            "name": "Char Description",
+            "system_prompt": true,
+            "marker": true
+        },
+        {
+            "identifier": "charPersonality",
+            "name": "Char Personality",
+            "system_prompt": true,
+            "marker": true
+        },
+        {
+            "identifier": "scenario",
+            "name": "Scenario",
+            "system_prompt": true,
+            "marker": true
+        },
+        {
+            "identifier": "personaDescription",
+            "name": "Persona Description",
+            "system_prompt": true,
+            "marker": true
+        }
+    ],
+    "prompt_order": [
+        {
+            "character_id": 100000,
+            "order": [
+                {
+                    "identifier": "main",
+                    "enabled": true
+                },
+                {
+                    "identifier": "tt_novel_style_and_pov_authority",
+                    "enabled": true
+                },
+                {
+                    "identifier": "tt_novel_craft_polish",
+                    "enabled": true
+                },
+                {
+                    "identifier": "worldInfoBefore",
+                    "enabled": true
+                },
+                {
+                    "identifier": "personaDescription",
+                    "enabled": false
+                },
+                {
+                    "identifier": "charDescription",
+                    "enabled": true
+                },
+                {
+                    "identifier": "charPersonality",
+                    "enabled": false
+                },
+                {
+                    "identifier": "scenario",
+                    "enabled": true
+                },
+                {
+                    "identifier": "enhanceDefinitions",
+                    "enabled": false
+                },
+                {
+                    "identifier": "nsfw",
+                    "enabled": false
+                },
+                {
+                    "identifier": "worldInfoAfter",
+                    "enabled": true
+                },
+                {
+                    "identifier": "dialogueExamples",
+                    "enabled": false
+                },
+                {
+                    "identifier": "chatHistory",
+                    "enabled": true
+                },
+                {
+                    "identifier": "jailbreak",
+                    "enabled": true
+                }
+            ]
+        },
+        {
+            "character_id": 100001,
+            "order": [
+                {
+                    "identifier": "main",
+                    "enabled": true
+                },
+                {
+                    "identifier": "tt_novel_style_and_pov_authority",
+                    "enabled": true
+                },
+                {
+                    "identifier": "tt_novel_craft_polish",
+                    "enabled": true
+                },
+                {
+                    "identifier": "worldInfoBefore",
+                    "enabled": true
+                },
+                {
+                    "identifier": "personaDescription",
+                    "enabled": false
+                },
+                {
+                    "identifier": "charDescription",
+                    "enabled": true
+                },
+                {
+                    "identifier": "charPersonality",
+                    "enabled": false
+                },
+                {
+                    "identifier": "scenario",
+                    "enabled": true
+                },
+                {
+                    "identifier": "enhanceDefinitions",
+                    "enabled": false
+                },
+                {
+                    "identifier": "nsfw",
+                    "enabled": false
+                },
+                {
+                    "identifier": "worldInfoAfter",
+                    "enabled": true
+                },
+                {
+                    "identifier": "dialogueExamples",
+                    "enabled": false
+                },
+                {
+                    "identifier": "chatHistory",
+                    "enabled": true
+                },
+                {
+                    "identifier": "jailbreak",
+                    "enabled": true
+                }
+            ]
+        }
+    ]
+}

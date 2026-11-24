@@ -4,7 +4,7 @@ import { oai_settings } from '/scripts/openai.js';
 import { getPresetManager } from '/scripts/preset-manager.js';
 import { getWorldInfoPrompt } from '/scripts/world-info.js';
 import { deleteMessage, resetChatSurfaceView } from '/script.js';
-import { escapeHtml } from '/scripts/utils.js';
+import { download, escapeHtml } from '/scripts/utils.js';
 import {
     buildDeepRewritePrompt,
     buildSurgicalDeclichePrompt,
@@ -77,6 +77,8 @@ import {
 const SETTINGS_KEY = 'novel_continuation';
 const EXTENSION_PROMPT_TAG = 'novel_continuation_golden_context';
 const EXTENSION_PROMPT_TRAILER_TAG = 'novel_continuation_state_trailer';
+const BUNDLED_PURE_PRESET_NAME = 'TT小说续写专用-纯净版';
+const BUNDLED_PURE_PRESET_URL = new URL('./presets/novel-continuation-pure.json', import.meta.url);
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
@@ -745,6 +747,88 @@ function getAvailableOpenAiPresetNames() {
     }
 }
 
+async function loadBundledPureNovelPreset() {
+    const response = await fetch(BUNDLED_PURE_PRESET_URL.href, { cache: 'no-cache' });
+    if (!response.ok) {
+        throw new Error(`无法读取插件内置预设文件（HTTP ${response.status}）`);
+    }
+    const presetObj = await response.json();
+    if (!presetObj || !Array.isArray(presetObj.prompts) || !Array.isArray(presetObj.prompt_order)) {
+        throw new Error('插件内置预设 JSON 格式异常（缺少 prompts 或 prompt_order）');
+    }
+    return presetObj;
+}
+
+async function installBundledPureNovelPreset() {
+    const pm = getPresetManager('openai');
+    if (!pm || typeof pm.savePreset !== 'function') {
+        throw new Error('未检测到对话补全（Chat Completion）预设管理器，请确认当前主 API 模式支持预设');
+    }
+
+    const presetObj = await loadBundledPureNovelPreset();
+    const existingVal = pm.findPreset?.(BUNDLED_PURE_PRESET_NAME);
+    const alreadyExists = existingVal !== undefined && existingVal !== null && String(existingVal) !== '';
+    if (alreadyExists) {
+        const confirmed = window.confirm(
+            `酒馆中已存在预设「${BUNDLED_PURE_PRESET_NAME}」。\n是否用插件内置最新版覆盖并立即启用？（不会改动你的 API 地址、密钥或当前模型）`,
+        );
+        if (!confirmed) {
+            return { cancelled: true, name: BUNDLED_PURE_PRESET_NAME };
+        }
+    }
+
+    const context = getContext();
+    const ev = context?.eventSource;
+    const afterEvent = context?.eventTypes?.OAI_PRESET_CHANGED_AFTER;
+    let settled = false;
+    let resolveApplied = null;
+    const onApplied = () => {
+        if (settled) return;
+        settled = true;
+        resolveApplied?.();
+    };
+    const appliedPromise = (ev && afterEvent)
+        ? new Promise((resolve) => {
+            resolveApplied = resolve;
+            ev.on?.(afterEvent, onApplied);
+        })
+        : Promise.resolve();
+
+    try {
+        await pm.savePreset(BUNDLED_PURE_PRESET_NAME, presetObj);
+        if (ev && afterEvent) {
+            await Promise.race([
+                appliedPromise,
+                new Promise(resolve => setTimeout(resolve, 350)),
+            ]);
+        }
+    } finally {
+        if (ev && afterEvent) {
+            ev.removeListener?.(afterEvent, onApplied);
+        }
+    }
+
+    const settings = getSettings();
+    settings.distillPresetName = '__current__';
+    saveExtensionSettings();
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    globalThis.toastr?.success?.(
+        `已导入并启用专用预设「${BUNDLED_PURE_PRESET_NAME}」（已保留原有 API 连接与模型配置）`,
+        '小说续写阅读器',
+    );
+    return { cancelled: false, name: BUNDLED_PURE_PRESET_NAME };
+}
+
+async function exportBundledPureNovelPreset() {
+    const presetObj = await loadBundledPureNovelPreset();
+    await download(
+        JSON.stringify(presetObj, null, 4),
+        `${BUNDLED_PURE_PRESET_NAME}.json`,
+        'application/json',
+    );
+}
+
 function resolveSelectedDistillationPreset(presetSelection) {
     const selected = String(presetSelection ?? '').trim();
     if (!selected) {
@@ -1208,6 +1292,7 @@ function getRuntimeMeta() {
         presetLabel,
         activePresetName,
         presetNames: getAvailableOpenAiPresetNames(),
+        bundledPurePresetName: BUNDLED_PURE_PRESET_NAME,
     };
 }
 
@@ -2613,6 +2698,8 @@ export async function init() {
         onResynthArchive: runResynthArchiveTask,
         onFetchCustomModels: fetchCustomApiModels,
         onFetchRewriteCustomModels: fetchRewriteCustomModels,
+        onInstallBundledPurePreset: installBundledPureNovelPreset,
+        onExportBundledPurePreset: exportBundledPureNovelPreset,
         onRunStyleDistill: runStyleDistillTask,
         onCompressStyleCard: runCompressStyleCardTask,
         onGenerateDirectorOutline: runGenerateDirectorOutlineTask,

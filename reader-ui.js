@@ -2403,6 +2403,9 @@ function renderSettingsTab(bodyEl) {
     const isCustomApi = settings.bgApiMode === 'custom';
     const cachedModels = Array.isArray(settings.bgCustomApiModelsCache) ? settings.bgCustomApiModelsCache : [];
     const customModelVal = String(settings.bgCustomApiModel || '');
+    const purePresetName = String(meta.bundledPurePresetName || 'TT小说续写专用-纯净版');
+    const isPurePresetActive = Boolean(meta.activePresetName && meta.activePresetName === purePresetName);
+    const isPurePresetInstalled = presetNames.includes(purePresetName);
 
     const presetOptions = [
         `<option value="__current__" ${savedPreset === '__current__' ? 'selected' : ''}>使用当前酒馆预设${meta.activePresetName ? `（${escapeHtml(meta.activePresetName)}）` : ''}</option>`,
@@ -2480,6 +2483,19 @@ function renderSettingsTab(bodyEl) {
             <div class="tt-novel-inline-field">
                 <span>共用酒馆预设（套用预设或选纯净直连）：</span>
                 <select id="tt-novel-wb-preset-select" class="text_pole" style="max-width: 240px;">${presetOptions.join('')}</select>
+            </div>
+            <div class="tt-novel-muted" style="margin: 6px 0 4px;">
+                ${isPurePresetActive
+                    ? `✅ 当前酒馆已启用本插件专用预设 <code>${escapeHtml(purePresetName)}</code>（无 RP 干扰、不截断 &lt;novel_state&gt;、完全服从文风卡与单视角）。`
+                    : `💡 推荐：一键导入插件专用预设 <code>${escapeHtml(purePresetName)}</code>${isPurePresetInstalled ? '（已在酒馆列表中）' : ''}——专为纯小说续写打造，不含 RP/状态栏/&lt;game&gt;冲突，且不会改动你的 API 连接与模型。`}
+            </div>
+            <div class="tt-novel-action-bar" style="margin-bottom: 6px;">
+                <button type="button" id="tt-novel-wb-install-pure-preset" class="menu_button tt-novel-btn-sm ${isPurePresetActive ? '' : 'tt-novel-btn-primary'}">
+                    ${isPurePresetActive ? '🔄 更新/重置专用预设' : `✨ 一键导入并启用「${escapeHtml(purePresetName)}」`}
+                </button>
+                <button type="button" id="tt-novel-wb-export-pure-preset" class="menu_button tt-novel-btn-sm">
+                    📥 导出预设 JSON
+                </button>
             </div>
             <div class="tt-novel-inline-field">
                 <span>续写时直接发给 AI 的末尾原著章数 (1~20)：</span>
@@ -2580,6 +2596,34 @@ function renderSettingsTab(bodyEl) {
     bodyEl.querySelector('#tt-novel-wb-preset-select')?.addEventListener('change', (e) => {
         handlers.onUpdateSetting?.('distillPresetName', String(e.target.value ?? ''));
         renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-wb-install-pure-preset')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ 正在导入...';
+        try {
+            await handlers.onInstallBundledPurePreset?.();
+        } catch (err) {
+            globalThis.toastr?.error?.(`导入专用预设失败：${err?.message || err}`, '小说续写阅读器');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+    });
+    bodyEl.querySelector('#tt-novel-wb-export-pure-preset')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ 导出中...';
+        try {
+            await handlers.onExportBundledPurePreset?.();
+        } catch (err) {
+            globalThis.toastr?.error?.(`导出预设失败：${err?.message || err}`, '小说续写阅读器');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
     });
     bodyEl.querySelector('#tt-novel-wb-anchor-count')?.addEventListener('change', (e) => {
         handlers.onUpdateSetting?.('mountAnchorChapters', Math.max(1, Math.min(20, Number(e.target.value) || 3)));

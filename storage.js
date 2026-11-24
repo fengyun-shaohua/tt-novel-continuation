@@ -27,6 +27,10 @@ export const DEFAULT_NARRATIVE_CONFIG = Object.freeze({
     worldInfoBudgetChars: 12000,
     strictTimelineOrder: true,
     excludeFlashbackFromAnchor: true,
+    referenceTimelineMode: false,
+    referencePovLabel: '',
+    referenceCursorChapter: 0,
+    referenceLookaheadChapters: 8,
 });
 
 export function normalizeNarrativeConfig(raw = null) {
@@ -50,11 +54,19 @@ export function normalizeNarrativeConfig(raw = null) {
         worldInfoBudgetChars,
         strictTimelineOrder: src.strictTimelineOrder !== false,
         excludeFlashbackFromAnchor: src.excludeFlashbackFromAnchor !== false,
+        referenceTimelineMode: Boolean(src.referenceTimelineMode),
+        referencePovLabel: String(src.referencePovLabel || '').trim(),
+        referenceCursorChapter: Number.isFinite(Number(src.referenceCursorChapter)) && Number(src.referenceCursorChapter) >= 0
+            ? Math.floor(Number(src.referenceCursorChapter))
+            : 0,
+        referenceLookaheadChapters: Number.isFinite(Number(src.referenceLookaheadChapters))
+            ? Math.max(2, Math.min(20, Math.floor(Number(src.referenceLookaheadChapters))))
+            : 8,
     };
 }
 
 export function normalizeTimelineRole(role) {
-    return (role === 'flashback' || role === 'skip') ? role : 'main';
+    return (role === 'reference' || role === 'flashback' || role === 'skip') ? role : 'main';
 }
 
 export function reindexNovelChapters(novelData) {

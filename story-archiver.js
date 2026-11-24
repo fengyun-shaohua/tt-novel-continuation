@@ -112,7 +112,7 @@ export function planArchiveBatches(
     const normalized = selected.map(ch => ({
         index: Number(ch.index),
         title: String(ch.title || `第 ${ch.index} 章`),
-        timelineRole: ch.timelineRole === 'flashback' ? 'flashback' : 'main',
+        timelineRole: (ch.timelineRole === 'reference' || ch.timelineRole === 'flashback') ? ch.timelineRole : 'main',
         content: cleanTagText(ch.content || ''),
     })).filter(ch => ch.content.length > 0);
 
@@ -129,7 +129,9 @@ export function planArchiveBatches(
         if (bucket.length === 0) return;
         const text = bucket
             .map(ch => {
-                const roleTag = ch.timelineRole === 'flashback' ? ' [倒叙/他视角补完]' : '';
+                const roleTag = ch.timelineRole === 'reference'
+                    ? ' [基准时间线原著]'
+                    : (ch.timelineRole === 'flashback' ? ' [倒叙/插叙]' : '');
                 return `【第 ${ch.index} 章 · ${ch.title}${roleTag}】\n${ch.content}`;
             })
             .join('\n\n');
@@ -185,7 +187,9 @@ export function parseChronicleEvents(rawText) {
         const participants = participantsRaw
             ? participantsRaw.split(/[、,，/｜|\s]+/).map(s => s.trim()).filter(Boolean)
             : [];
-        const timelinePhase = /flashback|倒叙|插叙|补完|外传|他视角/i.test(timelinePhaseRaw) ? 'flashback' : 'main';
+        const timelinePhase = /reference|基准/i.test(timelinePhaseRaw)
+            ? 'reference'
+            : (/flashback|倒叙|插叙|外传/i.test(timelinePhaseRaw) ? 'flashback' : 'main');
 
         events.push({
             id: `evt_${startChapter}_${endChapter}_${i + 1}`,
@@ -579,7 +583,7 @@ export async function synthesizeArchiveFromBatches({
                     `<chapters>#${winStart}-#${Math.min(winEnd, winStart + 4)}</chapters>`,
                     '<time>时间阶段或场景背景</time>',
                     '<pov>本段实际叙事视角人物（如主视角/多视角/具体角色名）</pov>',
-                    '<timeline_phase>main（主线推进）或 flashback（倒叙/插叙/他视角补完）</timeline_phase>',
+                    '<timeline_phase>main（当前续写视角正文）、reference（已完结对照基准时间线）或 flashback（倒叙/插叙）</timeline_phase>',
                     '<title>简短精准的事件标题</title>',
                     '<participants>人物A、人物B</participants>',
                     '<summary>150~300字详实、具体、不回避关键节点的经过、底线/关系变化、筹码变动与确切结果</summary>',

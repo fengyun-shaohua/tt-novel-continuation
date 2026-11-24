@@ -424,6 +424,22 @@ export function buildDeepRewritePrompt({
             `【严格单视角（Limited POV）硬红线】：全章必须 100% 锁定在「${povChar}」的感官与已知信息范围内！若初稿切去了他人独处视角、泄露了「${povChar}」不可能知道的幕后信息，重写时必须删改并重构为仅通过「${povChar}」可感知的细节与线索推进。`,
         );
     }
+    if (activeCfg.referenceTimelineMode) {
+        const refLabel = activeCfg.referencePovLabel || '已完结基准时间线';
+        const refCursor = Number(activeCfg.referenceCursorChapter || 0);
+        const refLookahead = Math.max(2, Math.min(20, Number(activeCfg.referenceLookaheadChapters) || 8));
+        const refChapters = (novelData?.chapters || [])
+            .filter(c => c && c.timelineRole === 'reference' && Number(c.index) > refCursor && Number(c.index) <= refCursor + Math.min(3, refLookahead))
+            .sort((a, b) => Number(a.index) - Number(b.index));
+        const refLines = [
+            `【🧭 平行视角基准时间线核查（${refLabel} · 已对齐至第 ${refCursor} 章）】：重写时严禁违背基准时间线既定顺序，严禁重复已发生节点或凭空多编同类大事件！`,
+        ];
+        for (const ch of refChapters) {
+            const snippet = stripNonStoryBlocks(ch.content || '').replace(/\s+/g, ' ').trim().slice(0, 320);
+            refLines.push(`- [基准#${ch.index} ${ch.title}]：${snippet}`);
+        }
+        parts.push('', refLines.join('\n'));
+    }
 
     const chronicle = Array.isArray(ledger?.chronicle) ? ledger.chronicle.slice(-8) : [];
     if (chronicle.length > 0) {

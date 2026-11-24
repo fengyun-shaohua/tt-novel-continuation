@@ -25,7 +25,7 @@ export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { 
     const eligibleOriginals = (novelData?.chapters || [])
         .filter(c => {
             if (!c || Number(c.index) > cutoff) return false;
-            if (c.timelineRole === 'skip') return false;
+            if (c.timelineRole === 'skip' || c.timelineRole === 'reference') return false;
             if (excludeFlashback && c.timelineRole === 'flashback') return false;
             return true;
         })
@@ -190,6 +190,9 @@ export function buildDirectorOutlinePrompt({
         ...(narrativeCfg.strictTimelineOrder !== false ? [
             '6. 【时间线单向推进红线】：严禁时间倒流或无新因果地重复规划编年史中已经完成过的同类重大桥段，每一章都必须在最新时间点之后向前推进！',
         ] : []),
+        ...(narrativeCfg.referenceTimelineMode ? [
+            `6.5 【平行视角 · 严守基准时间线铁律】：你正在以当前视角续写平行线！下方提供了已完结的【${narrativeCfg.referencePovLabel || '基准时间线'}】事件蓝图与进度指针。必须严格按基准时间线的先后顺序推进与补完幕后细节：已走过的基准节点严禁重复再写，前方既定节点（如见面、通话、出行、关键转折）的时间点与对外交集结果必须 100% 严丝合缝，严禁凭空编造与基准时间线矛盾或重复的大事件！`,
+        ] : []),
         '7. 严格按要求的 `<chapter_outline index="章号" title="章节简短标题">...</chapter_outline>` 标签输出每一章，不要输出额外寒暄或解释。',
     ].join('\n');
 
@@ -236,8 +239,50 @@ export function buildDirectorOutlinePrompt({
     }
 
     const allChronicle = Array.isArray(ledger?.chronicle) ? ledger.chronicle : [];
-    const mainChronicle = allChronicle.filter(e => e && e.timelinePhase !== 'flashback').slice(-12);
+    const refMode = Boolean(narrativeCfg.referenceTimelineMode);
+    const refCursor = Number(narrativeCfg.referenceCursorChapter || 0);
+    const refLookahead = Math.max(2, Math.min(20, Number(narrativeCfg.referenceLookaheadChapters) || 8));
+    const refChapters = (novelData?.chapters || []).filter(c => c && c.timelineRole === 'reference');
+    const refChapterSet = new Set(refChapters.map(c => Number(c.index)));
+    const isRefEvent = (e) => e && (e.timelinePhase === 'reference' || (refMode && refChapterSet.has(Number(e.startChapter))));
+
+    const mainChronicle = allChronicle.filter(e => e && e.timelinePhase !== 'flashback' && !isRefEvent(e)).slice(-12);
+    const refChronicle = refMode ? allChronicle.filter(isRefEvent).sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0)) : [];
     const flashbackChronicle = allChronicle.filter(e => e && e.timelinePhase === 'flashback').slice(-6);
+
+    if (refMode) {
+        const refLabel = narrativeCfg.referencePovLabel || '已完结基准时间线';
+        const doneRefEvts = refChronicle.filter(e => refCursor > 0 && Number(e.endChapter || e.startChapter || 0) <= refCursor);
+        const upcomingRefEvts = refChronicle.filter(e => {
+            const st = Number(e.startChapter || 0);
+            const ed = Number(e.endChapter || st);
+            return ed > refCursor && st <= refCursor + refLookahead;
+        });
+        const upcomingRefChapters = refChapters
+            .filter(c => Number(c.index) > refCursor && Number(c.index) <= refCursor + Math.min(4, refLookahead))
+            .sort((a, b) => Number(a.index) - Number(b.index));
+
+        parts.push(
+            '',
+            `【🧭 平行视角 · ${refLabel}对照路标（当前已对齐至基准第 ${refCursor} 章 · 接下来必须按序衔接第 ${refCursor + 1}~${refCursor + refLookahead} 章）】`,
+        );
+        if (doneRefEvts.length > 0) {
+            parts.push(`▸ ✅ 基准时间线已完成节点（#${doneRefEvts[0].startChapter}~#${refCursor}，严禁重复再写）：${doneRefEvts.map(e => `${e.chapterRange}${e.title}`).join(' → ')}`);
+        }
+        if (upcomingRefEvts.length > 0) {
+            parts.push('▸ 🎯 接下来必须按顺序衔接与补完的基准时间线节点（严禁跳序、严禁凭空多加同类大事件）：');
+            for (const evt of upcomingRefEvts) {
+                parts.push(`  - (${evt.chapterRange}) ${evt.title}：${evt.summary}`);
+            }
+        }
+        if (upcomingRefChapters.length > 0) {
+            parts.push('▸ 📄 基准时间线前方原著摘要（供核对精确时间、地点、对话与交集细节）：');
+            for (const ch of upcomingRefChapters) {
+                const body = stripNonStoryBlocks(ch.content || '').replace(/\s+/g, ' ').trim();
+                parts.push(`  - [基准#${ch.index} ${ch.title}]：${body.slice(0, 420)}${body.length > 420 ? '……' : ''}`);
+            }
+        }
+    }
     if (mainChronicle.length > 0) {
         parts.push('', strictPov
             ? `【主线近期编年史（已发生且不可重复；仅「${povChar}已知」可直接入镜）】：`

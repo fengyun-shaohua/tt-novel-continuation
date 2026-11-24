@@ -41,7 +41,7 @@ export function resolveActiveAnchorChapter(novelData, excludeFlashback = true) {
     const eligible = novelData.chapters
         .filter(c => {
             if (!c || Number(c.index) > cutoff) return false;
-            if (c.timelineRole === 'skip') return false;
+            if (c.timelineRole === 'skip' || c.timelineRole === 'reference') return false;
             if (excludeFlashback && c.timelineRole === 'flashback') return false;
             return true;
         })
@@ -223,6 +223,13 @@ export function buildSingleCallContinuationContext({
             '【时间线单向推进红线】：严格紧接上一章最新时间点向下推进，严禁时间倒流、严禁回退或无新因果地重复描写编年史中已发生过的同类重大事件！',
         );
     }
+    if (narrativeCfg.referenceTimelineMode) {
+        const refLabel = narrativeCfg.referencePovLabel || '已完结基准时间线';
+        const refCursor = Number(narrativeCfg.referenceCursorChapter || 0);
+        headerLines.push(
+            `【平行视角 · 基准时间线严密对齐铁律】：当前正在续写与【${refLabel}】平行的视角正文（已推进对齐至基准第 ${refCursor} 章）。凡涉及与基准视角的交集事件（通话内容、发送的照片/视频、见面经过、重大外勤或出行节点），必须 100% 严格遵循下方基准路标的时间顺序与事实细节，严禁提前剧透、严禁重复已发生节点！`,
+        );
+    }
     if (hasExternalLwbSummary) {
         headerLines.push(
             '【外部摘要协同分工】：外部记忆仅作过往事实参考；人物言行方式、说话长度与心理气质必须 100% 遵循下方《核心人物灵魂与防 OOC 档案》与原著原文，严禁将外部摘要里的概括词或关系标签脑补成霸道总裁/刻板里番模板！',
@@ -289,8 +296,40 @@ export function buildSingleCallContinuationContext({
     if (activeChronicle.length > 0 || activeStates.length > 0 || activeSummaries.length > 0) {
         const tier1Lines = ['【第一优先级：当前时间线已确认状态与前情提要（最高事实权威）】'];
         if (activeChronicle.length > 0) {
-            const mainEvts = activeChronicle.filter(e => e.timelinePhase !== 'flashback');
+            const refMode = Boolean(narrativeCfg.referenceTimelineMode);
+            const refCursor = Number(narrativeCfg.referenceCursorChapter || 0);
+            const refLookahead = Math.max(2, Math.min(20, Number(narrativeCfg.referenceLookaheadChapters) || 8));
+            const refChapters = (novelData?.chapters || []).filter(c => c && c.timelineRole === 'reference');
+            const refChapterSet = new Set(refChapters.map(c => Number(c.index)));
+            const isRefEvt = (e) => e && (e.timelinePhase === 'reference' || (refMode && refChapterSet.has(Number(e.startChapter))));
+
+            const mainEvts = activeChronicle.filter(e => e.timelinePhase !== 'flashback' && !isRefEvt(e));
+            const refEvts = refMode ? (ledger?.chronicle || []).filter(isRefEvt).sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0)) : [];
             const flashbackEvts = activeChronicle.filter(e => e.timelinePhase === 'flashback');
+
+            if (refMode) {
+                const refLabel = narrativeCfg.referencePovLabel || '已完结基准时间线';
+                const doneRef = refEvts.filter(e => refCursor > 0 && Number(e.endChapter || e.startChapter || 0) <= refCursor);
+                const nextRef = refEvts.filter(e => {
+                    const st = Number(e.startChapter || 0);
+                    const ed = Number(e.endChapter || st);
+                    return ed > refCursor && st <= refCursor + refLookahead;
+                });
+                const nextRefChs = refChapters
+                    .filter(c => Number(c.index) > refCursor && Number(c.index) <= refCursor + Math.min(3, refLookahead))
+                    .sort((a, b) => Number(a.index) - Number(b.index));
+                tier1Lines.push(`▸ 🧭 平行视角基准时间线对齐（${refLabel} · 已对齐至第 ${refCursor} 章）：`);
+                if (doneRef.length > 0) {
+                    tier1Lines.push(`  · ✅ 已写完的基准节点（严禁重写）：${doneRef.map(e => `${e.chapterRange}${e.title}`).join(' → ')}`);
+                }
+                for (const evt of nextRef) {
+                    tier1Lines.push(`  · 🎯 即将衔接基准节点 (${evt.chapterRange}) ${evt.title}：${evt.summary}`);
+                }
+                for (const ch of nextRefChs) {
+                    const body = stripNonStoryBlocks(ch.content || '').replace(/\s+/g, ' ').trim();
+                    tier1Lines.push(`  · 📄 [基准#${ch.index} ${ch.title}]：${body.slice(0, 360)}${body.length > 360 ? '……' : ''}`);
+                }
+            }
             if (mainEvts.length > 0) {
                 tier1Lines.push(strictPov
                     ? `▸ 主线剧情编年史（已确认时间线 · 请严格区分「${povChar}已知」与「幕后盲区」）：`
@@ -355,6 +394,7 @@ export function buildSingleCallContinuationContext({
             cutoffChapterIndex: anchorChapter?.index || cutoff,
             excludeTailCount: hasOriginalFloorInChat ? Math.max(1, mountedOriginalCount) : 1,
             excludeFlashback,
+            excludeReference: Boolean(narrativeCfg.referenceTimelineMode),
             topK: Number(settings.maxOriginalHits) || 3,
             maxSnippetChars: 420,
         });

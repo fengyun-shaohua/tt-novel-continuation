@@ -618,7 +618,11 @@ export function searchOriginalChaptersCjk(queryText, chapters, options = {}) {
     const excludedRoles = new Set(
         Array.isArray(options.excludeTimelineRoles)
             ? options.excludeTimelineRoles
-            : (options.excludeFlashback ? ['flashback', 'skip'] : ['skip']),
+            : [
+                'skip',
+                ...(options.excludeFlashback ? ['flashback'] : []),
+                ...(options.excludeReference ? ['reference'] : []),
+            ],
     );
 
     const { exactTerms, bigrams } = extractCjkQueryTokens(queryText);

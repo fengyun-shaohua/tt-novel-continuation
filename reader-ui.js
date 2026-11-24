@@ -746,21 +746,32 @@ function renderMemoryTab(bodyEl) {
                 <div class="tt-novel-custom-api-box">
                     <label class="tt-novel-check-row" style="margin-bottom: 6px;">
                         <input type="checkbox" id="tt-novel-ncfg-ref-mode" ${nCfg.referenceTimelineMode ? 'checked' : ''} />
-                        <span><b>🧭 启用「平行视角 · 对照已完结基准时间线」模式</b>（适合“A视角已完结、续写B视角太监线”：先在「📑 目录」把已完结A视角区间标为「🧭 基准时间线」，再填写当前已对齐的基准章号）</span>
+                        <span><b>🧭 启用「平行视角 · 对照已完结基准时间线」模式</b>（全自动追踪：每写一章自动推进基准章号指针，无需每次手改）</span>
                     </label>
                     <div class="tt-novel-row-3">
                         <label>基准时间线名称：
-                            <input type="text" id="tt-novel-ncfg-ref-label" class="text_pole" value="${escapeHtml(nCfg.referencePovLabel || '')}" placeholder="例如：博士视角原著" />
+                            <input type="text" id="tt-novel-ncfg-ref-label" class="text_pole" value="${escapeHtml(nCfg.referencePovLabel || '')}" placeholder="例如：A视角已完结原著" />
                         </label>
-                        <label>当前已对齐基准章号（Cursor）：
+                        <label>当前已对齐基准章号（自动推进）：
                             <input type="number" id="tt-novel-ncfg-ref-cursor" class="text_pole" min="0" value="${Number(nCfg.referenceCursorChapter || 0)}" />
                         </label>
                         <label>前方基准路标视野（章数）：
                             <input type="number" id="tt-novel-ncfg-ref-window" class="text_pole" min="2" max="20" value="${Number(nCfg.referenceLookaheadChapters || 8)}" />
                         </label>
                     </div>
+                    <div class="tt-novel-row-2" style="margin-top: 6px;">
+                        <label class="tt-novel-check-row">
+                            <input type="checkbox" id="tt-novel-ncfg-auto-cursor" ${nCfg.autoAdvanceRefCursor !== false ? 'checked' : ''} />
+                            <span>🤖 每次续写后自动推进/回滚基准章号指针（0 额外 API）</span>
+                        </label>
+                        <label class="tt-novel-check-row">
+                            <input type="checkbox" id="tt-novel-ncfg-auto-detect" ${nCfg.autoDetectOnArchive !== false ? 'checked' : ''} />
+                            <span>🤖 新书全本归档前自动识别视角与双线结构</span>
+                        </label>
+                    </div>
                 </div>
                 <div class="tt-novel-action-bar">
+                    <button type="button" id="tt-novel-ncfg-auto-run" class="menu_button tt-novel-btn-sm" ${task.running ? 'disabled' : ''}>🤖 一键全自动识别视角与时间线（1次API）</button>
                     <button type="button" id="tt-novel-ncfg-save" class="menu_button tt-novel-btn-sm tt-novel-btn-primary">💾 保存本书叙事与世界书规则</button>
                 </div>
             </div>
@@ -1111,6 +1122,9 @@ function renderMemoryTab(bodyEl) {
             <button type="button" id="tt-novel-run-archive-inc" class="menu_button" ${task.running ? 'disabled' : ''}>
                 ⚡ 增量补总结新章
             </button>
+            <button type="button" id="tt-novel-auto-detect-btn" class="menu_button" ${task.running ? 'disabled' : ''} title="仅需1次API自动分析全书视角、分出基准线/主线并计算当前对齐章号">
+                🤖 自动识别视角与双线
+            </button>
             <button type="button" id="tt-novel-add-char" class="menu_button">+ 人物</button>
             <button type="button" id="tt-novel-add-evt" class="menu_button">+ 事件</button>
             <button type="button" id="tt-novel-add-hook" class="menu_button">+ 伏笔</button>
@@ -1170,6 +1184,8 @@ function renderMemoryTab(bodyEl) {
             referencePovLabel: String(bodyEl.querySelector('#tt-novel-ncfg-ref-label')?.value || '').trim(),
             referenceCursorChapter: Number(bodyEl.querySelector('#tt-novel-ncfg-ref-cursor')?.value || 0),
             referenceLookaheadChapters: Number(bodyEl.querySelector('#tt-novel-ncfg-ref-window')?.value || 8),
+            autoAdvanceRefCursor: Boolean(bodyEl.querySelector('#tt-novel-ncfg-auto-cursor')?.checked),
+            autoDetectOnArchive: Boolean(bodyEl.querySelector('#tt-novel-ncfg-auto-detect')?.checked),
         };
         if (patch.povMode === 'strict_limited' && !patch.povCharacter) {
             globalThis.toastr?.warning?.('已选「严格限制单视角」，请填写视角人物名称（如主角名）', '小说续写阅读器');
@@ -1179,6 +1195,8 @@ function renderMemoryTab(bodyEl) {
         globalThis.toastr?.success?.('已保存本书叙事视角、时间线与世界书规则！', '小说续写阅读器');
     });
 
+    bodyEl.querySelector('#tt-novel-auto-detect-btn')?.addEventListener('click', () => handlers.onAutoDetectNarrativeStructure?.());
+    bodyEl.querySelector('#tt-novel-ncfg-auto-run')?.addEventListener('click', () => handlers.onAutoDetectNarrativeStructure?.());
     bodyEl.querySelector('#tt-novel-run-archive-full')?.addEventListener('click', () => handlers.onRunArchive?.('full'));
     bodyEl.querySelector('#tt-novel-run-archive-inc')?.addEventListener('click', () => handlers.onRunArchive?.('incremental'));
     bodyEl.querySelector('#tt-novel-rerun-failed-slices')?.addEventListener('click', () => handlers.onRerunFailedArchiveBatches?.());

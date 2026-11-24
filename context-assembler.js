@@ -432,11 +432,15 @@ export function buildSingleCallContinuationContext({
         );
     }
     if (strictPov) {
+        const isThirdLimited = narrativeCfg.povPerson !== 'first_person';
         headerLines.push(
             `【严格单视角（Limited POV）铁律（最高叙事红线）】：全章必须 100% 锁死在「${povChar}」的${povPersonLabel}内！`,
             `1. 严禁切换至其他角色的独立视角、内心独白或「${povChar}」不在场的密室/背地场景；`,
             `2. 严禁让「${povChar}」未卜先知地提及下方【幕后逻辑黑盒】里尚未通过亲眼所见、亲耳所闻或文件/通讯获知的情报；`,
             `3. 幕后事件只能通过「${povChar}」实际接触到的蛛丝马迹、他人微反应、数据异常或收到的信息侧面透出。`,
+            ...(isThirdLimited
+                ? [`4. 第三人称称谓硬规：主角一律使用姓名「${povChar}」、人称代词「他/她/他的/她的」或自然承前省略主语，严禁把反身代词「自己」当成独立主语或高频替代「他/他的」（非必要反身语境外每章尽量不超过 2 次）。`]
+                : []),
         );
     }
     if (narrativeCfg.strictTimelineOrder !== false) {

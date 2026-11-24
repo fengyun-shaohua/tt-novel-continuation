@@ -629,16 +629,16 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
             : {};
         ledger.refCursorHistory[String(chapterIndex)] = incomingCursor;
 
-        // Recompute effective cursor up to latest chapter in history so swipes/edits stay accurate
-        let prevMaxCursor = Number(ledger.refCursorBase || 0);
-        for (const [k, v] of Object.entries(ledger.refCursorHistory)) {
-            const cIdx = Number(k);
+        // Recompute monotonic effective frontier across ALL recorded chapters so swiping the latest
+        // chapter can update/rewind while swiping an older chapter never regresses the active frontier.
+        let effectiveMaxCursor = Number(ledger.refCursorBase || 0);
+        for (const v of Object.values(ledger.refCursorHistory)) {
             const cVal = Number(v);
-            if (Number.isFinite(cIdx) && cIdx < chapterIndex && Number.isFinite(cVal)) {
-                prevMaxCursor = Math.max(prevMaxCursor, cVal);
+            if (Number.isFinite(cVal) && cVal >= 0) {
+                effectiveMaxCursor = Math.max(effectiveMaxCursor, cVal);
             }
         }
-        ledger.narrativeConfig.referenceCursorChapter = Math.max(prevMaxCursor, incomingCursor);
+        ledger.narrativeConfig.referenceCursorChapter = effectiveMaxCursor;
     }
 
     await saveLedger(ledger);

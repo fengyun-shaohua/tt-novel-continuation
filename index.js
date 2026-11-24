@@ -15,7 +15,9 @@ import {
 import {
     buildNovelStateTrailerPrompt,
     buildSingleCallContinuationContext,
+    buildUnarchivedRecentChaptersBridge,
     isContinuedNovelFloor,
+    resolveActiveAnchorChapter,
     resolveCurrentTargetChapterIndex,
 } from './context-assembler.js';
 import {
@@ -60,6 +62,7 @@ import {
     detectNovelNarrativeStructure,
     rerunArchiveBatches,
     runStoryAndCharacterArchivePipeline,
+    summarizeSingleChapterState,
     synthesizeArchiveFromBatches,
 } from './story-archiver.js';
 import {
@@ -83,6 +86,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     authorMode: true,
     foldUserOutlineFloors: true,
     enableAutoStateBlock: true,
+    autoFallbackChapterSummary: true,
     syncToWorldInfo: true,
     mountAnchorChapters: 3,
     distillRounds: 2,
@@ -289,6 +293,107 @@ function scheduleFoldPrecedingUserOutlineFloor(msgRef) {
     }, 260);
 }
 
+async function persistExtractedChapterState({
+    msg,
+    floorIndex,
+    swipeId,
+    extracted,
+    chapterIndex,
+    novelData,
+    settings,
+}) {
+    if (!msg || !extracted?.hasState) return;
+    const stateRecord = {
+        chapterIndex,
+        summary: extracted.summary,
+        worldUpdates: extracted.worldUpdates || [],
+        appearanceUpdates: extracted.appearanceUpdates || [],
+        hooks: extracted.hooks || [],
+        refCursor: extracted.refCursor ?? null,
+    };
+    msg.extra = msg.extra || {};
+    msg.extra.novelContinuationState = stateRecord;
+    msg.extra.novelContinuationStateBySwipe = msg.extra.novelContinuationStateBySwipe || {};
+    msg.extra.novelContinuationStateBySwipe[swipeId] = stateRecord;
+
+    const pureStoryText = stripNonStoryBlocks(msg.mes || '').replace(/<\/?game>/gi, '').trim();
+    const firstLine = pureStoryText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
+    const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
+
+    await applyExtractedStateToLedger(stateRecord, chapterIndex, chapterTitle, floorIndex);
+
+    if (settings?.syncToWorldInfo && stateRecord.worldUpdates.length > 0) {
+        try {
+            await syncWorldUpdatesToTavernLorebook(novelData?.title, stateRecord.worldUpdates, chapterIndex);
+        } catch (err) {
+            console.warn('[小说续写阅读器] 同步至酒馆世界书失败：', err);
+        }
+    }
+}
+
+const fallbackSummaryInFlight = new Set();
+
+async function runFallbackSingleChapterSummary(msgRef, chapterIndex) {
+    if (!msgRef || fallbackSummaryInFlight.has(msgRef)) return;
+    const settings = getSettings();
+    if (!settings.enabled || !settings.enableAutoStateBlock || !settings.autoFallbackChapterSummary) return;
+
+    const context = getContext();
+    const chat = context?.chat;
+    if (!Array.isArray(chat)) return;
+    const liveFloorIdx = chat.indexOf(msgRef);
+    if (liveFloorIdx < 0) return;
+
+    const swipeId = Number.isFinite(msgRef.swipe_id) ? msgRef.swipe_id : 0;
+    if (msgRef.extra?.novelContinuationStateBySwipe?.[swipeId]?.summary) return;
+
+    const draftCheck = validateDraftForRewrite(msgRef.mes || '');
+    if (!draftCheck.ok) return;
+
+    let caller;
+    try {
+        caller = createPresetModelCaller();
+    } catch {
+        return;
+    }
+
+    fallbackSummaryInFlight.add(msgRef);
+    try {
+        const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+        const pureStoryText = draftCheck.storyText;
+        const firstLine = pureStoryText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
+        const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
+
+        const extracted = await summarizeSingleChapterState({
+            novelTitle: novelData?.title || '当前小说',
+            chapterIndex,
+            chapterTitle,
+            chapterText: pureStoryText,
+            ledger,
+            callModel: caller.callModel,
+        });
+        const currentFloorIdx = chat.indexOf(msgRef);
+        if (currentFloorIdx < 0) return;
+        const curSwipeId = Number.isFinite(msgRef.swipe_id) ? msgRef.swipe_id : 0;
+        await persistExtractedChapterState({
+            msg: msgRef,
+            floorIndex: currentFloorIdx,
+            swipeId: curSwipeId,
+            extracted,
+            chapterIndex,
+            novelData,
+            settings,
+        });
+        await context.saveChat?.();
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+    } catch (err) {
+        console.warn(`[小说续写阅读器] 第 ${chapterIndex} 章兜底自动总结跳过：`, err?.message || err);
+    } finally {
+        fallbackSummaryInFlight.delete(msgRef);
+    }
+}
+
 async function onMessageReceived(messageId, type) {
     const settings = getSettings();
     if (!settings.enabled || type === 'first_message' || type === 'impersonate' || type === 'quiet') return;
@@ -300,14 +405,15 @@ async function onMessageReceived(messageId, type) {
     const msg = chat[messageId];
     if (msg.is_user || msg.is_system) return;
 
-    const novelData = await loadNovelData();
+    const [novelData, ledgerForIndex] = await Promise.all([loadNovelData(), loadLedger()]);
+    const excludeFlashback = ledgerForIndex?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
     msg.extra = msg.extra || {};
     if (!msg.extra.novelContinuationOrigin) {
         msg.extra.novelContinuationOrigin = 'continued';
     }
 
     const chapterIndex = Number(msg.extra.novelChapterIndex)
-        || Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData, true));
+        || Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData, true, excludeFlashback));
     msg.extra.novelChapterIndex = chapterIndex;
 
     const shouldFoldUserOutline = Boolean(
@@ -325,33 +431,16 @@ async function onMessageReceived(messageId, type) {
             msg.swipes[swipeId] = extracted.cleanText;
         }
 
-        const stateRecord = {
-            chapterIndex,
-            summary: extracted.summary,
-            worldUpdates: extracted.worldUpdates,
-            appearanceUpdates: extracted.appearanceUpdates,
-            hooks: extracted.hooks,
-            refCursor: extracted.refCursor,
-        };
-        msg.extra.novelContinuationState = stateRecord;
-        msg.extra.novelContinuationStateBySwipe = msg.extra.novelContinuationStateBySwipe || {};
-        msg.extra.novelContinuationStateBySwipe[swipeId] = stateRecord;
-
         context.updateMessageBlock?.(messageId, msg);
-
-        const pureStoryText = stripNonStoryBlocks(extracted.cleanText).replace(/<\/?game>/gi, '').trim();
-        const firstLine = pureStoryText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
-        const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
-
-        await applyExtractedStateToLedger(extracted, chapterIndex, chapterTitle, messageId);
-
-        if (settings.syncToWorldInfo && extracted.worldUpdates.length > 0) {
-            try {
-                await syncWorldUpdatesToTavernLorebook(novelData?.title, extracted.worldUpdates, chapterIndex);
-            } catch (err) {
-                console.warn('[小说续写阅读器] 同步至酒馆世界书失败：', err);
-            }
-        }
+        await persistExtractedChapterState({
+            msg,
+            floorIndex: messageId,
+            swipeId,
+            extracted,
+            chapterIndex,
+            novelData,
+            settings,
+        });
     }
 
     // Synchronously capture preceding user outline before any async fold timer deletes that floor
@@ -379,6 +468,7 @@ async function onMessageReceived(messageId, type) {
     }
 
     // Optional Auto Deep Diagnosis & Rewrite (strictly gated by empty/refusal validation + re-entry lock)
+    let scheduledAutoRewrite = false;
     if (settings.autoDeepRewrite && novelData?.chapters?.length && type !== 'continue') {
         const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
         const doneMap = msg.extra.novelDeepRewrittenSwipes || {};
@@ -392,10 +482,28 @@ async function onMessageReceived(messageId, type) {
                 });
                 globalThis.toastr?.warning?.(`🛡️ ${draftCheck.reason}`, '小说续写阅读器');
             } else {
+                scheduledAutoRewrite = true;
                 setTimeout(() => {
                     void runDeepRewriteLatestTask({ targetMsgRef: msg, triggerSource: 'auto' });
                 }, 360);
             }
+        }
+    }
+
+    // Fallback 1-call auto-summary if the chapter omitted `<novel_state>` and isn't about to be deep-rewritten
+    if (
+        !scheduledAutoRewrite
+        && !extracted.hasState
+        && settings.enableAutoStateBlock
+        && settings.autoFallbackChapterSummary
+        && novelData?.chapters?.length
+        && type !== 'continue'
+    ) {
+        const draftCheck = validateDraftForRewrite(msg.mes);
+        if (draftCheck.ok) {
+            setTimeout(() => {
+                void runFallbackSingleChapterSummary(msg, chapterIndex);
+            }, 420);
         }
     }
 }
@@ -760,7 +868,7 @@ async function collectActivatedTavernWorldInfo({ novelData = null, ledger = null
         }
         const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
         const anchor = cutoff > 0
-            ? (novelData?.chapters || []).find(c => Number(c.index) === cutoff)
+            ? resolveActiveAnchorChapter(novelData, cfg.excludeFlashbackFromAnchor !== false)
             : null;
         if (anchor?.content) {
             scanTexts.push(stripNonStoryBlocks(anchor.content).slice(-1200));
@@ -1123,6 +1231,7 @@ function collectContinuedChaptersFromChat(novelData) {
             index: chIdx,
             title: firstLine.replace(/^#+\s*/, '').slice(0, 40),
             content: cleanBody,
+            authorOutline: String(m.extra?.novelAuthorOutline || '').trim(),
         });
     });
     return list;
@@ -1302,6 +1411,9 @@ async function runStoryArchiveTask(mode = 'full') {
                 signal: ctrl.signal,
             });
             await applyDetectedNarrativeStructure(novelData, existingLedger, detected);
+            await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex, {
+                focusChapterIndex: novelData.viewingChapterIndex || novelData.cutoffChapterIndex,
+            });
         }
 
         const result = await runStoryAndCharacterArchivePipeline({
@@ -1898,9 +2010,19 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
             extraTexts: [draftCheck.storyText, authorOutline],
         });
 
+        const effectiveChapterIndex = chapterIndex || (prevChapterAnchor?.nextChapterIndex || 1);
+        const recentBridge = buildUnarchivedRecentChaptersBridge({
+            novelData,
+            continuedChapters: prevContinued,
+            ledger,
+            upToChapterIndex: effectiveChapterIndex - 1,
+            excludeFlashback,
+            maxItems: 8,
+        });
+
         const { systemPrompt, prompt, driftSummary } = buildDeepRewritePrompt({
             draftText: draftCheck.storyText,
-            chapterIndex: chapterIndex || (prevChapterAnchor?.nextChapterIndex || 1),
+            chapterIndex: effectiveChapterIndex,
             authorOutline,
             prevChapterAnchor,
             novelData,
@@ -1910,6 +2032,8 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
             extraDirective,
             worldInfoContext,
             narrativeConfig: ledger?.narrativeConfig,
+            recentChaptersBridgeLines: recentBridge.lines,
+            includeNovelState: Boolean(settings.enableAutoStateBlock),
         });
 
         const rawOutput = await caller.callModel({
@@ -1919,7 +2043,7 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         });
         throwIfAborted(ctrl.signal);
 
-        const { diagnosisPre, rewrittenContent } = parseDeepRewriteResponse(rawOutput, draftCheck.charCount);
+        const { diagnosisPre, rewrittenContent, extractedState } = parseDeepRewriteResponse(rawOutput, draftCheck.charCount);
         const finalMes = hadGameWrapper ? `<game>\n${rewrittenContent}\n</game>` : rewrittenContent;
 
         // Re-resolve live floor index in case preceding user outline floor was folded during async call
@@ -1946,12 +2070,23 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
             [origSwipeId]: true,
             [newSwipeId]: true,
         };
-        if (msg.extra.novelContinuationStateBySwipe?.[origSwipeId]) {
+        if (extractedState?.hasState) {
+            await persistExtractedChapterState({
+                msg,
+                floorIndex: liveFloorIdx,
+                swipeId: newSwipeId,
+                extracted: extractedState,
+                chapterIndex: effectiveChapterIndex,
+                novelData,
+                settings,
+            });
+        } else if (msg.extra.novelContinuationStateBySwipe?.[origSwipeId]) {
             msg.extra.novelContinuationStateBySwipe[newSwipeId] = msg.extra.novelContinuationStateBySwipe[origSwipeId];
         }
 
-        ledger.latestRewriteReport = {
-            chapterIndex: chapterIndex || (prevChapterAnchor?.nextChapterIndex || 1),
+        const freshLedger = await loadLedger();
+        freshLedger.latestRewriteReport = {
+            chapterIndex: effectiveChapterIndex,
             triggerSource,
             modelLabel: caller.modelLabel,
             presetLabel: caller.presetLabel,
@@ -1963,7 +2098,7 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
             diagnosisPre,
             createdAt: Date.now(),
         };
-        await saveLedger(ledger);
+        await saveLedger(freshLedger);
 
         context.updateMessageBlock?.(liveFloorIdx, msg);
         await context.saveChat?.();
@@ -1973,9 +2108,20 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         });
         await refreshReaderWidgets();
         globalThis.toastr?.success?.(
-            `第 ${chapterIndex || '?'} 章深度重塑完成（${afterChars} 字 · 八股 ${beforeScan.totalHits}→${afterScan.totalHits}），初稿已保留在上一页！`,
+            `第 ${effectiveChapterIndex} 章深度重塑完成（${afterChars} 字 · 八股 ${beforeScan.totalHits}→${afterScan.totalHits}），初稿已保留在上一页！`,
             '小说续写阅读器',
         );
+
+        // If neither the original draft nor the rewrite emitted `<novel_state>`, run lightweight fallback summary
+        if (
+            settings.enableAutoStateBlock
+            && settings.autoFallbackChapterSummary
+            && !msg.extra?.novelContinuationStateBySwipe?.[newSwipeId]?.summary
+        ) {
+            setTimeout(() => {
+                void runFallbackSingleChapterSummary(msg, effectiveChapterIndex);
+            }, 300);
+        }
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
             updateLiveProgress('cliche', { isRunning: false, isError: false, text: `⏹ ${modeTag}已手动停止（原初稿已安全保留）。` });

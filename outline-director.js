@@ -6,6 +6,7 @@
  * through `callModel` (which applies the user's selected API + Tavern preset).
  */
 
+import { buildUnarchivedRecentChaptersBridge } from './context-assembler.js';
 import { stripNonStoryBlocks } from './parser.js';
 import { isModelRefusalText } from './story-archiver.js';
 import { cleanDistillProse, throwIfAborted } from './style-distiller.js';
@@ -45,7 +46,7 @@ export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { 
     const chapterUnit = /节\s*$/.test(String(sampleTitle).trim()) ? '节' : '章';
 
     const cleanBody = anchorCh ? stripNonStoryBlocks(anchorCh.content || '').replace(/<\/?game>/gi, '').trim() : '';
-    const tailSnippet = cleanBody.slice(-1100);
+    const tailSnippet = cleanBody.slice(-1400);
     const shortClosing = cleanBody.replace(/\s+/g, ' ').slice(-90);
 
     return {
@@ -301,6 +302,23 @@ export function buildDirectorOutlinePrompt({
         for (const evt of flashbackChronicle) {
             parts.push(`- (${evt.chapterRange}·倒叙/他视角) ${evt.title}：${evt.summary}`);
         }
+    }
+
+    // Zero-API continuous bridge covering ALL unarchived original main chapters & ALL continued chapters up to anchor!
+    const unarchivedBridge = buildUnarchivedRecentChaptersBridge({
+        novelData,
+        continuedChapters,
+        ledger,
+        upToChapterIndex: anchor.prevChapterIndex,
+        excludeFlashback,
+        maxItems: 22,
+    });
+    if (unarchivedBridge.count > 0) {
+        parts.push(
+            '',
+            `【📌 尚未并入编年史的最新已写章节实录（第 ${unarchivedBridge.startChapter}~${unarchivedBridge.endChapter} ${anchor.chapterUnit} · 这些剧情均已真实发生，严禁失忆重演、严禁凭空编造与以下进展冲突的设定或人物！）】：`,
+            ...unarchivedBridge.lines,
+        );
     }
 
     if (chosenHooks.length > 0) {

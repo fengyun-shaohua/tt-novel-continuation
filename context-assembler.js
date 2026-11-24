@@ -50,9 +50,12 @@ export function resolveActiveAnchorChapter(novelData, excludeFlashback = true) {
     return novelData.chapters.find(c => Number(c.index) === cutoff) || novelData.chapters[novelData.chapters.length - 1];
 }
 
-export function resolveCurrentTargetChapterIndex(chat, novelData, isContinue = false) {
-    const cutoff = Number(novelData?.cutoffChapterIndex || 0);
-    if (!Array.isArray(chat)) return cutoff + 1;
+export function resolveCurrentTargetChapterIndex(chat, novelData, isContinue = false, excludeFlashback = true) {
+    const activeAnchor = Array.isArray(novelData?.chapters) && novelData.chapters.length > 0
+        ? resolveActiveAnchorChapter(novelData, excludeFlashback)
+        : null;
+    const baseChapter = Number(activeAnchor?.index || novelData?.cutoffChapterIndex || 0);
+    if (!Array.isArray(chat)) return baseChapter + 1;
 
     let lastOriginalFloorIdx = -1;
     chat.forEach((msg, idx) => {
@@ -69,9 +72,138 @@ export function resolveCurrentTargetChapterIndex(chat, novelData, isContinue = f
     });
 
     if (isContinue && continuedFloors > 0) {
-        return cutoff + continuedFloors;
+        return baseChapter + continuedFloors;
     }
-    return cutoff + continuedFloors + 1;
+    return baseChapter + continuedFloors + 1;
+}
+
+/**
+ * Deterministically builds a compact 0-API bridge of recent chapters that are NOT yet covered
+ * by `ledger.chronicle` (including unarchived original main chapters and all AI-continued chapters),
+ * preferring `<novel_state>` summaries and falling back to saved author outline / head+mid+tail prose skeletons.
+ * Guarantees Director Outline, Continuation, and Deep Rewrite NEVER lose context across long continued arcs.
+ */
+export function buildUnarchivedRecentChaptersBridge({
+    novelData = null,
+    continuedChapters = [],
+    ledger = null,
+    upToChapterIndex = Infinity,
+    excludeFlashback = true,
+    excludeChapterIndices = [],
+    maxItems = 18,
+} = {}) {
+    const excludeSet = new Set((excludeChapterIndices || []).map(Number));
+    const narrativeCfg = ledger?.narrativeConfig || {};
+    const refMode = Boolean(narrativeCfg.referenceTimelineMode);
+    const refSet = new Set(
+        (novelData?.chapters || []).filter(c => c && c.timelineRole === 'reference').map(c => Number(c.index)),
+    );
+
+    const mainChronicle = (ledger?.chronicle || []).filter(e => {
+        if (!e || e.timelinePhase === 'flashback') return false;
+        if (e.timelinePhase === 'reference') return false;
+        if (refMode && refSet.has(Number(e.startChapter))) return false;
+        return true;
+    });
+    const maxChronicleMain = mainChronicle.reduce(
+        (mx, e) => Math.max(mx, Number(e.endChapter || e.startChapter || 0)),
+        0,
+    );
+    const archivedFloor = Math.max(Number(ledger?.lastArchivedChapter || 0), maxChronicleMain);
+
+    const summaryByChapter = new Map();
+    for (const s of (ledger?.summaries || [])) {
+        if (s && Number(s.chapterIndex) > 0 && String(s.summary || '').trim()) {
+            summaryByChapter.set(Number(s.chapterIndex), s);
+        }
+    }
+
+    const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
+    const byChapter = new Map();
+
+    // 1) Unarchived original main chapters (archivedFloor + 1 .. min(cutoff, upToChapterIndex))
+    for (const ch of (novelData?.chapters || [])) {
+        const idx = Number(ch?.index || 0);
+        if (idx <= archivedFloor || idx > cutoff || idx > upToChapterIndex || excludeSet.has(idx)) continue;
+        if (ch.timelineRole === 'skip' || ch.timelineRole === 'reference') continue;
+        if (excludeFlashback && ch.timelineRole === 'flashback') continue;
+        byChapter.set(idx, {
+            index: idx,
+            title: ch.title || `第 ${idx} 章`,
+            content: String(ch.content || ''),
+            authorOutline: '',
+            origin: 'original',
+        });
+    }
+
+    // 2) ALL continued chapters up to `upToChapterIndex` (even if missing `<novel_state>` summaries!)
+    for (const ch of (continuedChapters || [])) {
+        const idx = Number(ch?.index || 0);
+        if (idx <= 0 || idx > upToChapterIndex || excludeSet.has(idx)) continue;
+        // Include if unarchived OR always include recent continued chapters so outline/continuation stay grounded
+        if (idx <= archivedFloor && !summaryByChapter.has(idx)) continue;
+        byChapter.set(idx, {
+            index: idx,
+            title: ch.title || `第 ${idx} 章`,
+            content: String(ch.content || ''),
+            authorOutline: String(ch.authorOutline || ''),
+            origin: 'continued',
+        });
+    }
+
+    // Also include any ledger.summaries entries above archivedFloor that weren't in chat/novel arrays
+    for (const [idx, sum] of summaryByChapter.entries()) {
+        if (idx > archivedFloor && idx <= upToChapterIndex && !excludeSet.has(idx) && !byChapter.has(idx)) {
+            byChapter.set(idx, {
+                index: idx,
+                title: sum.title || `第 ${idx} 章`,
+                content: '',
+                authorOutline: '',
+                origin: 'summary',
+            });
+        }
+    }
+
+    const sorted = [...byChapter.values()]
+        .sort((a, b) => a.index - b.index)
+        .slice(-Math.max(1, Number(maxItems) || 18));
+
+    if (sorted.length === 0) {
+        return { lines: [], startChapter: 0, endChapter: 0, count: 0 };
+    }
+
+    const buildProseSkeleton = (content, outline) => {
+        const cleanOutline = String(outline || '')
+            .replace(/【本章执笔纪律】[\s\S]*$/i, '')
+            .replace(/^【第\s*\d+\s*[章节回][^】]*】\s*/i, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const cleanBody = stripNonStoryBlocks(content || '').replace(/<\/?game>/gi, '').replace(/\s+/g, ' ').trim();
+        if (cleanOutline.length >= 16) {
+            const tail = cleanBody ? ` ｜ 实际结尾：…${cleanBody.slice(-70)}` : '';
+            return `${cleanOutline.slice(0, 200)}${cleanOutline.length > 200 ? '…' : ''}${tail}`;
+        }
+        if (!cleanBody) return '（无正文摘录）';
+        if (cleanBody.length <= 240) return cleanBody;
+        const midStart = Math.max(85, Math.floor(cleanBody.length * 0.48) - 40);
+        return `开头：${cleanBody.slice(0, 85)}… ｜ 中段：…${cleanBody.slice(midStart, midStart + 80)}… ｜ 结尾：…${cleanBody.slice(-85)}`;
+    };
+
+    const lines = sorted.map(item => {
+        const savedSum = summaryByChapter.get(item.index);
+        const tag = item.origin === 'continued' ? '已续写' : '未归档原著';
+        if (savedSum?.summary) {
+            return `- [第${item.index}章·${tag}] ${item.title}：${savedSum.summary}`;
+        }
+        return `- [第${item.index}章·${tag}实录] ${item.title}：${buildProseSkeleton(item.content, item.authorOutline)}`;
+    });
+
+    return {
+        lines,
+        startChapter: sorted[0].index,
+        endChapter: sorted[sorted.length - 1].index,
+        count: sorted.length,
+    };
 }
 
 /**
@@ -154,11 +286,12 @@ export function buildSingleCallContinuationContext({
         : (narrativeCfg.povPerson === 'third_limited' ? '第三人称限制视角' : '严格跟随原著人称的限制视角');
 
     const isContinue = generationType === 'continue';
-    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue);
+    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue, excludeFlashback);
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
     const anchorChapter = (hasNovel && cutoff > 0)
         ? resolveActiveAnchorChapter(novelData, excludeFlashback)
         : null;
+    const activeAnchorIndex = Number(anchorChapter?.index || cutoff);
     const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
     const mountedOriginalCount = Array.isArray(chat)
         ? chat
@@ -235,10 +368,10 @@ export function buildSingleCallContinuationContext({
             '【外部摘要协同分工】：外部记忆仅作过往事实参考；人物言行方式、说话长度与心理气质必须 100% 遵循下方《核心人物灵魂与防 OOC 档案》与原著原文，严禁将外部摘要里的概括词或关系标签脑补成霸道总裁/刻板里番模板！',
         );
     }
-    if (anchorChapter && targetChapterIndex === cutoff + 1 && !isContinue) {
+    if (anchorChapter && targetChapterIndex === activeAnchorIndex + 1 && !isContinue) {
         const closingTail = anchorChapter.content.replace(/\s+/g, ' ').trim().slice(-140);
         headerLines.push(
-            `【严格续写锚点】：前文原著已完整演进至【${anchorLabel}】结尾（末尾句：“……${closingTail}”）。严禁回退或重写第 1~${cutoff} ${chapterUnit}已发生的剧情！请直接紧接【${anchorLabel}】结尾处无缝向下推进，撰写【${targetLabel}】。`,
+            `【严格续写锚点】：前文原著已完整演进至【${anchorLabel}】结尾（末尾句：“……${closingTail}”）。严禁回退或重写第 1~${activeAnchorIndex} ${chapterUnit}已发生的剧情！请直接紧接【${anchorLabel}】结尾处无缝向下推进，撰写【${targetLabel}】。`,
         );
     }
     sections.push(headerLines.join('\n'));
@@ -293,7 +426,40 @@ export function buildSingleCallContinuationContext({
         .sort((a, b) => a.chapterIndex - b.chapterIndex)
         .slice(-(Number(settings.maxRecentSummaries) || 6));
 
-    if (activeChronicle.length > 0 || activeStates.length > 0 || activeSummaries.length > 0) {
+    // 0-API continuous bridge for unarchived chapters (original gap + continued chapters missing `<novel_state>`)
+    const continuedFromChat = [];
+    if (Array.isArray(chat)) {
+        let lastOrigFloor = -1;
+        chat.forEach((m, i) => {
+            if (m?.extra?.novelContinuationOrigin === 'original') lastOrigFloor = i;
+        });
+        let seq = 0;
+        chat.forEach((m, i) => {
+            if (!isContinuedNovelFloor(m, i, lastOrigFloor)) return;
+            seq += 1;
+            const chIdx = Number(m?.extra?.novelChapterIndex) || (activeAnchorIndex + seq);
+            if (chIdx < targetChapterIndex) {
+                continuedFromChat.push({
+                    index: chIdx,
+                    title: m?.extra?.novelChapterTitle || `第 ${chIdx} ${chapterUnit}`,
+                    content: String(m.mes || ''),
+                    authorOutline: String(m?.extra?.novelAuthorOutline || ''),
+                });
+            }
+        });
+    }
+    const summaryChapterIds = activeSummaries.map(s => Number(s.chapterIndex));
+    const unarchivedBridge = buildUnarchivedRecentChaptersBridge({
+        novelData,
+        continuedChapters: continuedFromChat,
+        ledger,
+        upToChapterIndex: targetChapterIndex - 1,
+        excludeFlashback,
+        excludeChapterIndices: summaryChapterIds,
+        maxItems: 12,
+    });
+
+    if (activeChronicle.length > 0 || activeStates.length > 0 || activeSummaries.length > 0 || unarchivedBridge.count > 0) {
         const tier1Lines = ['【第一优先级：当前时间线已确认状态与前情提要（最高事实权威）】'];
         if (activeChronicle.length > 0) {
             const refMode = Boolean(narrativeCfg.referenceTimelineMode);
@@ -362,6 +528,12 @@ export function buildSingleCallContinuationContext({
             tier1Lines.push('▸ 近期章节剧情摘要：');
             for (const sum of activeSummaries) {
                 tier1Lines.push(`  - 第${sum.chapterIndex}${chapterUnit}《${sum.title || ''}》：${sum.summary}`);
+            }
+        }
+        if (unarchivedBridge.count > 0) {
+            tier1Lines.push(`▸ 📌 未归档近期章节实录（第${unarchivedBridge.startChapter}~${unarchivedBridge.endChapter}${chapterUnit} · 确保不断档、不重复已写情节）：`);
+            for (const line of unarchivedBridge.lines) {
+                tier1Lines.push(`  ${line}`);
             }
         }
         sections.push(tier1Lines.join('\n'));
@@ -457,19 +629,20 @@ export function buildNovelStateTrailerPrompt({
     );
     if (!hasNovel && !hasLedger) return '';
 
-    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, false);
+    const nCfg = ledger?.narrativeConfig || {};
+    const excludeFlashback = nCfg.excludeFlashbackFromAnchor !== false;
+    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, false, excludeFlashback);
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
-    const anchorChapter = (hasNovel && cutoff > 0) ? novelData.chapters.find(c => c.index === cutoff) : null;
+    const anchorChapter = (hasNovel && cutoff > 0) ? resolveActiveAnchorChapter(novelData, excludeFlashback) : null;
     const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
     const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
     const openHooks = resolveTimelineHooks(ledger?.hooks || [], targetChapterIndex - 1).slice(-8);
-    const nCfg = ledger?.narrativeConfig || {};
     const refAutoOn = Boolean(nCfg.referenceTimelineMode && nCfg.autoAdvanceRefCursor !== false);
     const curRefCursor = Number(nCfg.referenceCursorChapter || 0);
 
     const lines = [
         '【单次调用自动归档指令（强制末段附带 · 前端自动隐藏入库）】',
-        '无论外部预设是否要求用 `<game>...</game>` 等标签包裹正文，都必须在整章正文及所有闭合标签完全结束后，在整条回复的最末尾单独附带如下 XML 块（切勿省略）：',
+        '写完本章正文后，必须附带如下 `<novel_state>...</novel_state>` XML 块（切勿省略）：若外部预设要求用 `<game>...</game>` 包裹整条回复，请直接将 `<novel_state>...</novel_state>` 紧贴写在 `</game>` 闭合标签**紧前面**（或紧后面），前端会自动解析并从正文里隐藏，绝不影响排版！',
         '<novel_state>',
         `<summary>${targetLabel}的一句话核心剧情总结（80字以内）</summary>`,
         '<worldbook>',

@@ -9,7 +9,7 @@
  * through `callModel` (which applies the chosen API + Tavern preset).
  */
 
-import { parseChapterRangeSpec, stripNonStoryBlocks } from './parser.js';
+import { extractNovelStateBlock, parseChapterRangeSpec, stripNonStoryBlocks } from './parser.js';
 import { cleanDistillProse, isAbortError, runBoundedPool, throwIfAborted } from './style-distiller.js';
 
 const REFUSAL_PATTERNS = [
@@ -1085,4 +1085,96 @@ export async function detectNovelNarrativeStructure({
         skipIndices,
         reasoning: isPlaceholder(reasoning) ? '' : reasoning.trim(),
     };
+}
+
+/**
+ * Lightweight 1-call fallback chapter summarizer that produces a standard `<novel_state>` record
+ * whenever a finished continued chapter omitted `<novel_state>` (e.g. preset stopped at `</game>`).
+ */
+export async function summarizeSingleChapterState({
+    novelTitle = '当前小说',
+    chapterIndex = 1,
+    chapterTitle = '',
+    chapterText = '',
+    ledger = null,
+    callModel,
+    signal = null,
+}) {
+    throwIfAborted(signal);
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+    const cleanBody = cleanTagText(chapterText);
+    if (!cleanBody || cleanBody.length < 80) {
+        throw new Error('章节正文过短，跳过单章自动总结');
+    }
+
+    const nCfg = ledger?.narrativeConfig || {};
+    const refAutoOn = Boolean(nCfg.referenceTimelineMode && nCfg.autoAdvanceRefCursor !== false);
+    const curRefCursor = Number(nCfg.referenceCursorChapter || 0);
+    const openHooks = (ledger?.hooks || []).filter(h => h && h.status !== 'resolved').slice(-10);
+
+    const systemPrompt = [
+        '你是精准的长篇小说单章台账速记员，负责将刚写完的一章正文提炼为结构化 `<novel_state>` 存档记录。',
+        '必须客观、直白、准确写清本章核心事件、人物处境/着装变化与伏笔推进，严禁模糊敷衍，只输出 `<novel_state>...</novel_state>` XML 块，不要输出额外解释。',
+    ].join('\n');
+
+    const promptParts = [
+        `请为《${novelTitle}》第 ${chapterIndex} 章${chapterTitle ? `（${chapterTitle}）` : ''}输出标准 \`<novel_state>\` 存档块：`,
+        '<novel_state>',
+        `<summary>第 ${chapterIndex} 章的具体核心事件经过与结果（60~140字，写明地点、出场人物、关键进展，绝不空泛）</summary>`,
+        '<worldbook>',
+        '- 人物|角色名：本章结束时的最新处境/持有物/关系变化（仅写有变动的；无则写无）',
+        '- 外观|角色名：本章发生的着装或外观变化（无变化则省略）',
+        '</worldbook>',
+        '<hooks>',
+        '- [新伏笔] 本章新埋下的悬念、约定或把柄（无则写无）',
+        '- [已填坑] 本章回收或解决的旧伏笔（尽量沿用下方原话；无则写无）',
+        '</hooks>',
+        ...(refAutoOn
+            ? [`<ref_cursor>写完本章后已对齐覆盖的【${nCfg.referencePovLabel || '基准时间线'}】最大章号（纯数字，当前为 ${curRefCursor}；若本章推进并覆盖了后续基准章节请填新章号，否则保持 ${curRefCursor}）</ref_cursor>`]
+            : []),
+        '</novel_state>',
+    ];
+
+    if (openHooks.length > 0) {
+        promptParts.push('', '【当前待填伏笔列表（用于判断哪些在本章已被回收）】：');
+        for (const h of openHooks) {
+            promptParts.push(`- (#${h.plantedChapter || 1}) ${h.content}`);
+        }
+    }
+
+    promptParts.push('', '【本章完整正文】：', cleanBody.slice(0, 12000));
+
+    const raw = await callModel({
+        stage: `fallback_chapter_summary_${chapterIndex}`,
+        systemPrompt,
+        prompt: promptParts.join('\n'),
+    });
+    throwIfAborted(signal);
+
+    const extracted = extractNovelStateBlock(raw);
+    if (extracted.hasState) {
+        return extracted;
+    }
+
+    const cleanedRaw = cleanDistillProse(raw);
+    if (isModelRefusalText(cleanedRaw)) {
+        throw new Error(`单章自动总结触发模型拒答：${cleanedRaw.slice(0, 100)}`);
+    }
+
+    // Fallback: if model returned plain concise summary without XML wrapper, store it cleanly
+    const plainSummary = cleanedRaw.replace(/^#+\s*/gm, '').replace(/\s+/g, ' ').trim();
+    if (plainSummary.length >= 20 && plainSummary.length <= 420 && !isModelRefusalText(plainSummary)) {
+        return {
+            hasState: true,
+            cleanText: '',
+            summary: plainSummary.slice(0, 220),
+            worldUpdates: [],
+            appearanceUpdates: [],
+            hooks: [],
+            refCursor: null,
+        };
+    }
+    throw new Error('单章自动总结未返回有效的 <novel_state> 结构');
 }

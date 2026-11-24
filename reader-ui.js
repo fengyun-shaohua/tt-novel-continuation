@@ -1114,13 +1114,20 @@ function renderMemoryTab(bodyEl) {
     const showWorld = memoryFilter === 'all' || memoryFilter === 'world';
     const showCanon = memoryFilter === 'canon';
 
+    const latestWrittenCh = Number(cachedAnchorInfo?.prevChapterIndex || cachedNovelData?.cutoffChapterIndex || 0);
+    const archivedTo = Number(ledger.lastArchivedChapter || 0);
+    const unarchivedGap = (archivedTo > 0 && latestWrittenCh > archivedTo) ? (latestWrittenCh - archivedTo) : 0;
+    const gapWarnHtml = unarchivedGap >= 2
+        ? `<div class="tt-novel-banner is-warn">⚠️ 当前最新正文已到 <b>第 ${latestWrittenCh} 章</b>，但编年史仅归档至 <b>第 ${archivedTo} 章</b>（有 ${unarchivedGap} 章尚未并入编年史）。点上方「⚡ 增量补总结新章」可一键补齐人物与编年史；即使暂不归档，新版导演大纲也会自动直读这些未归档章防止失忆！</div>`
+        : '';
+
     bodyEl.innerHTML = `
         <div class="tt-novel-action-bar">
             <button type="button" id="tt-novel-run-archive-full" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
                 📚 全本通读归档 (并发≤2 · 套预设)
             </button>
-            <button type="button" id="tt-novel-run-archive-inc" class="menu_button" ${task.running ? 'disabled' : ''}>
-                ⚡ 增量补总结新章
+            <button type="button" id="tt-novel-run-archive-inc" class="menu_button ${unarchivedGap >= 2 ? 'tt-novel-btn-primary' : ''}" ${task.running ? 'disabled' : ''}>
+                ⚡ 增量补总结新章${unarchivedGap >= 2 ? ` (+${unarchivedGap}章)` : ''}
             </button>
             <button type="button" id="tt-novel-auto-detect-btn" class="menu_button" ${task.running ? 'disabled' : ''} title="仅需1次API自动分析全书视角、分出基准线/主线并计算当前对齐章号">
                 🤖 自动识别视角与双线
@@ -1131,6 +1138,7 @@ function renderMemoryTab(bodyEl) {
             <button type="button" id="tt-novel-add-ws" class="menu_button">+ 状态</button>
             <button type="button" id="tt-novel-add-canon" class="menu_button">+ 设定</button>
         </div>
+        ${gapWarnHtml}
         ${narrativeConfigHtml}
         <div class="tt-novel-subfilter">
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'all' ? 'active' : ''}" data-filter="all">全部总览</button>
@@ -2488,7 +2496,8 @@ function renderSettingsTab(bodyEl) {
             <label class="checkbox_label"><input type="checkbox" data-setting="authorMode" ${settings.authorMode !== false ? 'checked' : ''} /><span>开启「✍️ 作者境界」（屏蔽玩家 {{user}} 人设，将输入转为导演大纲）</span></label>
             <label class="checkbox_label"><input type="checkbox" data-setting="foldUserOutlineFloors" ${settings.foldUserOutlineFloors !== false ? 'checked' : ''} /><span>续写完成后自动折叠用户大纲楼层（楼层与章节 1:1 严格对齐）</span></label>
             <label class="checkbox_label"><input type="checkbox" data-setting="autoDeepRewrite" ${settings.autoDeepRewrite ? 'checked' : ''} /><span>⚡ 续写完成后自动触发深度诊断重塑（带空回/道歉拦截，可在「🩺 精修重塑」指定独立重塑模型）</span></label>
-            <label class="checkbox_label"><input type="checkbox" data-setting="enableAutoStateBlock" ${settings.enableAutoStateBlock ? 'checked' : ''} /><span>单次生成末尾自动产出总结、状态与伏笔更新（depth=0 强化 · 0 额外 API）</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="enableAutoStateBlock" ${settings.enableAutoStateBlock ? 'checked' : ''} /><span>单次生成末尾自动产出总结、状态与伏笔更新（兼容 &lt;game&gt; 标签 · 0 额外 API）</span></label>
+            <label class="checkbox_label"><input type="checkbox" data-setting="autoFallbackChapterSummary" ${settings.autoFallbackChapterSummary !== false ? 'checked' : ''} /><span>📝 若某章未产出 &lt;novel_state&gt; 总结，自动后台补做单章快总结（带空回/道歉拦截，防止续写断档）</span></label>
             <label class="checkbox_label"><input type="checkbox" data-setting="syncToWorldInfo" ${settings.syncToWorldInfo ? 'checked' : ''} /><span>自动将提取的状态同步写入酒馆原生世界书</span></label>
         </section>
 

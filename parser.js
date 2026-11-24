@@ -10,7 +10,7 @@ const FALLBACK_CHUNK_SIZE = 4200;
 const MEGA_CHAPTER_THRESHOLD = 8000;
 const MEGA_CHAPTER_TARGET = 4500;
 const NOVEL_STATE_BLOCK_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]*?)<\/novel_state>(?:\s*\n?```)?/gi;
-const UNCLOSED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]+)$/i;
+const UNCLOSED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]+?)(?=<\/game>|$)/i;
 const ESCAPED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?&lt;novel_state&gt;([\s\S]*?)&lt;\/novel_state&gt;(?:\s*\n?```)?/gi;
 const NOISE_BLOCKS_REGEX = /<(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)\b[^>]*>[\s\S]*?<\/(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)>/gi;
 

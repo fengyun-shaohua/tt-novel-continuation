@@ -4,7 +4,7 @@
  * for the Novel Continuation extension. Zero DOM or network dependencies.
  */
 
-import { stripNonStoryBlocks } from './parser.js';
+import { extractNovelStateBlock, stripNonStoryBlocks } from './parser.js';
 import { isModelRefusalText } from './story-archiver.js';
 import { cleanDistillProse, computeLocalStyleFingerprint } from './style-distiller.js';
 
@@ -314,6 +314,8 @@ export function buildDeepRewritePrompt({
     extraDirective = '',
     worldInfoContext = '',
     narrativeConfig = null,
+    recentChaptersBridgeLines = [],
+    includeNovelState = false,
 }) {
     const activeCfg = narrativeConfig || ledger?.narrativeConfig || {};
     const strictPov = activeCfg.povMode === 'strict_limited' && Boolean(String(activeCfg.povCharacter || '').trim());
@@ -449,6 +451,10 @@ export function buildDeepRewritePrompt({
         }
     }
 
+    if (Array.isArray(recentChaptersBridgeLines) && recentChaptersBridgeLines.length > 0) {
+        parts.push('', '【📌 近期尚未并入编年史的已写章节实录（重写时严禁与刚写完的前几章矛盾或重复）】：', ...recentChaptersBridgeLines);
+    }
+
     if (ledger?.styleProfile?.styleCard) {
         parts.push('', '【原著文风骨相 DNA 圣经（重写笔触与段长标尺）】：', String(ledger.styleProfile.styleCard).slice(0, 2200));
     }
@@ -456,12 +462,23 @@ export function buildDeepRewritePrompt({
         parts.push('', '【原著灵魂原文范例】：', String(ledger.styleProfile.goldenExcerpts).slice(0, 1000));
     }
 
+    const refAutoOn = Boolean(activeCfg.referenceTimelineMode && activeCfg.autoAdvanceRefCursor !== false);
+    const curRefCursor = Number(activeCfg.referenceCursorChapter || 0);
+    const stateTrailerReminder = includeNovelState
+        ? [
+            '',
+            '【可选末段状态块】：在 `</content>` 之后另起一行附带 `<novel_state>` 块（前端会自动提取入账并隐藏，绝不混入正文）：',
+            `<novel_state><summary>第 ${chapterIndex} 章一句话核心总结（80字内）</summary><worldbook>- 人物|角色名：本章状态变动（无则写无）\n- 外观|角色名：着装变动（无变化省略）</worldbook><hooks>- [新伏笔] 本章新埋线索（无则写无）\n- [已填坑] 本章回收旧伏笔（无则写无）</hooks>${refAutoOn ? `<ref_cursor>${curRefCursor}或推进后的新基准章号(纯数字)</ref_cursor>` : ''}</novel_state>`,
+        ]
+        : [];
+
     parts.push(
         '',
         `【待推翻重塑的上一轮初稿正文（共 ${cleanDraft.replace(/\s+/g, '').length} 字）】：`,
         cleanDraft,
         '',
         '【输出标签硬性提醒】：请严格先输出 `<pre>...</pre>`（仅放 5 项精准诊断与重写执行蓝图），紧接空一行后输出 `<content>...</content>`（仅放纯净小说正文，绝不要把“第一部分/深度诊断报告/第二部分”等审稿文字写进正文里）。',
+        ...stateTrailerReminder,
     );
 
     return {
@@ -472,16 +489,16 @@ export function buildDeepRewritePrompt({
 }
 
 /**
- * Parses `<pre>...</pre>` diagnosis and `<content>...</content>` rewritten prose from Deep Rewrite output,
- * with Markdown two-part fallback (`### 【第一部分：深度诊断报告】` / `### 【第二部分：...正文】` or `### 第 N 章`)
- * and strict post-rewrite refusal, empty, leakage, and truncation guards.
+ * Parses `<pre>...</pre>` diagnosis, `<content>...</content>` rewritten prose, and optional `<novel_state>`
+ * from Deep Rewrite output, with Markdown two-part fallback and strict post-rewrite guards.
  *
  * @param {string} rawOutput
  * @param {number} [originalStoryLength=0]
- * @returns {{ diagnosisPre: string, rewrittenContent: string }}
+ * @returns {{ diagnosisPre: string, rewrittenContent: string, extractedState: ReturnType<typeof extractNovelStateBlock> }}
  */
 export function parseDeepRewriteResponse(rawOutput, originalStoryLength = 0) {
-    const cleaned = cleanDistillProse(rawOutput);
+    const extractedState = extractNovelStateBlock(rawOutput);
+    const cleaned = cleanDistillProse(extractedState.cleanText);
     if (!cleaned) {
         throw new Error('重写模型返回为空，已保留原初稿未覆盖');
     }
@@ -550,5 +567,6 @@ export function parseDeepRewriteResponse(rawOutput, originalStoryLength = 0) {
     return {
         diagnosisPre,
         rewrittenContent,
+        extractedState,
     };
 }

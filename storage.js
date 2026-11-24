@@ -31,6 +31,8 @@ export const DEFAULT_NARRATIVE_CONFIG = Object.freeze({
     referencePovLabel: '',
     referenceCursorChapter: 0,
     referenceLookaheadChapters: 8,
+    autoAdvanceRefCursor: true,
+    autoDetectOnArchive: true,
 });
 
 export function normalizeNarrativeConfig(raw = null) {
@@ -62,6 +64,8 @@ export function normalizeNarrativeConfig(raw = null) {
         referenceLookaheadChapters: Number.isFinite(Number(src.referenceLookaheadChapters))
             ? Math.max(2, Math.min(20, Math.floor(Number(src.referenceLookaheadChapters))))
             : 8,
+        autoAdvanceRefCursor: src.autoAdvanceRefCursor !== false,
+        autoDetectOnArchive: src.autoDetectOnArchive !== false,
     };
 }
 
@@ -111,6 +115,8 @@ export function createEmptyLedger() {
         hooks: [],
         styleProfile: null,
         narrativeConfig: normalizeNarrativeConfig(),
+        refCursorBase: null,
+        refCursorHistory: {},
         lastArchivedChapter: 0,
         archiveBatches: [],
         archiveNeedsResynth: false,
@@ -339,6 +345,8 @@ export async function loadLedger() {
         hooks: Array.isArray(raw.hooks) ? raw.hooks : [],
         styleProfile: raw.styleProfile && typeof raw.styleProfile === 'object' ? raw.styleProfile : null,
         narrativeConfig: normalizeNarrativeConfig(raw.narrativeConfig),
+        refCursorBase: Number.isFinite(Number(raw.refCursorBase)) ? Number(raw.refCursorBase) : null,
+        refCursorHistory: raw.refCursorHistory && typeof raw.refCursorHistory === 'object' ? raw.refCursorHistory : {},
         lastArchivedChapter: Number(raw.lastArchivedChapter || 0),
         archiveBatches,
         archiveNeedsResynth: Boolean(raw.archiveNeedsResynth),
@@ -495,6 +503,25 @@ export async function pruneLedgerAfterChapter(maxChapterIndex) {
     if (Number(ledger.lastArchivedChapter || 0) > maxChapterIndex) {
         ledger.lastArchivedChapter = maxChapterIndex;
     }
+    if (ledger.refCursorHistory && typeof ledger.refCursorHistory === 'object') {
+        const kept = {};
+        let bestCh = -1;
+        let restoredCursor = Number.isFinite(Number(ledger.refCursorBase)) ? Number(ledger.refCursorBase) : null;
+        for (const [k, v] of Object.entries(ledger.refCursorHistory)) {
+            const chNum = Number(k);
+            if (Number.isFinite(chNum) && chNum <= maxChapterIndex) {
+                kept[k] = v;
+                if (chNum > bestCh && Number.isFinite(Number(v))) {
+                    bestCh = chNum;
+                    restoredCursor = Number(v);
+                }
+            }
+        }
+        ledger.refCursorHistory = kept;
+        if (restoredCursor !== null && ledger.narrativeConfig?.referenceTimelineMode && ledger.narrativeConfig?.autoAdvanceRefCursor !== false) {
+            ledger.narrativeConfig.referenceCursorChapter = restoredCursor;
+        }
+    }
     await saveLedger(ledger);
     return ledger;
 }
@@ -583,6 +610,35 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
                 });
             }
         }
+    }
+
+    // Auto-advance (or swipe-update) parallel reference cursor when enabled
+    if (
+        Number.isFinite(Number(extracted.refCursor))
+        && Number(extracted.refCursor) >= 0
+        && ledger.narrativeConfig?.referenceTimelineMode
+        && ledger.narrativeConfig?.autoAdvanceRefCursor !== false
+    ) {
+        const curCursor = Number(ledger.narrativeConfig.referenceCursorChapter || 0);
+        if (!Number.isFinite(Number(ledger.refCursorBase))) {
+            ledger.refCursorBase = curCursor;
+        }
+        const incomingCursor = Math.floor(Number(extracted.refCursor));
+        ledger.refCursorHistory = ledger.refCursorHistory && typeof ledger.refCursorHistory === 'object'
+            ? ledger.refCursorHistory
+            : {};
+        ledger.refCursorHistory[String(chapterIndex)] = incomingCursor;
+
+        // Recompute effective cursor up to latest chapter in history so swipes/edits stay accurate
+        let prevMaxCursor = Number(ledger.refCursorBase || 0);
+        for (const [k, v] of Object.entries(ledger.refCursorHistory)) {
+            const cIdx = Number(k);
+            const cVal = Number(v);
+            if (Number.isFinite(cIdx) && cIdx < chapterIndex && Number.isFinite(cVal)) {
+                prevMaxCursor = Math.max(prevMaxCursor, cVal);
+            }
+        }
+        ledger.narrativeConfig.referenceCursorChapter = Math.max(prevMaxCursor, incomingCursor);
     }
 
     await saveLedger(ledger);

@@ -9,6 +9,7 @@
  * through `callModel` (which applies the chosen API + Tavern preset).
  */
 
+import { parseChapterRangeSpec, stripNonStoryBlocks } from './parser.js';
 import { cleanDistillProse, isAbortError, runBoundedPool, throwIfAborted } from './style-distiller.js';
 
 const REFUSAL_PATTERNS = [
@@ -949,5 +950,139 @@ export async function rerunArchiveBatches({
     return {
         batches: mergedBatches,
         refreshed,
+    };
+}
+
+/**
+ * Automatically analyzes a novel's chapter digest in 1 single LLM call to detect:
+ * - whether it is multi-POV or single-POV (and who the continuing POV character is),
+ * - whether it contains an earlier completed reference timeline + an unfinished parallel POV branch,
+ * - exact chapter ranges for `reference` / `main` / `flashback` / `skip`,
+ * - initial `referenceCursorChapter` where the main branch has caught up to the reference timeline.
+ */
+export async function detectNovelNarrativeStructure({
+    novelData,
+    continuedChapters = [],
+    callModel,
+    signal = null,
+}) {
+    throwIfAborted(signal);
+    if (!novelData?.chapters?.length) {
+        throw new Error('请先导入原著小说后再执行自动识别');
+    }
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+
+    const chapters = [...novelData.chapters].sort((a, b) => Number(a.index) - Number(b.index));
+    const total = chapters.length;
+    const perHead = total > 160 ? 60 : (total > 80 ? 95 : 140);
+    const perTail = total > 160 ? 40 : (total > 80 ? 65 : 90);
+
+    const digestLines = chapters.map(ch => {
+        const clean = stripNonStoryBlocks(ch.content || '').replace(/\s+/g, ' ').trim();
+        const head = clean.slice(0, perHead);
+        const tail = clean.length > perHead + 20 ? clean.slice(-perTail) : '';
+        return `#${ch.index}《${ch.title}》(${ch.wordCount || clean.length}字)：${head}${tail ? ` …… ${tail}` : ''}`;
+    });
+
+    let digestText = digestLines.join('\n');
+    if (digestText.length > 26000) {
+        digestText = `${digestText.slice(0, 13000)}\n……（中段省略）……\n${digestText.slice(-13000)}`;
+    }
+
+    const continuedHint = (continuedChapters || []).length > 0
+        ? `\n【已有 AI 续写最新章摘要】：${stripNonStoryBlocks(continuedChapters[continuedChapters.length - 1].content || '').replace(/\s+/g, ' ').trim().slice(0, 600)}`
+        : '';
+
+    const systemPrompt = [
+        '你是专业长篇小说结构与叙事视角分析师。',
+        '你的任务是根据整本书各章的标题和首尾片段，自动判断：',
+        '1. 本书是【普通单线/群像正叙】，还是【双视角/平行视角拼接】（即前面有一段某视角已完结的完整原著，后面切换成另一个视角重写/补完同一段时期却半途断更）；',
+        '2. 紧接着后续要继续写下去的主角/叙事视角是谁（是否应开启严格单视角限制）；',
+        '3. 各章节区间分别属于 `reference`（已完结对照基准视角）、`main`（当前要继续往后写的主线视角）、`flashback`（纯倒叙/番外）或 `skip`（作者感言/废稿）；',
+        '4. 若存在双视角平行结构，目前主线最后一章（含已有续写）的时间线已经推进对齐到基准时间线的第几章（`reference_cursor`）。',
+        '必须严格按 XML 标签输出，不要输出多余寒暄。',
+    ].join('\n');
+
+    const prompt = [
+        `请分析小说《${novelData.title || '当前小说'}》（共 ${total} 章）的叙事结构与时间线：`,
+        '',
+        '严格按以下 XML 标签输出分析结果：',
+        '<narrative_structure>',
+        '<pov_mode>strict_limited（单视角）或 auto（多视角/全知）</pov_mode>',
+        '<pov_character>接下来要继续续写的核心视角人物姓名（若为多视角则留空）</pov_character>',
+        '<pov_person>first_person（第一人称）、third_limited（第三人称限制视角）或 follow_original（跟随原著）</pov_person>',
+        '<reference_mode>true（存在“先写完A视角、后切换B视角未写完”的平行双线）或 false（普通单线顺序推进）</reference_mode>',
+        '<reference_label>若 reference_mode 为 true，填写基准视角名称（如：原主视角线），否则留空</reference_label>',
+        '<reference_ranges>属于已完结基准时间线的章号区间（如 1-77；没有则写 无）</reference_ranges>',
+        '<main_ranges>属于当前要继续往下写的主线章节区间（如 78-135；普通单线则写 1-' + total + '）</main_ranges>',
+        '<flashback_ranges>纯倒叙/番外章节区间（没有则写 无）</flashback_ranges>',
+        '<skip_ranges>非正文/作者声明/废稿章节区间（没有则写 无）</skip_ranges>',
+        '<reference_cursor>若 reference_mode 为 true，写出主线结尾目前已经对齐到基准时间线的第几章（纯数字，如 18 或 75；无法判断写 0）</reference_cursor>',
+        '<reasoning>一句话说明判断依据（说明分界点在哪个章节以及理由）</reasoning>',
+        '</narrative_structure>',
+        '',
+        '【全书分章首尾速览】：',
+        digestText,
+        continuedHint,
+    ].filter(Boolean).join('\n');
+
+    const raw = await callModel({
+        stage: 'auto_detect_narrative_structure',
+        systemPrompt,
+        prompt,
+    });
+    throwIfAborted(signal);
+
+    const cleaned = cleanDistillProse(raw);
+    if (isModelRefusalText(cleaned) && !/<narrative_structure>/i.test(cleaned)) {
+        throw new Error(`模型返回了拒答内容：${cleaned.slice(0, 100)}`);
+    }
+
+    const inner = extractInner(cleaned, 'narrative_structure') || cleaned;
+    const povModeRaw = extractInner(inner, 'pov_mode');
+    const povCharacterRaw = extractInner(inner, 'pov_character');
+    const povPersonRaw = extractInner(inner, 'pov_person');
+    const refModeRaw = extractInner(inner, 'reference_mode');
+    const refLabelRaw = extractInner(inner, 'reference_label');
+    const refRangesRaw = extractInner(inner, 'reference_ranges');
+    const mainRangesRaw = extractInner(inner, 'main_ranges');
+    const fbRangesRaw = extractInner(inner, 'flashback_ranges');
+    const skipRangesRaw = extractInner(inner, 'skip_ranges');
+    const refCursorRaw = extractInner(inner, 'reference_cursor');
+    const reasoning = extractInner(inner, 'reasoning');
+
+    const povCharacter = isPlaceholder(povCharacterRaw) ? '' : povCharacterRaw.trim();
+    const povMode = (/strict/i.test(povModeRaw) && povCharacter) ? 'strict_limited' : 'auto';
+    const povPerson = /first_person/i.test(povPersonRaw)
+        ? 'first_person'
+        : (/third_limited/i.test(povPersonRaw) ? 'third_limited' : 'follow_original');
+
+    const referenceIndices = isPlaceholder(refRangesRaw) ? [] : parseChapterRangeSpec(refRangesRaw, total);
+    const mainIndices = isPlaceholder(mainRangesRaw) ? [] : parseChapterRangeSpec(mainRangesRaw, total);
+    const flashbackIndices = isPlaceholder(fbRangesRaw) ? [] : parseChapterRangeSpec(fbRangesRaw, total);
+    const skipIndices = isPlaceholder(skipRangesRaw) ? [] : parseChapterRangeSpec(skipRangesRaw, total);
+
+    const referenceTimelineMode = /^true$/i.test(refModeRaw.trim()) && referenceIndices.length > 0 && mainIndices.length > 0;
+    const cursorMatch = refCursorRaw.match(/\d+/);
+    const referenceCursorChapter = cursorMatch ? Math.min(total, Math.max(0, Number(cursorMatch[0]))) : 0;
+
+    return {
+        narrativeConfig: {
+            povMode,
+            povCharacter,
+            povPerson,
+            referenceTimelineMode,
+            referencePovLabel: isPlaceholder(refLabelRaw) ? '' : refLabelRaw.trim(),
+            referenceCursorChapter: referenceTimelineMode ? referenceCursorChapter : 0,
+            strictTimelineOrder: true,
+            excludeFlashbackFromAnchor: true,
+        },
+        referenceIndices,
+        mainIndices,
+        flashbackIndices,
+        skipIndices,
+        reasoning: isPlaceholder(reasoning) ? '' : reasoning.trim(),
     };
 }

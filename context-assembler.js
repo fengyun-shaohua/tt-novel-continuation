@@ -463,6 +463,9 @@ export function buildNovelStateTrailerPrompt({
     const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
     const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
     const openHooks = resolveTimelineHooks(ledger?.hooks || [], targetChapterIndex - 1).slice(-8);
+    const nCfg = ledger?.narrativeConfig || {};
+    const refAutoOn = Boolean(nCfg.referenceTimelineMode && nCfg.autoAdvanceRefCursor !== false);
+    const curRefCursor = Number(nCfg.referenceCursorChapter || 0);
 
     const lines = [
         '【单次调用自动归档指令（强制末段附带 · 前端自动隐藏入库）】',
@@ -477,6 +480,9 @@ export function buildNovelStateTrailerPrompt({
         '- [新伏笔] 本章新埋下的悬念、约定或隐患（若无则写无）',
         '- [已填坑] 本章已揭晓、完成或回收的旧伏笔（尽量沿用下方已有伏笔原话；若无则写无）',
         '</hooks>',
+        ...(refAutoOn
+            ? [`<ref_cursor>写完本章后已对齐覆盖的【${nCfg.referencePovLabel || '基准时间线'}】最大章号（纯数字，当前为 ${curRefCursor}；若本章推进并覆盖了后续基准章节请填新章号，否则保持 ${curRefCursor}）</ref_cursor>`]
+            : []),
         '</novel_state>',
     ];
     if (openHooks.length > 0) {

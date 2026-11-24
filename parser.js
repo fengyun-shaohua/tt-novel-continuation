@@ -411,10 +411,12 @@ export function extractNovelStateBlock(rawMessageText) {
             worldUpdates: [],
             appearanceUpdates: [],
             hooks: [],
+            refCursor: null,
         };
     }
 
     let summary = '';
+    let refCursor = null;
     const worldUpdates = [];
     const appearanceUpdates = [];
     const hooks = [];
@@ -423,6 +425,15 @@ export function extractNovelStateBlock(rawMessageText) {
         const summaryMatch = inner.match(/<summary>([\s\S]*?)(?:<\/summary>|$)/i);
         if (summaryMatch && !isEmptyPlaceholder(summaryMatch[1])) {
             summary = summaryMatch[1].trim();
+        }
+
+        const refCursorMatch = inner.match(/<ref_cursor>([\s\S]*?)(?:<\/ref_cursor>|$)/i);
+        if (refCursorMatch && refCursorMatch[1]) {
+            const numMatch = refCursorMatch[1].match(/\d+/);
+            if (numMatch) {
+                const n = Number(numMatch[0]);
+                if (Number.isFinite(n) && n >= 0) refCursor = Math.floor(n);
+            }
         }
 
         const worldMatch = inner.match(/<worldbook>([\s\S]*?)(?:<\/worldbook>|<appearance>|<hooks>|$)/i);
@@ -480,6 +491,7 @@ export function extractNovelStateBlock(rawMessageText) {
         worldUpdates,
         appearanceUpdates,
         hooks,
+        refCursor,
     };
 }
 

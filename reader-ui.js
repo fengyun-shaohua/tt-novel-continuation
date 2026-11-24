@@ -2403,7 +2403,7 @@ function renderSettingsTab(bodyEl) {
     const isCustomApi = settings.bgApiMode === 'custom';
     const cachedModels = Array.isArray(settings.bgCustomApiModelsCache) ? settings.bgCustomApiModelsCache : [];
     const customModelVal = String(settings.bgCustomApiModel || '');
-    const purePresetName = String(meta.bundledPurePresetName || 'TT小说续写专用-纯净版');
+    const purePresetName = String(meta.bundledPurePresetName || 'TT小说续写专用-猫神融合版');
     const isPurePresetActive = Boolean(meta.activePresetName && meta.activePresetName === purePresetName);
     const isPurePresetInstalled = presetNames.includes(purePresetName);
 
@@ -2486,8 +2486,8 @@ function renderSettingsTab(bodyEl) {
             </div>
             <div class="tt-novel-muted" style="margin: 6px 0 4px;">
                 ${isPurePresetActive
-                    ? `✅ 当前酒馆已启用本插件专用预设 <code>${escapeHtml(purePresetName)}</code>（无 RP 干扰、不截断 &lt;novel_state&gt;、完全服从文风卡与单视角）。`
-                    : `💡 推荐：一键导入插件专用预设 <code>${escapeHtml(purePresetName)}</code>${isPurePresetInstalled ? '（已在酒馆列表中）' : ''}——专为纯小说续写打造，不含 RP/状态栏/&lt;game&gt;冲突，且不会改动你的 API 连接与模型。`}
+                    ? `✅ 当前酒馆已启用融合预设 <code>${escapeHtml(purePresetName)}</code>（保留小猫之神破限/大思考，全面适配纯小说续写、后台直通与 &lt;novel_state&gt;）。`
+                    : `💡 推荐：一键导入 <code>${escapeHtml(purePresetName)}</code>${isPurePresetInstalled ? '（已在酒馆列表中）' : ''}——融合 Meowssiah-2.1.7 破限/大思考 与 v1.6.4 纯小说权威契约，支持后台直通与 &lt;novel_state&gt; 自动总结，不会改动你的 API 与模型。`}
             </div>
             <div class="tt-novel-action-bar" style="margin-bottom: 6px;">
                 <button type="button" id="tt-novel-wb-install-pure-preset" class="menu_button tt-novel-btn-sm ${isPurePresetActive ? '' : 'tt-novel-btn-primary'}">

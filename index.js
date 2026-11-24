@@ -827,6 +827,10 @@ async function installBundledPureNovelPreset() {
         : Promise.resolve();
 
     try {
+        const importReadyEvent = context?.eventTypes?.OAI_PRESET_IMPORT_READY;
+        if (ev && importReadyEvent) {
+            await ev.emit?.(importReadyEvent, { data: presetObj, presetName: BUNDLED_PURE_PRESET_NAME });
+        }
         await pm.savePreset(BUNDLED_PURE_PRESET_NAME, presetObj);
         if (ev && afterEvent) {
             await Promise.race([
@@ -1159,6 +1163,13 @@ function createPresetModelCaller({ role = 'bg', signal = null } = {}) {
         : null;
     const preserveDirectives = Boolean(resolvedPreset.isActivePreset);
 
+    const tagBackgroundSystemPrompt = (rawSystem, stage) => {
+        const trimmed = String(rawSystem || '').trim();
+        if (trimmed.includes('[小说续写阅读器后台任务')) return trimmed;
+        const tag = stage ? `[小说续写阅读器后台任务 · ${String(stage).trim()}]` : '[小说续写阅读器后台任务]';
+        return trimmed ? `${tag}\n${trimmed}` : tag;
+    };
+
     const isRewriteCustom = role === 'rewrite' && settings.rewriteModelMode === 'custom';
     const isRewriteTavernOverride = role === 'rewrite' && settings.rewriteModelMode === 'tavern_override';
     const useCustomApi = isRewriteCustom || (!isRewriteTavernOverride && settings.bgApiMode === 'custom');
@@ -1183,17 +1194,18 @@ function createPresetModelCaller({ role = 'bg', signal = null } = {}) {
                 ? '重塑已选「独立自定义 API」，请先选择或填写重塑模型名称'
                 : '当前已选择「自定义 API」，请先在「工作台 → 设置」选择或填写模型名称');
         }
-        const callModel = async ({ prompt, systemPrompt }) => {
+        const callModel = async ({ prompt, systemPrompt, stage = '' }) => {
             throwIfAborted(signal);
+            const taggedSystemPrompt = tagBackgroundSystemPrompt(systemPrompt, stage);
             const messages = resolvedPreset.presetObj
                 ? buildDistillationPresetMessages(resolvedPreset.presetObj, {
-                    systemPrompt,
+                    systemPrompt: taggedSystemPrompt,
                     userPrompt: prompt,
                     substitute: substituteFn,
                     preserveDirectives,
                 })
                 : [
-                    ...(systemPrompt ? [{ role: 'system', content: String(systemPrompt).trim() }] : []),
+                    ...(taggedSystemPrompt ? [{ role: 'system', content: taggedSystemPrompt }] : []),
                     { role: 'user', content: String(prompt || '').trim() },
                 ];
             const reply = await callCustomOpenAiViaHost({
@@ -1224,19 +1236,20 @@ function createPresetModelCaller({ role = 'bg', signal = null } = {}) {
     }
     const modelLabel = overrideModel || getActiveApiModelLabel();
 
-    const callModel = async ({ prompt, systemPrompt }) => {
+    const callModel = async ({ prompt, systemPrompt, stage = '' }) => {
         throwIfAborted(signal);
+        const taggedSystemPrompt = tagBackgroundSystemPrompt(systemPrompt, stage);
         const invokeRaw = async () => {
             if (resolvedPreset.presetObj) {
                 const messages = buildDistillationPresetMessages(resolvedPreset.presetObj, {
-                    systemPrompt,
+                    systemPrompt: taggedSystemPrompt,
                     userPrompt: prompt,
                     substitute: substituteFn,
                     preserveDirectives,
                 });
                 return String(await context.generateRaw({ prompt: messages }) || '');
             }
-            return String(await context.generateRaw({ prompt, systemPrompt }) || '');
+            return String(await context.generateRaw({ prompt, systemPrompt: taggedSystemPrompt }) || '');
         };
 
         const runWithAbortRace = async (promise) => {

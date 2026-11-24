@@ -522,7 +522,8 @@ async function onMessageSwiped(messageId) {
     const chapterIndex = Number(msg.extra?.novelChapterIndex);
     if (swipeState && chapterIndex > 0) {
         msg.extra.novelContinuationState = swipeState;
-        const firstLine = String(msg.mes || '').split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
+        const pureStoryText = stripNonStoryBlocks(String(msg.mes || '')).replace(/<\/?game>/gi, '').trim();
+        const firstLine = pureStoryText.split('\n').map(l => l.trim()).find(Boolean) || `第 ${chapterIndex} 章`;
         const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
         await applyExtractedStateToLedger(swipeState, chapterIndex, chapterTitle, messageId);
         if (settings.syncToWorldInfo && swipeState.worldUpdates?.length > 0) {
@@ -844,13 +845,32 @@ async function installBundledPureNovelPreset() {
         }
     }
 
+    // Automatically allow the bundled preset's SPreset runner script in JS-Slash-Runner (酒馆助手)
+    let enabledThPresetScript = false;
+    try {
+        const th = extension_settings?.tavern_helper;
+        if (th && typeof th === 'object') {
+            th.script = th.script && typeof th.script === 'object' ? th.script : {};
+            th.script.enabled = th.script.enabled && typeof th.script.enabled === 'object' ? th.script.enabled : {};
+            const list = Array.isArray(th.script.enabled.presets) ? th.script.enabled.presets : [];
+            if (!list.includes(BUNDLED_PURE_PRESET_NAME)) {
+                th.script.enabled.presets = [...list, BUNDLED_PURE_PRESET_NAME];
+                enabledThPresetScript = true;
+            }
+        }
+    } catch {
+        // Ignore if JS-Slash-Runner is not installed
+    }
+
     const settings = getSettings();
     settings.distillPresetName = '__current__';
     saveExtensionSettings();
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
     globalThis.toastr?.success?.(
-        `已导入并启用专用预设「${BUNDLED_PURE_PRESET_NAME}」（已保留原有 API 连接与模型配置）`,
+        enabledThPresetScript
+            ? `已导入并启用「${BUNDLED_PURE_PRESET_NAME}」并自动放行 SPreset 脚本（刷新一次页面即可激活破限链）`
+            : `已导入并启用专用预设「${BUNDLED_PURE_PRESET_NAME}」（已保留原有 API 连接与模型配置）`,
         '小说续写阅读器',
     );
     return { cancelled: false, name: BUNDLED_PURE_PRESET_NAME };

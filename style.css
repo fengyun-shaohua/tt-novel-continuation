@@ -260,6 +260,7 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     padding: 11px 14px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     background: rgba(0, 0, 0, 0.18);
+    flex-shrink: 0;
 }
 
 .tt-novel-wb-title-wrap {
@@ -310,6 +311,7 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     grid-template-columns: repeat(5, 1fr);
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     background: rgba(0, 0, 0, 0.1);
+    flex-shrink: 0;
 }
 
 .tt-novel-wb-tab {
@@ -355,12 +357,17 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-wb-body {
-    flex: 1;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
     padding: 12px 14px 24px 14px;
     display: flex;
     flex-direction: column;
     gap: 10px;
+}
+
+.tt-novel-wb-body > * {
+    flex-shrink: 0;
 }
 
 /* 6. Segmented Controls, Toolbars & Dropdown Menu */
@@ -514,6 +521,7 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     border-radius: 9px;
     background: rgba(255, 255, 255, 0.025);
     overflow: hidden;
+    flex-shrink: 0;
 }
 
 .tt-novel-accordion > summary {
@@ -527,6 +535,19 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     font-size: 0.83rem;
     font-weight: 600;
     list-style: none;
+}
+
+.tt-novel-accordion > summary > span:first-child {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.tt-novel-accordion > summary > .tt-novel-muted {
+    flex-shrink: 0;
+    max-width: 52%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .tt-novel-accordion > summary::-webkit-details-marker {
@@ -612,11 +633,9 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 
 .tt-novel-subfilter {
     display: flex;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
+    flex-wrap: wrap;
     gap: 5px;
-    padding-bottom: 1px;
+    flex-shrink: 0;
 }
 
 .tt-novel-subfilter::-webkit-scrollbar {

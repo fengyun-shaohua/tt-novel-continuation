@@ -399,9 +399,9 @@ export function computeStyleDriftReport(truthText, rewriteText) {
         `• 标点频次：省略号 ${tEllipsis} vs ${rEllipsis}/千字 | 感叹号 ${truthFp.punctuationPer1k?.exclamation ?? 0} vs ${rewriteFp.punctuationPer1k?.exclamation ?? 0}/千字`,
     ];
     if (warnings.length > 0) {
-        lines.push(`• 🎯 客观硬偏差提醒：${warnings.join('；')}`);
+        lines.push(`• 客观硬偏差提醒：${warnings.join('；')}`);
     } else {
-        lines.push('• ✅ 各项本地物理统计指标已高度贴合原著真迹！');
+        lines.push('• 各项本地物理统计指标已高度贴合原著真迹！');
     }
 
     return {
@@ -1060,7 +1060,7 @@ export async function runStyleDistillationPipeline({
             round: roundNum,
             evaluateOnly,
             title: evaluateOnly
-                ? `🧪 纯跑分验收（未改圣经）· 第 ${roundNum} 次 · ${holdout.label}`
+                ? `纯跑分验收（未改圣经）· 第 ${roundNum} 次 · ${holdout.label}`
                 : `第 ${roundNum} 轮盲测对抗 · ${holdoutLabelFull}`,
             holdoutLabel: holdoutLabelFull,
             isRetest,
@@ -1077,7 +1077,7 @@ export async function runStyleDistillationPipeline({
             step: currentStep,
             totalSteps,
             label: evaluateOnly
-                ? `🧪 纯跑分验收完成：${roundScore !== null ? `${roundScore}/100 分` : '已评估'}（圣经保持 ${currentStyleCard.length} 字未改动）`
+                ? `纯跑分验收完成：${roundScore !== null ? `${roundScore}/100 分` : '已评估'}（圣经保持 ${currentStyleCard.length} 字未改动）`
                 : `第 ${roundNum} 轮盲测评分完成：${roundScore !== null ? `${roundScore}/100 分` : '已评估'}（圣经现 ${currentStyleCard.length} 字）`,
             logEntry: roundLogEntry,
         });
@@ -1236,7 +1236,7 @@ export async function generateCustomStyleCard({
         processLog: [{
             id: `custom_style_${now}`,
             type: 'stage',
-            title: sample ? '✨ 原创定制文风卡（参考范文提纯 + 目标定制）' : '✨ 原创定制文风卡（目标风格生成）',
+            title: sample ? '原创定制文风卡（参考范文提纯 + 目标定制）' : '原创定制文风卡（目标风格生成）',
             summary: `生成 ${styleCard.length} 字实战文风卡${fingerprint ? `（参考范文统计 ${fingerprint.totalChars} 字，均段 ${fingerprint.avgParagraphChars} 字）` : ''}。`,
             detail: styleCard,
         }],

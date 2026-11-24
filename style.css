@@ -1,5 +1,5 @@
 /* ==========================================================================
-   TauriTavern Novel Continuation & Immersive Reader Extension Styles (v1.3)
+   TauriTavern Novel Creation & Continuation Studio Styles (v1.8 Editorial)
    ========================================================================== */
 
 /* 1. Hide user instruction floors when enabled */
@@ -25,12 +25,12 @@ body.tt-novel-immersive #chat .mes[is_user="false"] {
 }
 
 body.tt-novel-immersive #chat .mes[is_user="false"] ~ .mes[is_user="false"]::before {
-    content: "───  ❖  ───";
+    content: "— · —";
     display: block;
     text-align: center;
-    font-size: 0.82rem;
-    letter-spacing: 0.25em;
-    opacity: 0.35;
+    font-size: 0.8rem;
+    letter-spacing: 0.35em;
+    opacity: 0.3;
     margin: 4px 0 22px 0;
     user-select: none;
 }
@@ -99,11 +99,43 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 @keyframes ttNovelFlash {
-    0% { background-color: rgba(212, 163, 89, 0.25) !important; }
+    0% { background-color: rgba(212, 163, 89, 0.22) !important; }
     100% { background-color: transparent !important; }
 }
 
-/* 3. Ultra-Slim Single-Row Mini Quick Bar (Zero Vertical Cramping on Mobile) */
+/* 3. Vector Icons & Semantic Status Dots */
+.tt-svg-icon {
+    display: inline-block;
+    vertical-align: -0.16em;
+    flex-shrink: 0;
+}
+
+.tt-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    vertical-align: middle;
+    margin-right: 4px;
+    background: rgba(255, 255, 255, 0.35);
+    flex-shrink: 0;
+}
+
+.tt-dot.is-ok { background: #52c48c; }
+.tt-dot.is-warn { background: #e0a94c; }
+.tt-dot.is-error { background: #e06262; }
+.tt-dot.is-idle { background: rgba(255, 255, 255, 0.32); }
+.tt-dot.is-running {
+    background: #55bdb2;
+    animation: ttNovelPulse 1.3s ease-in-out infinite;
+}
+
+@keyframes ttNovelPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.35; transform: scale(0.8); }
+}
+
+/* 4. Ultra-Slim Single-Row Quick Bar */
 .tt-novel-quickbar {
     display: flex;
     align-items: center;
@@ -116,8 +148,8 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     overflow-x: auto;
     scrollbar-width: none;
     border-radius: 8px;
-    background: var(--SmartThemeBlurTintColor, rgba(22, 24, 30, 0.8));
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+    background: var(--SmartThemeBlurTintColor, rgba(22, 24, 30, 0.82));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
     font-size: 0.78rem;
 }
 
@@ -128,39 +160,39 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-pill {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     padding: 3px 9px;
     height: 25px;
-    border-radius: 999px;
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
-    background: rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+    background: rgba(255, 255, 255, 0.04);
     color: var(--SmartThemeBodyColor, #ddd);
     cursor: pointer;
-    font-size: 0.76rem;
+    font-size: 0.75rem;
     white-space: nowrap;
     flex-shrink: 0;
     transition: background 0.14s ease, border-color 0.14s ease;
 }
 
 .tt-novel-pill-icon {
-    padding: 3px 7px;
+    padding: 3px 6px;
 }
 
 .tt-novel-pill:hover {
-    background: rgba(255, 255, 255, 0.13);
+    background: rgba(255, 255, 255, 0.1);
 }
 
 .tt-novel-pill.active {
-    background: rgba(56, 152, 142, 0.28);
-    border-color: rgba(74, 196, 183, 0.65);
-    color: #9ff3e8;
+    background: rgba(85, 189, 178, 0.18);
+    border-color: rgba(85, 189, 178, 0.45);
+    color: #9beae0;
 }
 
 .tt-novel-pill-accent {
     margin-left: auto;
-    background: rgba(212, 163, 89, 0.2);
-    border-color: rgba(212, 163, 89, 0.5);
-    color: #f6d594;
+    background: rgba(212, 163, 89, 0.16);
+    border-color: rgba(212, 163, 89, 0.42);
+    color: #edd09b;
     font-weight: 600;
 }
 
@@ -169,27 +201,27 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     align-items: center;
     justify-content: center;
     padding: 0 5px;
-    min-width: 16px;
-    height: 16px;
+    min-width: 15px;
+    height: 15px;
     border-radius: 999px;
-    background: rgba(74, 196, 183, 0.35);
-    color: #c8fff7;
-    font-size: 0.68rem;
+    background: rgba(255, 255, 255, 0.14);
+    color: #e6ecf5;
+    font-size: 0.66rem;
     font-weight: 700;
 }
 
 .tt-novel-mini-badge.is-warn {
-    background: rgba(235, 92, 92, 0.85);
+    background: rgba(224, 98, 98, 0.85);
     color: #fff;
 }
 
-/* 4. LittleWhiteBox-Style Tabbed Workbench Modal */
+/* 5. Editorial Minimal Workbench Modal */
 .tt-novel-wb-overlay {
     position: fixed;
     inset: 0;
     z-index: 10020;
-    background: rgba(8, 10, 14, 0.68);
-    backdrop-filter: blur(6px);
+    background: rgba(8, 10, 14, 0.65);
+    backdrop-filter: blur(5px);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -197,26 +229,26 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-wb-modal {
-    width: min(920px, 95vw);
-    height: min(86vh, 840px);
+    width: min(860px, 95vw);
+    height: min(86vh, 820px);
     display: flex;
     flex-direction: column;
-    border-radius: 14px;
+    border-radius: 12px;
     overflow: hidden;
-    background: var(--SmartThemeBlurTintColor, rgba(22, 24, 31, 0.98));
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
-    box-shadow: 0 18px 54px rgba(0, 0, 0, 0.6);
+    background: var(--SmartThemeBlurTintColor, rgba(20, 22, 28, 0.98));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+    box-shadow: 0 20px 56px rgba(0, 0, 0, 0.52);
     color: var(--SmartThemeBodyColor, #e5e5e5);
 }
 
 @media (max-width: 768px) {
     .tt-novel-wb-overlay {
-        padding: 6px;
+        padding: 4px;
     }
     .tt-novel-wb-modal {
-        width: 97vw;
-        height: 92dvh;
-        border-radius: 12px;
+        width: 98vw;
+        height: 93dvh;
+        border-radius: 10px;
     }
 }
 
@@ -226,8 +258,8 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     justify-content: space-between;
     gap: 10px;
     padding: 11px 14px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(0, 0, 0, 0.22);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(0, 0, 0, 0.18);
 }
 
 .tt-novel-wb-title-wrap {
@@ -236,8 +268,9 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-wb-title {
-    font-size: 0.98rem;
+    font-size: 0.95rem;
     font-weight: 700;
+    letter-spacing: 0.01em;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -245,7 +278,7 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 
 .tt-novel-wb-subtitle {
     font-size: 0.72rem;
-    opacity: 0.72;
+    opacity: 0.62;
     margin-top: 2px;
     white-space: nowrap;
     overflow: hidden;
@@ -253,73 +286,71 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-icon-btn {
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 8px;
-    color: var(--SmartThemeBodyColor, #ddd);
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 7px;
+    color: var(--SmartThemeBodyColor, #ccc);
     cursor: pointer;
-    font-size: 1rem;
     width: 30px;
     height: 30px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    transition: background 0.14s ease;
 }
 
 .tt-novel-icon-btn:hover {
-    background: rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.1);
 }
 
+/* 5-Tab Clean Underline Bar */
 .tt-novel-wb-tabs {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 6px 10px;
-    overflow-x: auto;
-    scrollbar-width: none;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(0, 0, 0, 0.14);
-}
-
-.tt-novel-wb-tabs::-webkit-scrollbar {
-    display: none;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(0, 0, 0, 0.1);
 }
 
 .tt-novel-wb-tab {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 5px;
-    padding: 6px 12px;
-    border-radius: 8px;
-    border: 1px solid transparent;
+    padding: 9px 4px;
+    border: none;
+    border-bottom: 2px solid transparent;
     background: transparent;
-    color: var(--SmartThemeBodyColor, #bbb);
+    color: var(--SmartThemeBodyColor, #aaa);
+    opacity: 0.72;
     cursor: pointer;
-    font-size: 0.82rem;
+    font-size: 0.83rem;
     font-weight: 500;
     white-space: nowrap;
-    flex-shrink: 0;
-    transition: all 0.14s ease;
+    transition: opacity 0.14s ease, border-color 0.14s ease, color 0.14s ease;
 }
 
 .tt-novel-wb-tab:hover {
-    background: rgba(255, 255, 255, 0.07);
+    opacity: 0.95;
+    background: rgba(255, 255, 255, 0.03);
 }
 
 .tt-novel-wb-tab.active {
-    background: rgba(212, 163, 89, 0.2);
-    border-color: rgba(212, 163, 89, 0.5);
-    color: #ffe3a8;
-    font-weight: 700;
+    opacity: 1;
+    color: #ecd09b;
+    border-bottom-color: #d4a359;
+    font-weight: 600;
 }
 
 .tt-novel-tab-dot {
     padding: 0 5px;
+    min-width: 15px;
+    height: 15px;
+    line-height: 15px;
     border-radius: 999px;
-    background: rgba(235, 92, 92, 0.85);
+    background: rgba(224, 98, 98, 0.85);
     color: #fff;
-    font-size: 0.68rem;
+    font-size: 0.65rem;
     font-weight: 700;
 }
 
@@ -329,10 +360,223 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     padding: 12px 14px 24px 14px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 10px;
 }
 
-/* 5. Shared Workbench Cards, Actions, Filters & Banners */
+/* 6. Segmented Controls, Toolbars & Dropdown Menu */
+.tt-novel-seg {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 3px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.24);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    gap: 3px;
+}
+
+.tt-novel-seg-btn {
+    padding: 6px 10px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--SmartThemeBodyColor, #bbb);
+    opacity: 0.74;
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.14s ease, opacity 0.14s ease;
+}
+
+.tt-novel-seg-btn.active {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.1);
+    color: #f2ddb2;
+    font-weight: 600;
+}
+
+.tt-novel-context-strip {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 7px 10px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    font-size: 0.78rem;
+}
+
+.tt-novel-context-main {
+    opacity: 0.88;
+    min-width: 0;
+    flex: 1 1 180px;
+}
+
+.tt-novel-context-links {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+}
+
+.tt-novel-link-pill {
+    padding: 2px 8px;
+    border-radius: 5px;
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--SmartThemeBodyColor, #ccc);
+    font-size: 0.73rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.tt-novel-link-pill:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.tt-novel-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.tt-novel-spacer {
+    flex: 1 1 auto;
+}
+
+.tt-novel-compact-select {
+    width: auto !important;
+    min-width: 78px;
+    padding: 4px 8px !important;
+    font-size: 0.79rem !important;
+}
+
+.tt-novel-menu-drop {
+    position: relative;
+}
+
+.tt-novel-menu-drop > summary {
+    list-style: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.tt-novel-menu-drop > summary::-webkit-details-marker {
+    display: none;
+}
+
+.tt-novel-menu-panel {
+    position: absolute;
+    left: 0;
+    top: calc(100% + 4px);
+    z-index: 30;
+    min-width: 164px;
+    padding: 4px;
+    border-radius: 8px;
+    background: var(--SmartThemeBlurTintColor, #1a1d24);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.tt-novel-menu-item {
+    width: 100%;
+    text-align: left;
+    padding: 6px 9px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--SmartThemeBodyColor, #e2e2e2);
+    font-size: 0.78rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.tt-novel-menu-item:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.09);
+}
+
+.tt-novel-menu-item:disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+}
+
+/* 7. Clean Accordions & Subtle Folds */
+.tt-novel-accordion {
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.025);
+    overflow: hidden;
+}
+
+.tt-novel-accordion > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.83rem;
+    font-weight: 600;
+    list-style: none;
+}
+
+.tt-novel-accordion > summary::-webkit-details-marker {
+    display: none;
+}
+
+.tt-novel-accordion > summary::after {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    opacity: 0.55;
+    transition: transform 0.15s ease;
+    flex-shrink: 0;
+}
+
+.tt-novel-accordion[open] > summary {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.tt-novel-accordion[open] > summary::after {
+    transform: rotate(45deg);
+}
+
+.tt-novel-accordion-body {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.tt-novel-subtle-fold {
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    padding-top: 7px;
+    font-size: 0.78rem;
+}
+
+.tt-novel-subtle-fold > summary {
+    cursor: pointer;
+    user-select: none;
+    opacity: 0.76;
+}
+
+.tt-novel-subtle-fold > summary:hover {
+    opacity: 1;
+}
+
+/* 8. Shared Cards, Buttons, Toggles & Filters */
 .tt-novel-action-bar {
     display: flex;
     flex-wrap: wrap;
@@ -341,15 +585,29 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-btn-primary {
-    border-color: rgba(212, 163, 89, 0.55) !important;
-    background: rgba(212, 163, 89, 0.2) !important;
-    color: #ffe5b0 !important;
+    border-color: rgba(212, 163, 89, 0.5) !important;
+    background: rgba(212, 163, 89, 0.18) !important;
+    color: #f3dbb0 !important;
     font-weight: 600;
 }
 
 .tt-novel-btn-sm {
-    padding: 3px 9px !important;
+    padding: 4px 10px !important;
     font-size: 0.78rem !important;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.tt-novel-btn-stop {
+    background: rgba(214, 72, 72, 0.18) !important;
+    border: 1px solid rgba(224, 98, 98, 0.45) !important;
+    color: #f7c5c5 !important;
+    flex-shrink: 0;
+}
+
+.tt-novel-btn-stop:hover {
+    background: rgba(214, 72, 72, 0.3) !important;
 }
 
 .tt-novel-subfilter {
@@ -358,57 +616,107 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     overflow-x: auto;
     scrollbar-width: none;
     gap: 5px;
+    padding-bottom: 1px;
+}
+
+.tt-novel-subfilter::-webkit-scrollbar {
+    display: none;
 }
 
 .tt-novel-filter-pill {
-    padding: 3px 10px;
-    border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--SmartThemeBodyColor, #ccc);
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--SmartThemeBodyColor, #bbb);
     font-size: 0.76rem;
     white-space: nowrap;
     cursor: pointer;
+    flex-shrink: 0;
 }
 
 .tt-novel-filter-pill.active {
-    background: rgba(56, 152, 142, 0.28);
-    border-color: rgba(74, 196, 183, 0.6);
-    color: #a6f5eb;
+    background: rgba(212, 163, 89, 0.16);
+    border-color: rgba(212, 163, 89, 0.45);
+    color: #f2ddb2;
     font-weight: 600;
+}
+
+.tt-novel-toggle-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.tt-novel-toggle-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    cursor: pointer;
+}
+
+.tt-novel-toggle-row input[type="checkbox"] {
+    margin-top: 2px;
+    flex-shrink: 0;
+}
+
+.tt-novel-toggle-title {
+    font-size: 0.82rem;
+    font-weight: 500;
+    line-height: 1.35;
+}
+
+.tt-novel-toggle-desc {
+    font-size: 0.72rem;
+    opacity: 0.62;
+    margin-top: 1px;
+    line-height: 1.4;
 }
 
 .tt-novel-banner {
     padding: 8px 11px;
     border-radius: 8px;
-    font-size: 0.8rem;
+    font-size: 0.79rem;
     line-height: 1.5;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.04);
 }
 
 .tt-novel-banner.is-running {
-    background: rgba(56, 152, 142, 0.16);
-    border-color: rgba(74, 196, 183, 0.45);
-    color: #b4f5ec;
+    background: rgba(85, 189, 178, 0.12);
+    border-color: rgba(85, 189, 178, 0.35);
+    color: #b7efe8;
 }
 
 .tt-novel-banner.is-ok {
-    background: rgba(56, 168, 112, 0.16);
-    border-color: rgba(82, 204, 142, 0.45);
-    color: #b5f5d1;
+    background: rgba(82, 196, 140, 0.12);
+    border-color: rgba(82, 196, 140, 0.35);
+    color: #bcefd3;
 }
 
 .tt-novel-banner.is-warn {
-    background: rgba(229, 169, 60, 0.16);
-    border-color: rgba(229, 169, 60, 0.5);
-    color: #ffe3a8;
+    background: rgba(224, 169, 76, 0.12);
+    border-color: rgba(224, 169, 76, 0.38);
+    color: #f3d9a8;
 }
 
 .tt-novel-banner.is-error {
-    background: rgba(225, 76, 76, 0.18);
-    border-color: rgba(235, 92, 92, 0.5);
-    color: #ffc2c2;
+    background: rgba(224, 98, 98, 0.14);
+    border-color: rgba(224, 98, 98, 0.4);
+    color: #f7c2c2;
+}
+
+.tt-novel-banner-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.tt-novel-banner-text {
+    flex: 1 1 200px;
+    min-width: 0;
 }
 
 .tt-novel-section {
@@ -418,18 +726,24 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-section-title {
-    font-size: 0.84rem;
-    font-weight: 700;
-    color: #ecd29c;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #e6cca0;
     display: flex;
     align-items: center;
     gap: 6px;
 }
 
+.tt-novel-field-label {
+    font-size: 0.75rem;
+    opacity: 0.76;
+    margin-bottom: 5px;
+}
+
 .tt-novel-card-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    gap: 9px;
 }
 
 @media (max-width: 768px) {
@@ -441,17 +755,17 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-card-stack {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 7px;
 }
 
 .tt-novel-card {
     padding: 10px 12px;
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.035);
-    border: 1px solid rgba(255, 255, 255, 0.11);
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.028);
+    border: 1px solid rgba(255, 255, 255, 0.09);
     display: flex;
     flex-direction: column;
-    gap: 7px;
+    gap: 8px;
 }
 
 .tt-novel-card-head {
@@ -469,39 +783,59 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-mini-icon-btn {
-    background: rgba(255, 255, 255, 0.06);
+    background: transparent;
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 6px;
-    padding: 2px 6px;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     cursor: pointer;
-    font-size: 0.76rem;
-    color: inherit;
+    color: var(--SmartThemeBodyColor, #ccc);
+    opacity: 0.78;
+    transition: background 0.14s ease, opacity 0.14s ease;
 }
 
-.tt-novel-mini-icon-btn:hover {
-    background: rgba(255, 255, 255, 0.16);
+.tt-novel-mini-icon-btn:hover:not(:disabled) {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.1);
 }
 
+.tt-novel-mini-icon-btn.is-active {
+    opacity: 1;
+    border-color: rgba(212, 163, 89, 0.55);
+    color: #f0d39a;
+    background: rgba(212, 163, 89, 0.16);
+}
+
+.tt-novel-mini-icon-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+/* 9. Character & Timeline Cards */
 .tt-novel-char-name {
-    font-size: 0.94rem;
+    font-size: 0.92rem;
     margin-right: 6px;
 }
 
 .tt-novel-char-row {
-    padding: 5px 8px;
+    padding: 5px 9px;
     border-radius: 6px;
-    border-left: 3px solid rgba(255, 255, 255, 0.25);
-    background: rgba(0, 0, 0, 0.18);
+    border-left: 2px solid rgba(255, 255, 255, 0.22);
+    background: rgba(0, 0, 0, 0.16);
     font-size: 0.79rem;
     line-height: 1.55;
 }
 
 .tt-novel-char-row span {
-    display: inline-block;
-    font-weight: 700;
-    font-size: 0.73rem;
+    display: block;
+    font-weight: 600;
+    font-size: 0.72rem;
     margin-bottom: 2px;
-    opacity: 0.9;
+    opacity: 0.72;
 }
 
 .tt-novel-char-row p {
@@ -509,12 +843,13 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     white-space: pre-wrap;
 }
 
-.tt-novel-char-row.is-canon { border-left-color: #63a4ff; }
-.tt-novel-char-row.is-sit { border-left-color: #4ac4b7; }
-.tt-novel-char-row.is-voice { border-left-color: #e5b75a; }
+.tt-novel-char-row.is-appear { border-left-color: #79b8e8; }
+.tt-novel-char-row.is-canon { border-left-color: #6b9ce2; }
+.tt-novel-char-row.is-sit { border-left-color: #55bdb2; }
+.tt-novel-char-row.is-voice { border-left-color: #d4a359; }
 .tt-novel-char-row.is-ooc {
-    border-left-color: #ef6b6b;
-    background: rgba(235, 82, 82, 0.09);
+    border-left-color: #d96b6b;
+    background: rgba(217, 107, 107, 0.08);
 }
 
 .tt-novel-timeline-meta {
@@ -525,17 +860,17 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-card-text {
-    font-size: 0.81rem;
+    font-size: 0.8rem;
     line-height: 1.62;
     white-space: pre-wrap;
 }
 
 .tt-novel-infogap {
-    font-size: 0.76rem;
+    font-size: 0.75rem;
     padding: 4px 8px;
     border-radius: 6px;
-    background: rgba(229, 169, 60, 0.12);
-    color: #f3d28e;
+    background: rgba(212, 163, 89, 0.1);
+    color: #e6cca0;
 }
 
 .tt-novel-chip-row {
@@ -547,21 +882,32 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-chip {
     display: inline-block;
     padding: 1px 7px;
-    border-radius: 5px;
-    font-size: 0.72rem;
-    background: rgba(255, 255, 255, 0.08);
-    color: #d6deea;
+    border-radius: 4px;
+    font-size: 0.71rem;
+    background: rgba(255, 255, 255, 0.07);
+    color: #d0d7e2;
 }
 
 .tt-novel-chip.is-gold {
-    background: rgba(229, 169, 60, 0.24);
-    color: #ffe3a8;
+    background: rgba(212, 163, 89, 0.2);
+    color: #f0d7a6;
     font-weight: 600;
 }
 
+.tt-novel-chip.is-ok {
+    background: rgba(82, 196, 140, 0.2);
+    color: #b4edd0;
+    font-weight: 600;
+}
+
+.tt-novel-chip.is-warn {
+    background: rgba(224, 169, 76, 0.2);
+    color: #f3d9a8;
+}
+
 .tt-novel-chip.is-danger {
-    background: rgba(235, 82, 82, 0.28);
-    color: #ffc2c2;
+    background: rgba(224, 98, 98, 0.22);
+    color: #f7c2c2;
     font-weight: 600;
 }
 
@@ -572,18 +918,18 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     gap: 8px;
     padding: 7px 10px;
     border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.025);
     font-size: 0.8rem;
 }
 
 .tt-novel-hook-row.is-pinned {
-    border-color: rgba(229, 169, 60, 0.55);
-    background: rgba(229, 169, 60, 0.12);
+    border-color: rgba(212, 163, 89, 0.45);
+    background: rgba(212, 163, 89, 0.09);
 }
 
 .tt-novel-hook-row.is-resolved {
-    opacity: 0.58;
+    opacity: 0.55;
     text-decoration: line-through;
 }
 
@@ -599,32 +945,46 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     display: flex;
     align-items: flex-start;
     gap: 7px;
-    padding: 5px 8px;
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.03);
+    padding: 7px 9px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.07);
     font-size: 0.79rem;
     line-height: 1.5;
 }
 
+.tt-novel-state-crud-row {
+    justify-content: space-between;
+}
+
+.tt-novel-state-main {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
 .tt-novel-subhead {
-    font-size: 0.78rem;
+    font-size: 0.76rem;
     font-weight: 600;
-    opacity: 0.8;
+    opacity: 0.72;
     margin-top: 4px;
 }
 
 .tt-novel-edit-grid {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 7px;
 }
 
 .tt-novel-edit-grid label {
     display: flex;
     flex-direction: column;
     gap: 3px;
-    font-size: 0.76rem;
-    opacity: 0.9;
+    font-size: 0.75rem;
+    opacity: 0.86;
 }
 
 .tt-novel-row-2 {
@@ -633,22 +993,33 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     gap: 6px;
 }
 
-/* 6. Style Distillation Full-Process Viewer */
-.tt-novel-fold-card,
+.tt-novel-row-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+}
+
+@media (max-width: 640px) {
+    .tt-novel-row-3 {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* 10. Logs, Comparisons & Editors */
 .tt-novel-step-item,
 .tt-novel-round-card,
 .tt-novel-subfold {
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 9px;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 8px;
     padding: 7px 10px;
-    background: rgba(0, 0, 0, 0.18);
-    font-size: 0.8rem;
+    background: rgba(0, 0, 0, 0.16);
+    font-size: 0.79rem;
 }
 
-.tt-novel-fold-card > summary,
 .tt-novel-step-item > summary,
 .tt-novel-round-card > summary,
-.tt-novel-subfold > summary {
+.tt-novel-subfold > summary,
+.tt-novel-outline-card > summary {
     cursor: pointer;
     user-select: none;
     line-height: 1.45;
@@ -662,16 +1033,16 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-score-pill {
-    padding: 2px 9px;
+    padding: 1px 8px;
     border-radius: 999px;
-    font-size: 0.74rem;
+    font-size: 0.72rem;
     font-weight: 700;
-    background: rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.1);
 }
 
-.tt-novel-score-pill.is-high { background: rgba(56, 180, 120, 0.28); color: #a7f5cb; }
-.tt-novel-score-pill.is-mid { background: rgba(229, 169, 60, 0.28); color: #ffe3a8; }
-.tt-novel-score-pill.is-low { background: rgba(235, 82, 82, 0.28); color: #ffc2c2; }
+.tt-novel-score-pill.is-high { background: rgba(82, 196, 140, 0.22); color: #b4edd0; }
+.tt-novel-score-pill.is-mid { background: rgba(212, 163, 89, 0.22); color: #f0d7a6; }
+.tt-novel-score-pill.is-low { background: rgba(224, 98, 98, 0.22); color: #f7c2c2; }
 
 .tt-novel-round-body {
     display: flex;
@@ -683,25 +1054,29 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-diff-box {
     padding: 8px 10px;
     border-radius: 7px;
-    background: rgba(255, 255, 255, 0.04);
-    border-left: 3px solid #e5b75a;
+    background: rgba(255, 255, 255, 0.03);
+    border-left: 2px solid #d4a359;
+}
+
+.tt-novel-diff-box.is-cool {
+    border-left-color: #55bdb2;
 }
 
 .tt-novel-mini-label {
-    font-size: 0.74rem;
-    font-weight: 700;
-    color: #ecd29c;
+    font-size: 0.73rem;
+    font-weight: 600;
+    color: #e6cca0;
     margin-bottom: 4px;
 }
 
 .tt-novel-pre,
 .tt-novel-pre-wrap {
-    margin: 6px 0 0 0;
+    margin: 5px 0 0 0;
     white-space: pre-wrap;
     word-break: break-word;
     font-family: inherit;
-    font-size: 0.78rem;
-    line-height: 1.6;
+    font-size: 0.77rem;
+    line-height: 1.58;
 }
 
 .tt-novel-compare-grid {
@@ -720,9 +1095,9 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-compare-col {
     padding: 8px;
     border-radius: 7px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    max-height: 280px;
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    max-height: 260px;
     overflow-y: auto;
 }
 
@@ -734,21 +1109,21 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 
 .tt-novel-style-editor {
     width: 100%;
-    min-height: 130px;
+    min-height: 120px;
     font-size: 0.8rem;
     line-height: 1.55;
     resize: vertical;
 }
 
-/* 7. Cliché Hit List */
+/* 11. Cliché List & TOC */
 .tt-novel-cliche-hit {
     display: flex;
     align-items: flex-start;
     gap: 8px;
     padding: 6px 9px;
     border-radius: 7px;
-    background: rgba(235, 82, 82, 0.08);
-    border: 1px solid rgba(235, 82, 82, 0.22);
+    background: rgba(224, 98, 98, 0.07);
+    border: 1px solid rgba(224, 98, 98, 0.2);
     font-size: 0.79rem;
     line-height: 1.5;
 }
@@ -758,40 +1133,43 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     word-break: break-word;
 }
 
-/* 8. Chapter TOC inside Workbench */
 .tt-novel-toc-jumps {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    display: flex;
     gap: 6px;
 }
 
 .tt-novel-jump-btn {
+    flex: 1;
     padding: 6px 8px;
     border-radius: 7px;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    background: rgba(255, 255, 255, 0.06);
-    color: var(--SmartThemeBodyColor, #eee);
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--SmartThemeBodyColor, #e5e5e5);
     cursor: pointer;
-    font-size: 0.78rem;
-    text-align: center;
+    font-size: 0.77rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    white-space: nowrap;
 }
 
 .tt-novel-jump-btn:hover {
-    background: rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.1);
 }
 
 .tt-novel-toc-list-inline {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
 }
 
 .tt-novel-toc-divider {
-    font-size: 0.78rem;
-    font-weight: 700;
-    opacity: 0.75;
-    padding: 8px 4px 4px 4px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 0.75rem;
+    font-weight: 600;
+    opacity: 0.65;
+    padding: 8px 2px 4px 2px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
 }
 
 .tt-novel-toc-item {
@@ -801,21 +1179,21 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     gap: 6px;
     padding: 6px 8px;
     border-radius: 7px;
-    background: rgba(255, 255, 255, 0.03);
+    background: rgba(255, 255, 255, 0.025);
     border: 1px solid transparent;
 }
 
 .tt-novel-toc-item:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.07);
 }
 
 .tt-novel-toc-item.is-cutoff {
-    border-color: rgba(229, 169, 60, 0.55);
-    background: rgba(229, 169, 60, 0.12);
+    border-color: rgba(212, 163, 89, 0.45);
+    background: rgba(212, 163, 89, 0.1);
 }
 
 .tt-novel-toc-item.is-masked {
-    opacity: 0.45;
+    opacity: 0.44;
 }
 
 .tt-novel-toc-item-main {
@@ -828,44 +1206,44 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-toc-tag {
-    font-size: 0.69rem;
+    font-size: 0.68rem;
     padding: 1px 6px;
     border-radius: 4px;
     flex-shrink: 0;
 }
 
-.tt-novel-toc-tag.orig { background: rgba(90, 140, 210, 0.22); color: #a8cdf8; }
-.tt-novel-toc-tag.cutoff { background: rgba(229, 169, 60, 0.3); color: #ffe3a8; font-weight: 600; }
-.tt-novel-toc-tag.ai { background: rgba(56, 172, 142, 0.25); color: #96f2d7; }
-.tt-novel-toc-tag.masked { background: rgba(160, 160, 160, 0.2); color: #aaa; }
+.tt-novel-toc-tag.orig { background: rgba(107, 156, 226, 0.18); color: #adcbf5; }
+.tt-novel-toc-tag.cutoff { background: rgba(212, 163, 89, 0.25); color: #f0d7a6; font-weight: 600; }
+.tt-novel-toc-tag.ai { background: rgba(85, 189, 178, 0.2); color: #9ce8df; }
+.tt-novel-toc-tag.masked { background: rgba(160, 160, 160, 0.16); color: #999; }
 
 .tt-novel-toc-name {
     flex: 1;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    font-size: 0.83rem;
+    font-size: 0.82rem;
 }
 
 .tt-novel-toc-meta {
-    font-size: 0.72rem;
-    opacity: 0.65;
+    font-size: 0.71rem;
+    opacity: 0.6;
     flex-shrink: 0;
 }
 
 .tt-novel-toc-actions {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
     flex-shrink: 0;
 }
 
 .tt-novel-view-btn {
     padding: 2px 8px;
     border-radius: 5px;
-    border: 1px solid rgba(74, 196, 183, 0.45);
-    background: rgba(56, 152, 142, 0.2);
-    color: #a6f4ea;
+    border: 1px solid rgba(85, 189, 178, 0.38);
+    background: rgba(85, 189, 178, 0.14);
+    color: #9ce8df;
     cursor: pointer;
     font-size: 0.72rem;
 }
@@ -873,14 +1251,14 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-cutoff-btn {
     padding: 2px 8px;
     border-radius: 5px;
-    border: 1px solid rgba(229, 169, 60, 0.4);
-    background: rgba(229, 169, 60, 0.14);
-    color: #f3c878;
+    border: 1px solid rgba(212, 163, 89, 0.35);
+    background: rgba(212, 163, 89, 0.12);
+    color: #ebd09d;
     cursor: pointer;
     font-size: 0.72rem;
 }
 
-/* 9. Compact Extension Settings Entry Card & Shared Controls */
+/* 12. Extension Settings Drawer Entry & Shared Misc */
 .tt-novel-settings-body {
     display: flex;
     flex-direction: column;
@@ -891,9 +1269,9 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-status-card {
     padding: 9px 11px;
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
-    font-size: 0.82rem;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    font-size: 0.8rem;
     line-height: 1.65;
 }
 
@@ -901,7 +1279,7 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     cursor: pointer;
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
 }
 
 .tt-novel-inline-field {
@@ -910,7 +1288,7 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 8px;
-    font-size: 0.82rem;
+    font-size: 0.8rem;
 }
 
 .tt-novel-bridge-row {
@@ -924,37 +1302,30 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 }
 
 .tt-novel-bridge-status {
-    opacity: 0.85;
-    font-size: 0.76rem;
+    opacity: 0.8;
+    font-size: 0.75rem;
 }
 
 .tt-novel-muted {
-    font-size: 0.76rem;
-    opacity: 0.72;
+    font-size: 0.74rem;
+    opacity: 0.65;
 }
 
 .tt-novel-empty {
-    padding: 12px;
+    padding: 14px 12px;
     border-radius: 8px;
-    border: 1px dashed rgba(255, 255, 255, 0.15);
-    font-size: 0.8rem;
-    opacity: 0.75;
+    border: 1px dashed rgba(255, 255, 255, 0.12);
+    font-size: 0.79rem;
+    opacity: 0.68;
     line-height: 1.6;
+    text-align: center;
 }
 
 .tt-novel-log-list {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 5px;
     margin-top: 6px;
-}
-
-/* 10. Per-Slice Archive Manager & Custom API Box */
-.tt-novel-slice-body {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-top: 8px;
 }
 
 .tt-novel-slice-list {
@@ -966,16 +1337,16 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-slice-row {
     padding: 7px 9px;
     border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    background: rgba(255, 255, 255, 0.025);
     display: flex;
     flex-direction: column;
     gap: 4px;
 }
 
 .tt-novel-slice-row.is-bad {
-    border-color: rgba(235, 92, 92, 0.5);
-    background: rgba(235, 82, 82, 0.09);
+    border-color: rgba(224, 98, 98, 0.45);
+    background: rgba(224, 98, 98, 0.08);
 }
 
 .tt-novel-slice-head {
@@ -991,13 +1362,7 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     align-items: center;
     flex-wrap: wrap;
     gap: 6px;
-    font-size: 0.79rem;
-}
-
-.tt-novel-chip.is-ok {
-    background: rgba(56, 172, 118, 0.25);
-    color: #b5f5d1;
-    font-weight: 600;
+    font-size: 0.78rem;
 }
 
 .tt-novel-slice-detail > summary {
@@ -1008,37 +1373,20 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
 .tt-novel-custom-api-box {
     padding: 9px 10px;
     border-radius: 8px;
-    background: rgba(0, 0, 0, 0.22);
-    border: 1px dashed rgba(212, 163, 89, 0.35);
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.09);
 }
 
 .tt-novel-hook-picker {
     display: flex;
     flex-wrap: wrap;
     gap: 5px;
-    max-height: 150px;
+    max-height: 140px;
     overflow-y: auto;
 }
 
-.tt-novel-row-3 {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 6px;
-}
-
-@media (max-width: 640px) {
-    .tt-novel-row-3 {
-        grid-template-columns: 1fr;
-    }
-}
-
-.tt-novel-outline-card > summary {
-    cursor: pointer;
-    user-select: none;
-}
-
 .tt-novel-outline-card.is-sent {
-    opacity: 0.72;
+    opacity: 0.7;
 }
 
 .tt-novel-outline-card-body {
@@ -1048,67 +1396,11 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     margin-top: 6px;
 }
 
-/* v1.6.0 Universal POV / WorldInfo / Stop / CRUD Additions */
-.tt-novel-banner-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    flex-wrap: wrap;
-}
-
-.tt-novel-banner-text {
-    flex: 1 1 200px;
-    min-width: 0;
-}
-
-.tt-novel-btn-stop {
-    background: rgba(214, 72, 72, 0.22) !important;
-    border: 1px solid rgba(242, 107, 107, 0.55) !important;
-    color: #ffd4d4 !important;
-    flex-shrink: 0;
-}
-
-.tt-novel-btn-stop:hover {
-    background: rgba(214, 72, 72, 0.36) !important;
-}
-
-.tt-novel-state-crud-row {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 8px;
-}
-
-.tt-novel-state-main {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 6px;
-    flex: 1 1 auto;
-    min-width: 0;
-}
-
-.tt-novel-char-row.is-appear {
-    border-left: 3px solid #6ec6ff;
-    padding-left: 8px;
-}
-
-.tt-novel-chip.is-warn {
-    background: rgba(235, 168, 52, 0.2);
-    border-color: rgba(235, 168, 52, 0.45);
-    color: #ffe2a8;
-}
-
 .tt-novel-check-row {
     display: flex;
     align-items: flex-start;
-    gap: 6px;
+    gap: 7px;
     font-size: 0.78rem;
     line-height: 1.45;
     cursor: pointer;
-}
-
-.tt-novel-narrative-box {
-    margin: 8px 0;
 }

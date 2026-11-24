@@ -293,7 +293,7 @@ function buildDraftDriftSummary(draftText, styleProfile) {
     return [
         `• 平均段长：原著 ${targetFp.avgParagraphChars} 字（≤60字短段 ${targetFp.shortParagraphRatio ?? '?'}%） vs 初稿 ${draftFp.avgParagraphChars} 字（短段 ${draftFp.shortParagraphRatio ?? '?'}%）`,
         `• 句长与对话：原著均句 ${targetFp.avgSentenceChars} 字 / 对话占比 ${targetFp.dialogueRatio}% vs 初稿均句 ${draftFp.avgSentenceChars} 字 / 对话占比 ${draftFp.dialogueRatio}%`,
-        alerts.length > 0 ? `• 🚨 客观文风硬偏差：${alerts.join('；')}` : '• ✅ 段长与对话密度基本贴合原著，重点主抓 OOC、台词质感与信息差！',
+        alerts.length > 0 ? `• 客观文风硬偏差：${alerts.join('；')}` : '• 段长与对话密度基本贴合原著，重点主抓 OOC、台词质感与信息差。',
     ].join('\n');
 }
 

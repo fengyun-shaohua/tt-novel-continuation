@@ -678,7 +678,7 @@ export async function synthesizeArchiveFromBatches({
     const parsedCharacters = parseCharacterProfiles(charactersRaw, maxCoveredChapter);
 
     const charsWarning = parsedCharacters.length === 0
-        ? `⚠️ 人物档案合稿未解析出人物（原始回复开头：${cleanTagText(charactersRaw).slice(0, 140)}）`
+        ? `人物档案合稿未解析出人物（原始回复开头：${cleanTagText(charactersRaw).slice(0, 140)}）`
         : `提炼 ${parsedCharacters.length} 位核心人物防 OOC 档案（${parsedCharacters.map(c => c.name).join('、')}）`;
 
     const synthLogEntry = {
@@ -793,7 +793,7 @@ export async function runStoryAndCharacterArchivePipeline({
             try { await onSliceCompleted(resultSlice); } catch { /* ignore incremental save error */ }
         }
         completedSteps += 1;
-        const statusIcon = resultSlice.status === 'ok' ? '✅' : (resultSlice.status === 'refused' ? '⚠️' : '❌');
+        const statusIcon = resultSlice.status === 'ok' ? '[正常]' : (resultSlice.status === 'refused' ? '[异常]' : '[失败]');
         const entry = {
             id: `batch_${resultSlice.batchIndex}`,
             title: `${statusIcon} 切片 ${resultSlice.batchIndex}/${batchIndexOffset + batchesToRun.length} · 第 ${resultSlice.startChapter}~${resultSlice.endChapter} 章（${resultSlice.charCount} 字）`,
@@ -911,7 +911,7 @@ export async function rerunArchiveBatches({
             signal,
         });
         doneCount += 1;
-        const icon = updated.status === 'ok' ? '✅' : (updated.status === 'refused' ? '⚠️' : '❌');
+        const icon = updated.status === 'ok' ? '[正常]' : (updated.status === 'refused' ? '[异常]' : '[失败]');
         onProgress({
             step: doneCount,
             totalSteps: targets.length,
@@ -1224,7 +1224,7 @@ export async function summarizeMissingChaptersBatch({
             onProgress({
                 step: done,
                 totalSteps: validTargets.length,
-                label: `✅ 已补齐第 ${ch.index} 章《${ch.title || `第 ${ch.index} 章`}》单章总结（${done}/${validTargets.length}）`,
+                label: `已补齐第 ${ch.index} 章《${ch.title || `第 ${ch.index} 章`}》单章总结（${done}/${validTargets.length}）`,
             });
             return { chapterIndex: ch.index, status: 'ok', extracted };
         } catch (err) {
@@ -1234,7 +1234,7 @@ export async function summarizeMissingChaptersBatch({
             onProgress({
                 step: done,
                 totalSteps: validTargets.length,
-                label: `⚠️ 第 ${ch.index} 章补总结跳过：${err?.message || err}（${done}/${validTargets.length}）`,
+                label: `第 ${ch.index} 章补总结跳过：${err?.message || err}（${done}/${validTargets.length}）`,
             });
             return { chapterIndex: ch.index, status: 'error', error: err?.message || String(err) };
         }

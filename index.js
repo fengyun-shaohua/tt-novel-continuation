@@ -502,9 +502,9 @@ async function onMessageReceived(messageId, type) {
                 updateLiveProgress('cliche', {
                     isRunning: false,
                     isError: true,
-                    text: `🛡️ 已跳过第 ${chapterIndex} 章自动重塑：${draftCheck.reason}`,
+                    text: `已跳过第 ${chapterIndex} 章自动重塑：${draftCheck.reason}`,
                 });
-                globalThis.toastr?.warning?.(`🛡️ ${draftCheck.reason}`, '小说续写阅读器');
+                globalThis.toastr?.warning?.(`${draftCheck.reason}`, '小说续写阅读器');
             } else {
                 scheduledAutoRewrite = true;
                 setTimeout(() => {
@@ -578,7 +578,7 @@ function createOriginalChapterFloor(ch, charName) {
 function createBookCoverFloor(novelData, maxChapter, charName) {
     const sampleTitle = novelData.chapters?.[0]?.title || '';
     const unit = /节\s*$/.test(sampleTitle.trim()) ? '节' : '章';
-    const text = `📖 **《${novelData.title}》**\n\n共 ${novelData.totalChapters} ${unit} · 当前夺舍节点：第 ${maxChapter} ${unit}（楼层 #1 ~ #${maxChapter} 与原著第 1 ~ ${maxChapter} ${unit} 一一对应）`;
+    const text = `**《${novelData.title}》**\n\n共 ${novelData.totalChapters} ${unit} · 当前夺舍节点：第 ${maxChapter} ${unit}（楼层 #1 ~ #${maxChapter} 与原著第 1 ~ ${maxChapter} ${unit} 一一对应）`;
     return {
         name: charName,
         is_user: false,
@@ -1007,7 +1007,7 @@ function stopBackgroundTask(taskKey) {
     updateLiveProgress(taskKey, {
         isRunning: false,
         isError: false,
-        text: '⏹ 任务已手动停止（已完成的进度与切片均已安全保留）。',
+        text: '任务已手动停止（已完成的进度与切片均已安全保留）。',
     });
     globalThis.toastr?.info?.('已发送停止信号，当前后台任务将立即中止', '小说续写阅读器');
 }
@@ -1489,7 +1489,7 @@ async function runAutoDetectNarrativeStructureTask() {
     updateLiveProgress('memory', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] 自动分析全书视角结构与双线时间坐标（仅需 1 次 API）...`,
+        text: `使用 [${caller.modelLabel}] 自动分析全书视角结构与双线时间坐标（仅需 1 次 API）...`,
     });
 
     try {
@@ -1518,18 +1518,18 @@ async function runAutoDetectNarrativeStructureTask() {
 
         updateLiveProgress('memory', {
             isRunning: false,
-            text: `✅ 自动识别并应用完成：${summaryMsg}`,
+            text: `自动识别并应用完成：${summaryMsg}`,
         });
         globalThis.toastr?.success?.(`已自动识别并配置：${summaryMsg}`, '小说续写阅读器');
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 自动结构识别已手动停止。' });
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '自动结构识别已手动停止。' });
             return;
         }
         updateLiveProgress('memory', {
             isRunning: false,
             isError: true,
-            text: `❌ 自动识别失败：${error?.message || error}`,
+            text: `自动识别失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`自动识别失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -1566,7 +1566,7 @@ async function runStoryArchiveTask(mode = 'full') {
         isRunning: true,
         isError: false,
         resetLogs: true,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动${mode === 'incremental' ? '增量' : '全本'}剧情与 4 维人物归档（并发上限 ≤ 2${worldInfoContext ? ' · 已贯通酒馆世界书' : ''}）...`,
+        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动${mode === 'incremental' ? '增量' : '全本'}剧情与 4 维人物归档（并发上限 ≤ 2${worldInfoContext ? ' · 已贯通酒馆世界书' : ''}）...`,
     });
 
     try {
@@ -1576,7 +1576,7 @@ async function runStoryArchiveTask(mode = 'full') {
         if (mode === 'full' && curCfg.autoDetectOnArchive !== false && isUnconfigured && novelData?.chapters?.length >= 4) {
             updateLiveProgress('memory', {
                 isRunning: true,
-                text: `⏳ [${caller.modelLabel}] 正在自动识别全书叙事视角与双线结构...`,
+                text: `[${caller.modelLabel}] 正在自动识别全书叙事视角与双线结构...`,
             });
             const detected = await detectNovelNarrativeStructure({
                 novelData,
@@ -1611,7 +1611,7 @@ async function runStoryArchiveTask(mode = 'full') {
                 if (ctrl.signal.aborted) return;
                 updateLiveProgress('memory', {
                     isRunning: true,
-                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    text: `[${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
                     logEntry,
                 });
             },
@@ -1619,11 +1619,11 @@ async function runStoryArchiveTask(mode = 'full') {
 
         await mergeArchivedDataIntoLedger(result, { mode });
         const warnTail = result.failedBatchCount > 0
-            ? ` ⚠️ 其中有 ${result.failedBatchCount} 个切片疑似道歉/失败，请在下方「分批切片管理」中单独重跑后点「重新合稿」！`
+            ? ` 其中有 ${result.failedBatchCount} 个切片疑似道歉/失败，请在下方「分批切片管理」中单独重跑后点「重新合稿」！`
             : ' 全部切片均正常提取，续写自动生效！';
         updateLiveProgress('memory', {
             isRunning: false,
-            text: `✅ 归档完成（至第 ${result.lastArchivedChapter} 章 · ${result.chronicle.length} 条编年史 · ${result.characters.length} 位人物灵魂卡 · ${result.hooks.length} 条伏笔）。${warnTail}`,
+            text: `归档完成（至第 ${result.lastArchivedChapter} 章 · ${result.chronicle.length} 条编年史 · ${result.characters.length} 位人物灵魂卡 · ${result.hooks.length} 条伏笔）。${warnTail}`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
@@ -1636,7 +1636,7 @@ async function runStoryArchiveTask(mode = 'full') {
             updateLiveProgress('memory', {
                 isRunning: false,
                 isError: false,
-                text: `⏹ 归档已手动停止（已完成的 ${completedSliceBuffer.size} 个切片已自动保存，可随时继续或合稿）。`,
+                text: `归档已手动停止（已完成的 ${completedSliceBuffer.size} 个切片已自动保存，可随时继续或合稿）。`,
             });
             await refreshReaderWidgets();
             return;
@@ -1644,7 +1644,7 @@ async function runStoryArchiveTask(mode = 'full') {
         updateLiveProgress('memory', {
             isRunning: false,
             isError: true,
-            text: `❌ 归档失败：${error?.message || error}`,
+            text: `归档失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`归档失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -1676,7 +1676,7 @@ async function runRerunArchiveBatchesTask(targetBatchIndices) {
     updateLiveProgress('memory', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 重跑 ${validIndices.length} 个切片（#${validIndices.join(', #')}）...`,
+        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 重跑 ${validIndices.length} 个切片（#${validIndices.join(', #')}）...`,
     });
 
     try {
@@ -1693,7 +1693,7 @@ async function runRerunArchiveBatchesTask(targetBatchIndices) {
                 if (ctrl.signal.aborted) return;
                 updateLiveProgress('memory', {
                     isRunning: true,
-                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    text: `[${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
                 });
             },
         });
@@ -1709,21 +1709,21 @@ async function runRerunArchiveBatchesTask(targetBatchIndices) {
             isRunning: false,
             isError: stillBad > 0 && okRefreshed === 0,
             text: okRefreshed > 0
-                ? `✅ 重跑完成：${okRefreshed}/${refreshed.length} 个切片已恢复正常！请点击「🔁 用当前切片重新合稿总账」把补齐的章节合并进编年史与人物卡。`
-                : `⚠️ 重跑的 ${refreshed.length} 个切片仍疑似道歉或失败，建议在「⚙️ 设置」中切换自定义 API 或调整预设（例如选「不使用预设（纯净直连）」）后再重跑！`,
+                ? `重跑完成：${okRefreshed}/${refreshed.length} 个切片已恢复正常。请点击「重新合稿总账」合并进编年史与人物卡。`
+                : `重跑的 ${refreshed.length} 个切片仍疑似道歉或失败，建议在「设置」中切换自定义 API 或调整预设（例如选「不使用预设（纯净直连）」）后再重跑！`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 切片重跑已手动停止。' });
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '切片重跑已手动停止。' });
             await refreshReaderWidgets();
             return;
         }
         updateLiveProgress('memory', {
             isRunning: false,
             isError: true,
-            text: `❌ 切片重跑失败：${error?.message || error}`,
+            text: `切片重跑失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`切片重跑失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -1753,7 +1753,7 @@ async function runResynthArchiveTask() {
     updateLiveProgress('memory', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 复用现有正常切片重新合稿总账（不重读原文${worldInfoContext ? ' · 已贯通世界书' : ''}）...`,
+        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 复用现有正常切片重新合稿总账（不重读原文${worldInfoContext ? ' · 已贯通世界书' : ''}）...`,
     });
 
     try {
@@ -1771,7 +1771,7 @@ async function runResynthArchiveTask() {
                 if (ctrl.signal.aborted) return;
                 updateLiveProgress('memory', {
                     isRunning: true,
-                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    text: `[${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
                     logEntry,
                 });
             },
@@ -1780,7 +1780,7 @@ async function runResynthArchiveTask() {
         await mergeArchivedDataIntoLedger(synth, { mode: 'full' });
         updateLiveProgress('memory', {
             isRunning: false,
-            text: `✅ 重新合稿完成：${synth.chronicle.length} 条编年史 · ${synth.characters.length} 位人物灵魂卡 · ${synth.hooks.length} 条伏笔（已复用全部正常切片）！`,
+            text: `重新合稿完成：${synth.chronicle.length} 条编年史 · ${synth.characters.length} 位人物灵魂卡 · ${synth.hooks.length} 条伏笔（已复用全部正常切片）！`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
@@ -1790,14 +1790,14 @@ async function runResynthArchiveTask() {
         );
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 重新合稿已手动停止（原总账与切片均未受损）。' });
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '重新合稿已手动停止（原总账与切片均未受损）。' });
             await refreshReaderWidgets();
             return;
         }
         updateLiveProgress('memory', {
             isRunning: false,
             isError: true,
-            text: `❌ 重新合稿失败：${error?.message || error}`,
+            text: `重新合稿失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`重新合稿失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -1829,7 +1829,7 @@ async function runBackfillMissingChapterSummariesTask() {
     updateLiveProgress('memory', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] 扫描并批量补齐缺失的单章四要素总结（并发 ≤ 2）...`,
+        text: `使用 [${caller.modelLabel}] 扫描并批量补齐缺失的单章四要素总结（并发 ≤ 2）...`,
     });
 
     try {
@@ -1861,7 +1861,7 @@ async function runBackfillMissingChapterSummariesTask() {
                 if (ctrl.signal.aborted) return;
                 updateLiveProgress('memory', {
                     isRunning: true,
-                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    text: `[${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
                 });
             },
         });
@@ -1873,21 +1873,21 @@ async function runBackfillMissingChapterSummariesTask() {
         if (res.summarizedCount === 0 && res.failedCount === 0) {
             updateLiveProgress('memory', {
                 isRunning: false,
-                text: '✅ 所有已写章节均已有单章精要总结，无需补齐！',
+                text: '所有已写章节均已有单章精要总结，无需补齐！',
             });
             globalThis.toastr?.info?.('所有已写章节均已有单章总结，无需补齐', '小说续写阅读器');
         } else {
-            const msgText = `✅ 批量补总结完成：成功补齐 ${res.summarizedCount} 章${res.failedCount > 0 ? `，跳过/失败 ${res.failedCount} 章` : ''}${res.skippedCount > 0 ? `（已拦截 ${res.skippedCount} 条空回/过短楼层）` : ''}！`;
+            const msgText = `批量补总结完成：成功补齐 ${res.summarizedCount} 章${res.failedCount > 0 ? `，跳过/失败 ${res.failedCount} 章` : ''}${res.skippedCount > 0 ? `（已拦截 ${res.skippedCount} 条空回/过短楼层）` : ''}！`;
             updateLiveProgress('memory', { isRunning: false, isError: res.summarizedCount === 0 && res.failedCount > 0, text: msgText });
-            globalThis.toastr?.success?.(msgText.replace(/^✅\s*/, ''), '小说续写阅读器');
+            globalThis.toastr?.success?.(msgText, '小说续写阅读器');
         }
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 批量补单章总结已手动停止（已补完的章节总结已自动保存）。' });
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '批量补单章总结已手动停止（已补完的章节总结已自动保存）。' });
             await refreshReaderWidgets();
             return;
         }
-        updateLiveProgress('memory', { isRunning: false, isError: true, text: `❌ 批量补单章总结失败：${error?.message || error}` });
+        updateLiveProgress('memory', { isRunning: false, isError: true, text: `批量补单章总结失败：${error?.message || error}` });
         globalThis.toastr?.error?.(`批量补总结失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
         endBackgroundTaskController('memory', ctrl);
@@ -1932,10 +1932,10 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
         isError: false,
         resetLogs: !(incremental || evaluateOnly),
         text: evaluateOnly
-            ? `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动纯跑分盲测验收（不修改当前 ${String(ledger.styleProfile.styleCard).length} 字圣经）...`
+            ? `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动纯跑分盲测验收（不修改当前 ${String(ledger.styleProfile.styleCard).length} 字圣经）...`
             : (incremental
-                ? `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 追加 1 轮全新真迹盲测与评分...`
-                : `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动 ${rounds} 轮骨相对抗蒸馏（并发上限 ≤ 2）...`),
+                ? `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 追加 1 轮全新真迹盲测与评分...`
+                : `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 启动 ${rounds} 轮骨相对抗蒸馏（并发上限 ≤ 2）...`),
     });
 
     try {
@@ -1951,7 +1951,7 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
                 if (ctrl.signal.aborted) return;
                 updateLiveProgress('style', {
                     isRunning: true,
-                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                    text: `[${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
                     logEntry,
                 });
             },
@@ -1965,8 +1965,8 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
         updateLiveProgress('style', {
             isRunning: false,
             text: evaluateOnly
-                ? `✅ 纯跑分验收完成：本轮 ${styleProfile.latestScore ?? '?'}/100 分（圣经保持 ${String(styleProfile.styleCard).length} 字未改 · 历程 ${scoreChain}），可展开下方卡片查看客观指标与真迹对照！`
-                : `✅ 蒸馏完成（${String(styleProfile.styleCard).length} 字 · ${scoreChain || '已定稿'}），全过程已保存，后续每章自动生效！`,
+                ? `纯跑分验收完成：本轮 ${styleProfile.latestScore ?? '?'}/100 分（圣经保持 ${String(styleProfile.styleCard).length} 字未改 · 历程 ${scoreChain}），可展开下方卡片查看客观指标与真迹对照！`
+                : `蒸馏完成（${String(styleProfile.styleCard).length} 字 · ${scoreChain || '已定稿'}），全过程已保存，后续每章自动生效！`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
@@ -1978,14 +1978,14 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
         );
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('style', { isRunning: false, isError: false, text: '⏹ 文风蒸馏任务已手动停止（原已保存文风卡未受影响）。' });
+            updateLiveProgress('style', { isRunning: false, isError: false, text: '文风蒸馏任务已手动停止（原已保存文风卡未受影响）。' });
             await refreshReaderWidgets();
             return;
         }
         updateLiveProgress('style', {
             isRunning: false,
             isError: true,
-            text: `❌ ${evaluateOnly ? '跑分验收' : '蒸馏'}失败：${error?.message || error}`,
+            text: `${evaluateOnly ? '跑分验收' : '蒸馏'}失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`${evaluateOnly ? '跑分验收' : '文风蒸馏'}失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -2015,7 +2015,7 @@ async function runCompressStyleCardTask() {
     updateLiveProgress('style', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 将 ${beforeLen} 字文风圣经去过拟合提纯至 ~2,200 字实战版...`,
+        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 将 ${beforeLen} 字文风圣经去过拟合提纯至 ~2,200 字实战版...`,
     });
 
     try {
@@ -2032,28 +2032,28 @@ async function runCompressStyleCardTask() {
         sp.processLog.push({
             id: `compress_${Date.now()}`,
             type: 'stage',
-            title: `✨ 去过拟合提纯瘦身（${beforeLen} 字 → ${compressed.length} 字）`,
+            title: `去过拟合提纯瘦身（${beforeLen} 字 → ${compressed.length} 字）`,
             summary: `已剥离单章原句剧透与冗余重复，保留全部核心骨相洞察，节省 ${Math.max(0, beforeLen - compressed.length)} 字上下文。`,
             detail: compressed,
         });
         await saveLedger(ledger);
         updateLiveProgress('style', {
             isRunning: false,
-            text: `✅ 提纯瘦身完成：${beforeLen} 字 → ${compressed.length} 字！现在可以直接点击上方「🧪 纯跑分盲测验收 (不改圣经)」实测瘦身后的真实得分与真迹对比！`,
+            text: `提纯瘦身完成：${beforeLen} 字 → ${compressed.length} 字！现在可以直接点击上方「纯跑分盲测验收 (不改圣经)」实测瘦身后的真实得分与真迹对比！`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
         globalThis.toastr?.success?.(`文风圣经已提纯瘦身：${beforeLen} 字 → ${compressed.length} 字！`, '小说续写阅读器');
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('style', { isRunning: false, isError: false, text: '⏹ 提纯瘦身已手动停止（原文风圣经未改动）。' });
+            updateLiveProgress('style', { isRunning: false, isError: false, text: '提纯瘦身已手动停止（原文风圣经未改动）。' });
             await refreshReaderWidgets();
             return;
         }
         updateLiveProgress('style', {
             isRunning: false,
             isError: true,
-            text: `❌ 提纯瘦身失败：${error?.message || error}`,
+            text: `提纯瘦身失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`提纯瘦身失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -2077,7 +2077,7 @@ async function runGenerateCustomStyleCardTask({ styleBrief = '', referenceSample
     updateLiveProgress('style', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] 生成《${bookTitle}》原创定制文风骨相 DNA 执行卡...`,
+        text: `使用 [${caller.modelLabel}] 生成《${bookTitle}》原创定制文风骨相 DNA 执行卡...`,
     });
 
     try {
@@ -2093,18 +2093,18 @@ async function runGenerateCustomStyleCardTask({ styleBrief = '', referenceSample
         await saveLedger(ledger);
         updateLiveProgress('style', {
             isRunning: false,
-            text: `✅ 原创定制文风卡已生成（${profile.styleCard.length} 字），后续创作每章自动生效！`,
+            text: `原创定制文风卡已生成（${profile.styleCard.length} 字），后续创作每章自动生效！`,
         });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
         globalThis.toastr?.success?.(`定制文风卡已生成（${profile.styleCard.length} 字）！`, '小说续写阅读器');
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('style', { isRunning: false, isError: false, text: '⏹ 定制文风卡生成已手动停止。' });
+            updateLiveProgress('style', { isRunning: false, isError: false, text: '定制文风卡生成已手动停止。' });
             await refreshReaderWidgets();
             return;
         }
-        updateLiveProgress('style', { isRunning: false, isError: true, text: `❌ 生成定制文风卡失败：${error?.message || error}` });
+        updateLiveProgress('style', { isRunning: false, isError: true, text: `生成定制文风卡失败：${error?.message || error}` });
         globalThis.toastr?.error?.(`生成定制文风卡失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
         endBackgroundTaskController('style', ctrl);
@@ -2154,7 +2154,7 @@ async function runGenerateMasterBlueprintTask({
     updateLiveProgress('outline', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] 规划 L1 全书总纲 + ${volumeCount} 卷路线图 + 初始核心人物与伏笔${worldInfoContext ? '（已贯通酒馆世界书）' : ''}...`,
+        text: `使用 [${caller.modelLabel}] 规划 L1 全书总纲 + ${volumeCount} 卷路线图 + 初始核心人物与伏笔${worldInfoContext ? '（已贯通酒馆世界书）' : ''}...`,
     });
 
     try {
@@ -2189,18 +2189,18 @@ async function runGenerateMasterBlueprintTask({
             );
         }
 
-        const msgText = `✅ 已生成《${res.blueprint.title || '新书'}》完整蓝图：L1 总纲 + ${res.blueprint.volumes.length} 卷路线图 + ${res.characters.length} 位核心人物 + ${res.hooks.length} 条初始伏笔！`;
+        const msgText = `已生成《${res.blueprint.title || '新书'}》完整蓝图：L1 总纲 + ${res.blueprint.volumes.length} 卷路线图 + ${res.characters.length} 位核心人物 + ${res.hooks.length} 条初始伏笔！`;
         updateLiveProgress('outline', { isRunning: false, text: msgText });
         await refreshReaderWidgets();
         await refreshSettingsStatusCard();
-        globalThis.toastr?.success?.(msgText.replace(/^✅\s*/, ''), '小说续写阅读器');
+        globalThis.toastr?.success?.(msgText, '小说续写阅读器');
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('outline', { isRunning: false, isError: false, text: '⏹ 全书总纲生成已手动停止。' });
+            updateLiveProgress('outline', { isRunning: false, isError: false, text: '全书总纲生成已手动停止。' });
             await refreshReaderWidgets();
             return;
         }
-        updateLiveProgress('outline', { isRunning: false, isError: true, text: `❌ 生成全书总纲失败：${error?.message || error}` });
+        updateLiveProgress('outline', { isRunning: false, isError: true, text: `生成全书总纲失败：${error?.message || error}` });
         globalThis.toastr?.error?.(`生成全书总纲失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
         endBackgroundTaskController('outline', ctrl);
@@ -2236,7 +2236,7 @@ async function runGenerateVolumeRecapTask(volumeId) {
     updateLiveProgress('outline', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] 为第 ${targetVol.index} 卷《${targetVol.title}》生成卷级总复盘与 L2 卷纲偏离校准...`,
+        text: `使用 [${caller.modelLabel}] 为第 ${targetVol.index} 卷《${targetVol.title}》生成卷级总复盘与 L2 卷纲偏离校准...`,
     });
 
     try {
@@ -2274,17 +2274,17 @@ async function runGenerateVolumeRecapTask(volumeId) {
 
         updateLiveProgress('outline', {
             isRunning: false,
-            text: `✅ 第 ${targetVol.index} 卷《${targetVol.title}》复盘完成（覆盖 ${res.coveredChapters} 章 · 已回收 ${res.resolvedHooks.length} 条伏笔），已自动沉淀至后续卷纲与续写上下文！`,
+            text: `第 ${targetVol.index} 卷《${targetVol.title}》复盘完成（覆盖 ${res.coveredChapters} 章 · 已回收 ${res.resolvedHooks.length} 条伏笔），已自动沉淀至后续卷纲与续写上下文！`,
         });
         await refreshReaderWidgets();
         globalThis.toastr?.success?.(`第 ${targetVol.index} 卷复盘与偏离校准已完成！`, '小说续写阅读器');
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('outline', { isRunning: false, isError: false, text: '⏹ 卷末复盘已手动停止。' });
+            updateLiveProgress('outline', { isRunning: false, isError: false, text: '卷末复盘已手动停止。' });
             await refreshReaderWidgets();
             return;
         }
-        updateLiveProgress('outline', { isRunning: false, isError: true, text: `❌ 卷末复盘失败：${error?.message || error}` });
+        updateLiveProgress('outline', { isRunning: false, isError: true, text: `卷末复盘失败：${error?.message || error}` });
         globalThis.toastr?.error?.(`卷末复盘失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
         endBackgroundTaskController('outline', ctrl);
@@ -2329,7 +2329,7 @@ async function runGenerateDirectorOutlineTask({
     updateLiveProgress('outline', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡${worldInfoContext ? '与酒馆世界书' : ''}策划连续 ${count} 章原味分镜大纲...`,
+        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡${worldInfoContext ? '与酒馆世界书' : ''}策划连续 ${count} 章原味分镜大纲...`,
     });
 
     try {
@@ -2364,20 +2364,20 @@ async function runGenerateDirectorOutlineTask({
             : `第 ${res.targetChapterIndex} 章`;
         updateLiveProgress('outline', {
             isRunning: false,
-            text: `✅ ${rangeLabel}原味导演大纲已生成！可逐章微调后直接点「📋 填入此章」或「🚀 续写此章」。`,
+            text: `${rangeLabel}分章大纲已生成，可微调后直接点「填入」或「开写此章」。`,
         });
         await refreshReaderWidgets();
         globalThis.toastr?.success?.(`${rangeLabel}原味导演大纲已就绪！`, '小说续写阅读器');
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('outline', { isRunning: false, isError: false, text: '⏹ 大纲生成已手动停止（原已保存大纲未改动）。' });
+            updateLiveProgress('outline', { isRunning: false, isError: false, text: '大纲生成已手动停止（原已保存大纲未改动）。' });
             await refreshReaderWidgets();
             return;
         }
         updateLiveProgress('outline', {
             isRunning: false,
             isError: true,
-            text: `❌ 生成大纲失败：${error?.message || error}`,
+            text: `生成大纲失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`生成导演大纲失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -2472,9 +2472,9 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
-            text: `🛡️ 已拦截第 ${chapterIndex || '?'} 章重塑：${draftCheck.reason}`,
+            text: `已拦截第 ${chapterIndex || '?'} 章重塑：${draftCheck.reason}`,
         });
-        globalThis.toastr?.warning?.(`🛡️ ${draftCheck.reason}`, '小说续写阅读器');
+        globalThis.toastr?.warning?.(`${draftCheck.reason}`, '小说续写阅读器');
         return;
     }
 
@@ -2487,7 +2487,7 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
-            text: `⚠️ 无法启动深度重塑：${err?.message || err}`,
+            text: `无法启动深度重塑：${err?.message || err}`,
         });
         globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
         return;
@@ -2498,12 +2498,12 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
     const beforeScan = scanStoryCliches(rawOriginal, settings.clicheBlacklist);
     const hadGameWrapper = /<game>[\s\S]*<\/game>/i.test(rawOriginal);
     const origSwipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
-    const modeTag = triggerSource === 'auto' ? '⚡ 自动深度重塑' : '🔥 深度诊断重塑';
+    const modeTag = triggerSource === 'auto' ? '自动深度重塑' : '深度诊断重塑';
 
     updateLiveProgress('cliche', {
         isRunning: true,
         isError: false,
-        text: `⏳ ${modeTag}启动：正在使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 对第 ${chapterIndex || '?'} 章（初稿 ${draftCheck.charCount} 字）执行 5 项病灶诊断与推翻重写...`,
+        text: `${modeTag}启动：正在使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 对第 ${chapterIndex || '?'} 章（初稿 ${draftCheck.charCount} 字）执行 5 项病灶诊断与推翻重写...`,
     });
     if (triggerSource === 'auto') {
         globalThis.toastr?.info?.(
@@ -2621,7 +2621,7 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         await context.saveChat?.();
         updateLiveProgress('cliche', {
             isRunning: false,
-            text: `✅ ${modeTag}完成（${caller.modelLabel}）：字数 ${draftCheck.charCount} → ${afterChars} 字 · 八股 ${beforeScan.totalHits} → ${afterScan.totalHits} 处（初稿已保留为上一页 Swipe，可随时左右滑动对比，下方可展开完整 5 项诊断报告）。`,
+            text: `${modeTag}完成（${caller.modelLabel}）：字数 ${draftCheck.charCount} → ${afterChars} 字 · 八股 ${beforeScan.totalHits} → ${afterScan.totalHits} 处（初稿已保留为上一页 Swipe，可随时左右滑动对比，下方可展开完整 5 项诊断报告）。`,
         });
         await refreshReaderWidgets();
         globalThis.toastr?.success?.(
@@ -2641,14 +2641,14 @@ async function runDeepRewriteLatestTask({ targetMsgRef = null, triggerSource = '
         }
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('cliche', { isRunning: false, isError: false, text: `⏹ ${modeTag}已手动停止（原初稿已安全保留）。` });
+            updateLiveProgress('cliche', { isRunning: false, isError: false, text: `${modeTag}已手动停止（原初稿已安全保留）。` });
             await refreshReaderWidgets();
             return;
         }
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
-            text: `❌ ${modeTag}未覆盖原稿：${error?.message || error}`,
+            text: `${modeTag}未覆盖原稿：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`深度重塑失败（原初稿已保留）：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -2674,9 +2674,9 @@ async function runSurgicalDeclicheLatestTask() {
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
-            text: `🛡️ 已拦截局部精修：${draftCheck.reason}`,
+            text: `已拦截局部精修：${draftCheck.reason}`,
         });
-        globalThis.toastr?.warning?.(`🛡️ ${draftCheck.reason}`, '小说续写阅读器');
+        globalThis.toastr?.warning?.(`${draftCheck.reason}`, '小说续写阅读器');
         return;
     }
 
@@ -2701,7 +2701,7 @@ async function runSurgicalDeclicheLatestTask() {
     updateLiveProgress('cliche', {
         isRunning: true,
         isError: false,
-        text: `⏳ 使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 对第 ${status.chapterIndex} 章执行局部去八股精修（原稿将自动保留为上一个分支）...`,
+        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 对第 ${status.chapterIndex} 章执行局部去八股精修（原稿将自动保留为上一个分支）...`,
     });
 
     try {
@@ -2742,7 +2742,7 @@ async function runSurgicalDeclicheLatestTask() {
         await context.saveChat?.();
         updateLiveProgress('cliche', {
             isRunning: false,
-            text: `✅ 局部去八股完成！八股命中数由 ${status.report?.totalHits ?? 0} 处降至 ${afterScan.totalHits} 处（原稿已自动保留在上一条 Swipe 分支，可随时左右切换）。`,
+            text: `局部去八股完成！八股命中数由 ${status.report?.totalHits ?? 0} 处降至 ${afterScan.totalHits} 处（原稿已自动保留在上一条 Swipe 分支，可随时左右切换）。`,
         });
         await refreshReaderWidgets();
         globalThis.toastr?.success?.(
@@ -2751,14 +2751,14 @@ async function runSurgicalDeclicheLatestTask() {
         );
     } catch (error) {
         if (isAbortError(error) || ctrl.signal.aborted) {
-            updateLiveProgress('cliche', { isRunning: false, isError: false, text: '⏹ 局部去八股精修已手动停止（原稿已保留）。' });
+            updateLiveProgress('cliche', { isRunning: false, isError: false, text: '局部去八股精修已手动停止（原稿已保留）。' });
             await refreshReaderWidgets();
             return;
         }
         updateLiveProgress('cliche', {
             isRunning: false,
             isError: true,
-            text: `❌ 精修失败：${error?.message || error}`,
+            text: `精修失败：${error?.message || error}`,
         });
         globalThis.toastr?.error?.(`局部去八股精修失败：${error?.message || error}`, '小说续写阅读器');
     } finally {
@@ -3015,26 +3015,26 @@ function mountSettingsPanel() {
     wrapper.className = 'inline-drawer';
     wrapper.innerHTML = `
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>📖 小说续写与创作工作台 (v1.7)</b>
+            <b>小说创作与续写工作台 (v1.8)</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content tt-novel-settings-body">
             <div id="tt-novel-status-card" class="tt-novel-status-card">正在读取当前对话状态...</div>
             <div class="tt-novel-action-bar">
-                <button type="button" id="tt-novel-open-workbench" class="menu_button tt-novel-btn-primary">
-                    ✨ 打开小说工作台
+                <button type="button" id="tt-novel-open-workbench" class="menu_button tt-novel-btn-sm tt-novel-btn-primary">
+                    打开工作台
                 </button>
-                <button type="button" id="tt-novel-quick-new-book" class="menu_button">
-                    🆕 新书立项 / 总纲
+                <button type="button" id="tt-novel-quick-new-book" class="menu_button tt-novel-btn-sm">
+                    新书立项
                 </button>
-                <label class="menu_button tt-novel-file-label">
-                    <i class="fa-solid fa-file-import"></i> 快速导入原著
+                <label class="menu_button tt-novel-btn-sm tt-novel-file-label">
+                    <i class="fa-solid fa-file-import"></i> 导入原著
                     <input type="file" id="tt-novel-quick-import" accept=".txt,.md,text/plain,text/markdown,*/*" hidden />
                 </label>
             </div>
             <label class="checkbox_label">
                 <input type="checkbox" id="tt-novel-chk-enabled-entry" ${settings.enabled ? 'checked' : ''} />
-                <span>启用小说续写插件（关闭时彻底还原普通酒馆聊天）</span>
+                <span>启用小说插件（关闭时还原普通聊天）</span>
             </label>
         </div>
     `;
@@ -3042,10 +3042,10 @@ function mountSettingsPanel() {
     container.appendChild(wrapper);
 
     wrapper.querySelector('#tt-novel-open-workbench')?.addEventListener('click', () => {
-        void openWorkbench('memory');
+        void openWorkbench('create');
     });
     wrapper.querySelector('#tt-novel-quick-new-book')?.addEventListener('click', () => {
-        void openWorkbench('outline');
+        void openWorkbench('blueprint');
     });
     wrapper.querySelector('#tt-novel-quick-import')?.addEventListener('change', async (e) => {
         const file = e.target.files?.[0];
@@ -3069,18 +3069,18 @@ async function refreshSettingsStatusCard() {
     const sp = ledger?.styleProfile;
     const bp = ledger?.storyBlueprint;
     const novelLine = novelData
-        ? `📚 <b>原著</b>：《${escapeHtml(novelData.title)}》（${novelData.totalChapters}章 · 锚点 #${novelData.cutoffChapterIndex}）`
+        ? `<b>原著</b>：《${escapeHtml(novelData.title)}》（${novelData.totalChapters}章 · 锚点 #${novelData.cutoffChapterIndex}）`
         : (hasStoryBlueprint(bp)
-            ? `✍️ <b>作品</b>：《${escapeHtml(bp.title || '新书立项')}》（${bp.creationMode === 'fanfic_new' ? '同人新开坑' : '原创世界观'} · ${bp.volumes?.length || 0}卷蓝图）`
-            : '📚 <b>作品</b>：尚未导入原著或立项新书');
+            ? `<b>作品</b>：《${escapeHtml(bp.title || '新书立项')}》（${bp.creationMode === 'fanfic_new' ? '同人新开坑' : '原创世界观'} · ${bp.volumes?.length || 0}卷蓝图）`
+            : '<b>作品</b>：尚未导入原著或立项新书');
     const scoreChain = Array.isArray(sp?.roundHistory) && sp.roundHistory.length > 0
         ? ` · ${sp.roundHistory.map(r => `R${r.round} ${r.score ?? '?'}分`).join('→')}`
         : '';
     const styleLine = sp?.styleCard
-        ? `🎨 <b>文风骨相</b>：${String(sp.styleCard).length}字${escapeHtml(scoreChain)}`
-        : '🎨 <b>文风骨相</b>：未蒸馏';
-    const memLine = `🧠 <b>归档记忆</b>：${ledger.characters.length}人物 · ${ledger.chronicle.length}编年史 · ${openHooksCount}待填伏笔 · ${canonDb.items.length}补充设定`;
-    const presetLine = `🎛️ <b>模型/预设</b>：<code>${escapeHtml(meta.activeModel)}</code> · <code>${escapeHtml(meta.presetLabel)}</code>`;
+        ? `<b>文风</b>：${String(sp.styleCard).length}字${escapeHtml(scoreChain)}`
+        : '<b>文风</b>：未生成';
+    const memLine = `<b>设定</b>：${ledger.characters.length} 人物 · ${ledger.chronicle.length} 编年史 · ${openHooksCount} 伏笔 · ${canonDb.items.length} 补充设定`;
+    const presetLine = `<b>通道</b>：<code>${escapeHtml(meta.activeModel)}</code> · <code>${escapeHtml(meta.presetLabel)}</code>`;
 
     card.innerHTML = `<div>${novelLine}</div><div>${styleLine}</div><div>${memLine}</div><div>${presetLine}</div>`;
 }

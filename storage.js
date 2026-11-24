@@ -73,6 +73,89 @@ export function normalizeTimelineRole(role) {
     return (role === 'reference' || role === 'flashback' || role === 'skip') ? role : 'main';
 }
 
+export const DEFAULT_STORY_BLUEPRINT = Object.freeze({
+    creationMode: 'continuation', // 'continuation' | 'original' | 'fanfic_new'
+    title: '',
+    genreAndTone: '',
+    seedNotes: '',
+    premise: '',
+    worldRules: '',
+    endingDirection: '',
+    volumes: [],
+    updatedAt: 0,
+});
+
+export function normalizeStoryVolume(raw, fallbackIndex = 1) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const index = Number.isFinite(Number(src.index)) && Number(src.index) >= 1
+        ? Math.floor(Number(src.index))
+        : Math.max(1, fallbackIndex);
+    const chapterRange = String(src.chapterRange || '').trim();
+    const nums = [...chapterRange.matchAll(/\d+/g)].map(m => Number(m[0])).filter(n => n > 0);
+    const startChapter = Number.isFinite(Number(src.startChapter)) && Number(src.startChapter) >= 1
+        ? Math.floor(Number(src.startChapter))
+        : (nums[0] || ((index - 1) * 15 + 1));
+    const endChapter = Number.isFinite(Number(src.endChapter)) && Number(src.endChapter) >= startChapter
+        ? Math.floor(Number(src.endChapter))
+        : (nums[nums.length - 1] >= startChapter ? nums[nums.length - 1] : startChapter + 14);
+    const status = ['planned', 'active', 'completed'].includes(src.status) ? src.status : 'planned';
+    return {
+        id: String(src.id || `vol_${index}_${Date.now().toString(36)}`).trim(),
+        index,
+        title: String(src.title || `第 ${index} 卷`).trim() || `第 ${index} 卷`,
+        chapterRange: chapterRange || `第 ${startChapter}~${endChapter} 章`,
+        startChapter,
+        endChapter,
+        goal: String(src.goal || '').trim(),
+        keyTurns: String(src.keyTurns || '').trim(),
+        endingHook: String(src.endingHook || '').trim(),
+        status,
+        recap: String(src.recap || '').trim(),
+        recapCheck: String(src.recapCheck || '').trim(),
+        recapUpdatedAt: Number(src.recapUpdatedAt || 0),
+    };
+}
+
+export function normalizeStoryBlueprint(raw = null) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const creationMode = ['continuation', 'original', 'fanfic_new'].includes(src.creationMode)
+        ? src.creationMode
+        : 'continuation';
+    const volumes = Array.isArray(src.volumes)
+        ? src.volumes.map((v, i) => normalizeStoryVolume(v, i + 1))
+        : [];
+    return {
+        creationMode,
+        title: String(src.title || '').trim(),
+        genreAndTone: String(src.genreAndTone || '').trim(),
+        seedNotes: String(src.seedNotes || '').trim(),
+        premise: String(src.premise || '').trim(),
+        worldRules: String(src.worldRules || '').trim(),
+        endingDirection: String(src.endingDirection || '').trim(),
+        volumes,
+        updatedAt: Number(src.updatedAt || 0),
+    };
+}
+
+export function hasStoryBlueprint(blueprint) {
+    if (!blueprint || typeof blueprint !== 'object') return false;
+    return Boolean(
+        String(blueprint.title || '').trim()
+        || String(blueprint.premise || '').trim()
+        || String(blueprint.seedNotes || '').trim()
+        || String(blueprint.worldRules || '').trim()
+        || (Array.isArray(blueprint.volumes) && blueprint.volumes.length > 0),
+    );
+}
+
+export function resolveBookTitle(novelData, ledger) {
+    const fromNovel = String(novelData?.title || '').trim();
+    if (fromNovel) return fromNovel;
+    const fromBlueprint = String(ledger?.storyBlueprint?.title || '').trim();
+    if (fromBlueprint) return fromBlueprint;
+    return '当前长篇小说';
+}
+
 export function reindexNovelChapters(novelData) {
     if (!novelData || !Array.isArray(novelData.chapters)) return novelData;
     const prevCutoff = Number(novelData.cutoffChapterIndex || novelData.chapters.length || 0);
@@ -115,6 +198,7 @@ export function createEmptyLedger() {
         hooks: [],
         styleProfile: null,
         narrativeConfig: normalizeNarrativeConfig(),
+        storyBlueprint: normalizeStoryBlueprint(),
         refCursorBase: null,
         refCursorHistory: {},
         lastArchivedChapter: 0,
@@ -345,6 +429,7 @@ export async function loadLedger() {
         hooks: Array.isArray(raw.hooks) ? raw.hooks : [],
         styleProfile: raw.styleProfile && typeof raw.styleProfile === 'object' ? raw.styleProfile : null,
         narrativeConfig: normalizeNarrativeConfig(raw.narrativeConfig),
+        storyBlueprint: normalizeStoryBlueprint(raw.storyBlueprint),
         refCursorBase: Number.isFinite(Number(raw.refCursorBase)) ? Number(raw.refCursorBase) : null,
         refCursorHistory: raw.refCursorHistory && typeof raw.refCursorHistory === 'object' ? raw.refCursorHistory : {},
         lastArchivedChapter: Number(raw.lastArchivedChapter || 0),
@@ -400,26 +485,24 @@ export async function mergeArchivedDataIntoLedger(archiveResult, { mode = 'full'
     }
 
     if (Array.isArray(archiveResult.characters) && archiveResult.characters.length > 0) {
-        if (isFull) {
-            ledger.characters = archiveResult.characters;
-        } else {
-            const byName = new Map(ledger.characters.map(c => [String(c.name || '').toLowerCase(), c]));
-            for (const ch of archiveResult.characters) {
-                const key = String(ch.name || '').toLowerCase();
-                const prev = byName.get(key);
-                byName.set(key, prev ? {
-                    ...prev,
-                    role: ch.role || prev.role,
-                    canonFoundation: ch.canonFoundation || prev.canonFoundation,
-                    currentAppearance: ch.currentAppearance || prev.currentAppearance || '',
-                    currentSituation: ch.currentSituation || prev.currentSituation,
-                    voiceAndQuotes: ch.voiceAndQuotes || prev.voiceAndQuotes,
-                    oocRedLines: ch.oocRedLines || prev.oocRedLines,
-                    updatedChapter: ch.updatedChapter || prev.updatedChapter,
-                } : ch);
-            }
-            ledger.characters = [...byName.values()];
+        // Always merge by character name so planned/un-debuted blueprint characters & manual canonFoundation are never erased
+        const byName = new Map(ledger.characters.map(c => [String(c.name || '').trim().toLowerCase(), c]));
+        for (const ch of archiveResult.characters) {
+            const key = String(ch.name || '').trim().toLowerCase();
+            if (!key) continue;
+            const prev = byName.get(key);
+            byName.set(key, prev ? {
+                ...prev,
+                role: ch.role || prev.role,
+                canonFoundation: ch.canonFoundation || prev.canonFoundation,
+                currentAppearance: ch.currentAppearance || prev.currentAppearance || '',
+                currentSituation: ch.currentSituation || prev.currentSituation,
+                voiceAndQuotes: ch.voiceAndQuotes || prev.voiceAndQuotes,
+                oocRedLines: ch.oocRedLines || prev.oocRedLines,
+                updatedChapter: ch.updatedChapter || prev.updatedChapter,
+            } : ch);
         }
+        ledger.characters = [...byName.values()];
     }
 
     if (Array.isArray(archiveResult.worldStates) && archiveResult.worldStates.length > 0) {

@@ -1160,3 +1160,85 @@ export async function compressAndDeoverfitStyleCard({ novelTitle, styleCard, fin
     }
     return compressed;
 }
+
+/**
+ * Generates an actionable Style DNA Profile for original / fresh-fanfic creation from EITHER
+ * a brief target-style description, a pasted reference prose sample (extracting pure craft
+ * with zero plot leakage + real 0-API local statistical fingerprint), or BOTH.
+ */
+export async function generateCustomStyleCard({
+    novelTitle = '当前原创小说',
+    genreAndTone = '',
+    styleBrief = '',
+    referenceSample = '',
+    callModel,
+    signal = null,
+}) {
+    throwIfAborted(signal);
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+    const brief = String(styleBrief || '').trim();
+    const sample = String(referenceSample || '').trim();
+    if (!brief && sample.length < 120) {
+        throw new Error('请填写目标文风描述，或粘贴至少 120 字的参考范文');
+    }
+
+    let fingerprint = null;
+    let fingerprintText = '';
+    if (sample.length >= 120) {
+        fingerprint = computeLocalStyleFingerprint([{ index: 1, title: '参考范文', content: sample }], 1);
+        fingerprintText = formatFingerprintText(fingerprint);
+    }
+
+    const systemPrompt = [
+        '你是顶尖文学编辑与法医级文风分析师，负责为长篇小说创作定制一份【可直接执行、零空洞形容词、绝不泄露参考范文剧情】的《文风骨相 DNA 执行卡》。',
+        '严禁输出“文笔细腻、描写生动、节奏紧凑”等废话，必须给出可量化的段长/句长节奏、叙事视角呼吸、对话习惯、感官白描法则与具体反 AI 味替换例句。',
+    ].join('\n');
+
+    const promptParts = [
+        `请为《${novelTitle}》定制一份 **1,600 ~ 2,400 字** 的实战《文风骨相 DNA 执行卡》：`,
+        genreAndTone ? `【题材与基调】：${genreAndTone}` : '',
+        brief ? `【作者指定的目标文风要求（最高优先级）】：\n${brief}` : '',
+        fingerprintText ? `\n【参考范文的本地客观统计指纹（硬指标）】：\n${fingerprintText}` : '',
+        sample ? `\n【参考范文原文（仅学习其笔触、断句、对话节奏与叙事质感，严禁把范文里的具体角色名、地名或情节抄进文风卡！）】：\n${sample.slice(0, 6500)}` : '',
+        '',
+        '严格按以下两个 XML 标签输出（直接输出尖括号标签不要加反引号）：',
+        '- `<style_dna>` …… `</style_dna>`：分五大模块输出（一、段落骨相与句长/标点硬指标；二、叙事视角、心理克制度与内心独白语态；三、对话密度、台词节奏与微动作法则；四、环境/感官白描方法与节奏留白；五、6~10 组去剧情化的反 AI 味短句对照：“❌ AI常见通病 → ✅ 本作笔法”）',
+        sample
+            ? '- `<excerpts>` …… `</excerpts>`：从参考范文中摘录 2~3 段最体现语感节奏的短片段（每段 150~260 字，仅供模仿节奏语感）'
+            : '- `<excerpts>` …… `</excerpts>`：写 2 段共约 300~450 字的通用示范片段（展示上述文风卡落地后的段长、断句与对话质感，不涉及具体剧情剧透）',
+    ].filter(Boolean);
+
+    const raw = await callModel({
+        stage: 'custom_style_card_generate',
+        systemPrompt,
+        prompt: promptParts.join('\n'),
+    });
+    throwIfAborted(signal);
+
+    const styleCard = extractTaggedSection(raw, 'style_dna');
+    const excerptsRaw = cleanDistillProse(raw).match(/<excerpts>([\s\S]*?)<\/excerpts>/i)?.[1]?.trim() || '';
+    if (!styleCard || styleCard.length < 180) {
+        throw new Error('生成的定制文风卡过短或解析失败，请检查模型/预设后重试');
+    }
+
+    const now = Date.now();
+    return {
+        title: novelTitle,
+        fingerprint,
+        fingerprintText,
+        styleCard,
+        goldenExcerpts: excerptsRaw,
+        roundHistory: [],
+        latestScore: null,
+        distilledAt: now,
+        processLog: [{
+            id: `custom_style_${now}`,
+            type: 'stage',
+            title: sample ? '✨ 原创定制文风卡（参考范文提纯 + 目标定制）' : '✨ 原创定制文风卡（目标风格生成）',
+            summary: `生成 ${styleCard.length} 字实战文风卡${fingerprint ? `（参考范文统计 ${fingerprint.totalChars} 字，均段 ${fingerprint.avgParagraphChars} 字）` : ''}。`,
+            detail: styleCard,
+        }],
+    };
+}

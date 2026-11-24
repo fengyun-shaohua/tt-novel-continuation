@@ -27,7 +27,11 @@ import {
     parseSupplementaryDatabase,
     stripNonStoryBlocks,
 } from './parser.js';
-import { generateDirectorOutline, resolveLatestChapterAnchor } from './outline-director.js';
+import {
+    generateDirectorOutline,
+    generateMasterBlueprint,
+    resolveLatestChapterAnchor,
+} from './outline-director.js';
 import {
     applyReaderBodyClasses,
     clearReadingProgress,
@@ -45,14 +49,17 @@ import {
     clearNovelData,
     createEmptyCanonDb,
     createEmptyLedger,
+    hasStoryBlueprint,
     loadCanonDb,
     loadLedger,
     loadNovelData,
     mergeArchivedDataIntoLedger,
     normalizeNarrativeConfig,
+    normalizeStoryBlueprint,
     normalizeTimelineRole,
     pruneLedgerAfterChapter,
     reindexNovelChapters,
+    resolveBookTitle,
     saveCanonDb,
     saveLedger,
     saveNovelData,
@@ -60,8 +67,10 @@ import {
 } from './storage.js';
 import {
     detectNovelNarrativeStructure,
+    generateVolumeRecapAndAudit,
     rerunArchiveBatches,
     runStoryAndCharacterArchivePipeline,
+    summarizeMissingChaptersBatch,
     summarizeSingleChapterState,
     synthesizeArchiveFromBatches,
 } from './story-archiver.js';
@@ -69,6 +78,7 @@ import {
     buildDistillationPresetMessages,
     compressAndDeoverfitStyleCard,
     createAbortError,
+    generateCustomStyleCard,
     isAbortError,
     runStyleDistillationPipeline,
     throwIfAborted,
@@ -262,6 +272,17 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
     }
 };
 
+function isNovelProjectActive(novelData, ledger) {
+    return Boolean(
+        novelData?.chapters?.length
+        || hasStoryBlueprint(ledger?.storyBlueprint)
+        || ledger?.characters?.length
+        || ledger?.chronicle?.length
+        || ledger?.summaries?.length
+        || ledger?.styleProfile?.styleCard,
+    );
+}
+
 function scheduleFoldPrecedingUserOutlineFloor(msgRef) {
     setTimeout(async () => {
         const settings = getSettings();
@@ -278,8 +299,8 @@ function scheduleFoldPrecedingUserOutlineFloor(msgRef) {
         const prevMsg = chat[currentIdx - 1];
         if (!prevMsg?.is_user) return;
 
-        const novelData = await loadNovelData();
-        if (!novelData?.chapters?.length) return;
+        const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+        if (!isNovelProjectActive(novelData, ledger)) return;
 
         msgRef.extra = msgRef.extra || {};
         if (typeof prevMsg.mes === 'string' && prevMsg.mes.trim()) {
@@ -367,7 +388,7 @@ async function runFallbackSingleChapterSummary(msgRef, chapterIndex) {
         const chapterTitle = firstLine.replace(/^#+\s*/, '').slice(0, 40);
 
         const extracted = await summarizeSingleChapterState({
-            novelTitle: novelData?.title || '当前小说',
+            novelTitle: resolveBookTitle(novelData, ledger),
             chapterIndex,
             chapterTitle,
             chapterText: pureStoryText,
@@ -418,8 +439,9 @@ async function onMessageReceived(messageId, type) {
         || Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData, true, excludeFlashback));
     msg.extra.novelChapterIndex = chapterIndex;
 
+    const projectActive = isNovelProjectActive(novelData, ledgerForIndex);
     const shouldFoldUserOutline = Boolean(
-        novelData?.chapters?.length
+        projectActive
         && settings.authorMode !== false
         && settings.foldUserOutlineFloors !== false
         && type !== 'continue',
@@ -471,7 +493,7 @@ async function onMessageReceived(messageId, type) {
 
     // Optional Auto Deep Diagnosis & Rewrite (strictly gated by empty/refusal validation + re-entry lock)
     let scheduledAutoRewrite = false;
-    if (settings.autoDeepRewrite && novelData?.chapters?.length && type !== 'continue') {
+    if (settings.autoDeepRewrite && projectActive && type !== 'continue') {
         const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
         const doneMap = msg.extra.novelDeepRewrittenSwipes || {};
         if (!doneMap[swipeId] && !deepRewriteInFlight) {
@@ -498,7 +520,7 @@ async function onMessageReceived(messageId, type) {
         && !extracted.hasState
         && settings.enableAutoStateBlock
         && settings.autoFallbackChapterSummary
-        && novelData?.chapters?.length
+        && projectActive
         && type !== 'continue'
     ) {
         const draftCheck = validateDraftForRewrite(msg.mes);
@@ -1379,6 +1401,7 @@ function collectContinuedChaptersFromChat(novelData) {
         const firstLine = cleanBody.split('\n').map(l => l.trim()).find(Boolean) || `续写第 ${chIdx} 章`;
         list.push({
             index: chIdx,
+            floorIndex: idx,
             title: firstLine.replace(/^#+\s*/, '').slice(0, 40),
             content: cleanBody,
             authorOutline: String(m.extra?.novelAuthorOutline || '').trim(),
@@ -1518,7 +1541,7 @@ async function runStoryArchiveTask(mode = 'full') {
     const novelData = await loadNovelData();
     const continuedChapters = collectContinuedChaptersFromChat(novelData);
     if (!novelData?.chapters?.length && continuedChapters.length === 0) {
-        globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件', '小说续写阅读器');
+        globalThis.toastr?.warning?.('请先导入原著小说，或先写出至少 1 章原创/续写正文后再归档', '小说续写阅读器');
         return;
     }
 
@@ -1533,6 +1556,7 @@ async function runStoryArchiveTask(mode = 'full') {
     }
 
     const existingLedger = await loadLedger();
+    const bookTitle = resolveBookTitle(novelData, existingLedger);
     const worldInfoContext = await collectActivatedTavernWorldInfo({ novelData, ledger: existingLedger });
     const completedSliceBuffer = new Map(
         (mode === 'incremental' ? (existingLedger.archiveBatches || []) : []).map(b => [b.batchIndex, b]),
@@ -1567,7 +1591,7 @@ async function runStoryArchiveTask(mode = 'full') {
         }
 
         const result = await runStoryAndCharacterArchivePipeline({
-            novelData: novelData || { title: '当前小说', cutoffChapterIndex: 0, totalChapters: 0, chapters: [] },
+            novelData: novelData || { title: bookTitle, cutoffChapterIndex: 0, totalChapters: 0, chapters: [] },
             continuedChapters,
             existingLedger,
             narrativeConfig: existingLedger.narrativeConfig,
@@ -1781,14 +1805,112 @@ async function runResynthArchiveTask() {
     }
 }
 
-async function runStyleDistillTask({ incremental = false, evaluateOnly = false } = {}) {
-    const novelData = await loadNovelData();
-    if (!novelData?.chapters?.length) {
-        globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件', '小说续写阅读器');
+async function runBackfillMissingChapterSummariesTask() {
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    if (continuedChapters.length === 0) {
+        globalThis.toastr?.warning?.('当前聊天中还没有已写出的原创或续写章节', '小说续写阅读器');
         return;
     }
 
-    const ledger = await loadLedger();
+    const ctrl = beginBackgroundTaskController('memory');
+    let caller;
+    try {
+        caller = createPresetModelCaller({ signal: ctrl.signal });
+    } catch (err) {
+        endBackgroundTaskController('memory', ctrl);
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const bookTitle = resolveBookTitle(novelData, ledger);
+    const context = getContext();
+    const settings = getSettings();
+    updateLiveProgress('memory', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] 扫描并批量补齐缺失的单章四要素总结（并发 ≤ 2）...`,
+    });
+
+    try {
+        const res = await summarizeMissingChaptersBatch({
+            novelTitle: bookTitle,
+            chapters: continuedChapters,
+            ledger,
+            maxConcurrency: 2,
+            signal: ctrl.signal,
+            callModel: caller.callModel,
+            onChapterCompleted: async ({ chapter, extracted }) => {
+                const msg = Array.isArray(context?.chat) ? context.chat[chapter.floorIndex] : null;
+                if (msg) {
+                    const swipeId = Number.isFinite(msg.swipe_id) ? msg.swipe_id : 0;
+                    await persistExtractedChapterState({
+                        msg,
+                        floorIndex: chapter.floorIndex,
+                        swipeId,
+                        extracted,
+                        chapterIndex: chapter.index,
+                        novelData: novelData || { title: bookTitle },
+                        settings,
+                    });
+                } else {
+                    await applyExtractedStateToLedger(extracted, chapter.index, chapter.title, chapter.floorIndex ?? null);
+                }
+            },
+            onProgress: ({ step, totalSteps, label }) => {
+                if (ctrl.signal.aborted) return;
+                updateLiveProgress('memory', {
+                    isRunning: true,
+                    text: `⏳ [${caller.modelLabel}] [${step}/${totalSteps}] ${label}`,
+                });
+            },
+        });
+
+        await context?.saveChat?.();
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+
+        if (res.summarizedCount === 0 && res.failedCount === 0) {
+            updateLiveProgress('memory', {
+                isRunning: false,
+                text: '✅ 所有已写章节均已有单章精要总结，无需补齐！',
+            });
+            globalThis.toastr?.info?.('所有已写章节均已有单章总结，无需补齐', '小说续写阅读器');
+        } else {
+            const msgText = `✅ 批量补总结完成：成功补齐 ${res.summarizedCount} 章${res.failedCount > 0 ? `，跳过/失败 ${res.failedCount} 章` : ''}${res.skippedCount > 0 ? `（已拦截 ${res.skippedCount} 条空回/过短楼层）` : ''}！`;
+            updateLiveProgress('memory', { isRunning: false, isError: res.summarizedCount === 0 && res.failedCount > 0, text: msgText });
+            globalThis.toastr?.success?.(msgText.replace(/^✅\s*/, ''), '小说续写阅读器');
+        }
+    } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 批量补单章总结已手动停止（已补完的章节总结已自动保存）。' });
+            await refreshReaderWidgets();
+            return;
+        }
+        updateLiveProgress('memory', { isRunning: false, isError: true, text: `❌ 批量补单章总结失败：${error?.message || error}` });
+        globalThis.toastr?.error?.(`批量补总结失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('memory', ctrl);
+    }
+}
+
+async function runStyleDistillTask({ incremental = false, evaluateOnly = false } = {}) {
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    const effectiveNovelData = novelData?.chapters?.length
+        ? novelData
+        : (continuedChapters.length >= 2
+            ? {
+                title: resolveBookTitle(novelData, ledger),
+                cutoffChapterIndex: continuedChapters.length,
+                totalChapters: continuedChapters.length,
+                chapters: continuedChapters,
+            }
+            : null);
+    if (!effectiveNovelData) {
+        globalThis.toastr?.warning?.('请先导入原著小说、先创作至少 2 章正文，或在下方用「原创定制文风卡」粘贴参考范文/输入目标风格', '小说续写阅读器');
+        return;
+    }
     if ((incremental || evaluateOnly) && !ledger?.styleProfile?.styleCard) {
         globalThis.toastr?.warning?.('请先执行一次完整文风蒸馏，再进行盲测精炼或纯跑分验收', '小说续写阅读器');
         return;
@@ -1818,7 +1940,7 @@ async function runStyleDistillTask({ incremental = false, evaluateOnly = false }
 
     try {
         const styleProfile = await runStyleDistillationPipeline({
-            novelData,
+            novelData: effectiveNovelData,
             maxConcurrency: 2,
             rounds,
             existingProfile: (incremental || evaluateOnly) ? ledger.styleProfile : null,
@@ -1939,6 +2061,236 @@ async function runCompressStyleCardTask() {
     }
 }
 
+async function runGenerateCustomStyleCardTask({ styleBrief = '', referenceSample = '' } = {}) {
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+    const ctrl = beginBackgroundTaskController('style');
+    let caller;
+    try {
+        caller = createPresetModelCaller({ signal: ctrl.signal });
+    } catch (err) {
+        endBackgroundTaskController('style', ctrl);
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const bookTitle = resolveBookTitle(novelData, ledger);
+    updateLiveProgress('style', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] 生成《${bookTitle}》原创定制文风骨相 DNA 执行卡...`,
+    });
+
+    try {
+        const profile = await generateCustomStyleCard({
+            novelTitle: bookTitle,
+            genreAndTone: ledger?.storyBlueprint?.genreAndTone || '',
+            styleBrief,
+            referenceSample,
+            signal: ctrl.signal,
+            callModel: caller.callModel,
+        });
+        ledger.styleProfile = profile;
+        await saveLedger(ledger);
+        updateLiveProgress('style', {
+            isRunning: false,
+            text: `✅ 原创定制文风卡已生成（${profile.styleCard.length} 字），后续创作每章自动生效！`,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(`定制文风卡已生成（${profile.styleCard.length} 字）！`, '小说续写阅读器');
+    } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('style', { isRunning: false, isError: false, text: '⏹ 定制文风卡生成已手动停止。' });
+            await refreshReaderWidgets();
+            return;
+        }
+        updateLiveProgress('style', { isRunning: false, isError: true, text: `❌ 生成定制文风卡失败：${error?.message || error}` });
+        globalThis.toastr?.error?.(`生成定制文风卡失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('style', ctrl);
+    }
+}
+
+async function handleSaveStoryBlueprint(blueprintPatch) {
+    const ledger = await loadLedger();
+    ledger.storyBlueprint = normalizeStoryBlueprint({
+        ...(ledger.storyBlueprint || {}),
+        ...(blueprintPatch || {}),
+        updatedAt: Date.now(),
+    });
+    await saveLedger(ledger);
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+}
+
+async function runGenerateMasterBlueprintTask({
+    title = '',
+    creationMode = 'original',
+    genreAndTone = '',
+    seedNotes = '',
+    volumeCount = 4,
+    chaptersPerVolume = 15,
+} = {}) {
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    const excludeFlashback = ledger?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
+    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback });
+
+    const ctrl = beginBackgroundTaskController('outline');
+    let caller;
+    try {
+        caller = createPresetModelCaller({ signal: ctrl.signal });
+    } catch (err) {
+        endBackgroundTaskController('outline', ctrl);
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const worldInfoContext = await collectActivatedTavernWorldInfo({
+        novelData,
+        ledger,
+        extraTexts: [title, genreAndTone, seedNotes],
+    });
+    updateLiveProgress('outline', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] 规划 L1 全书总纲 + ${volumeCount} 卷路线图 + 初始核心人物与伏笔${worldInfoContext ? '（已贯通酒馆世界书）' : ''}...`,
+    });
+
+    try {
+        const res = await generateMasterBlueprint({
+            title: String(title || novelData?.title || ledger?.storyBlueprint?.title || '').trim(),
+            creationMode,
+            genreAndTone,
+            seedNotes,
+            volumeCount,
+            chaptersPerVolume,
+            startChapter: anchor.nextChapterIndex,
+            narrativeConfig: ledger.narrativeConfig,
+            worldInfoContext,
+            novelData,
+            existingLedger: ledger,
+            signal: ctrl.signal,
+            callModel: caller.callModel,
+        });
+
+        const latestLedger = await loadLedger();
+        latestLedger.storyBlueprint = normalizeStoryBlueprint(res.blueprint);
+        await saveLedger(latestLedger);
+
+        if (res.characters.length > 0 || res.hooks.length > 0) {
+            await mergeArchivedDataIntoLedger(
+                {
+                    characters: res.characters,
+                    hooks: res.hooks,
+                    lastArchivedChapter: latestLedger.lastArchivedChapter || 0,
+                },
+                { mode: 'incremental' },
+            );
+        }
+
+        const msgText = `✅ 已生成《${res.blueprint.title || '新书'}》完整蓝图：L1 总纲 + ${res.blueprint.volumes.length} 卷路线图 + ${res.characters.length} 位核心人物 + ${res.hooks.length} 条初始伏笔！`;
+        updateLiveProgress('outline', { isRunning: false, text: msgText });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(msgText.replace(/^✅\s*/, ''), '小说续写阅读器');
+    } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('outline', { isRunning: false, isError: false, text: '⏹ 全书总纲生成已手动停止。' });
+            await refreshReaderWidgets();
+            return;
+        }
+        updateLiveProgress('outline', { isRunning: false, isError: true, text: `❌ 生成全书总纲失败：${error?.message || error}` });
+        globalThis.toastr?.error?.(`生成全书总纲失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('outline', ctrl);
+    }
+}
+
+async function runGenerateVolumeRecapTask(volumeId) {
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
+    const volumes = ledger?.storyBlueprint?.volumes || [];
+    const targetVol = volumes.find(v => v.id === volumeId);
+    if (!targetVol) {
+        globalThis.toastr?.warning?.('未找到指定的卷纲记录', '小说续写阅读器');
+        return;
+    }
+
+    const ctrl = beginBackgroundTaskController('outline');
+    let caller;
+    try {
+        caller = createPresetModelCaller({ signal: ctrl.signal });
+    } catch (err) {
+        endBackgroundTaskController('outline', ctrl);
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
+    const origChapters = (novelData?.chapters || []).filter(c => c && c.index >= 1 && c.index <= cutoff);
+    const allChapters = [...origChapters, ...continuedChapters].sort((a, b) => Number(a.index) - Number(b.index));
+    const bookTitle = resolveBookTitle(novelData, ledger);
+    const worldInfoContext = await collectActivatedTavernWorldInfo({ novelData, ledger });
+
+    updateLiveProgress('outline', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] 为第 ${targetVol.index} 卷《${targetVol.title}》生成卷级总复盘与 L2 卷纲偏离校准...`,
+    });
+
+    try {
+        const res = await generateVolumeRecapAndAudit({
+            novelTitle: bookTitle,
+            volume: targetVol,
+            allChapters,
+            ledger,
+            worldInfoContext,
+            signal: ctrl.signal,
+            callModel: caller.callModel,
+        });
+
+        const latestLedger = await loadLedger();
+        const volToUpdate = (latestLedger.storyBlueprint?.volumes || []).find(v => v.id === volumeId);
+        if (volToUpdate) {
+            volToUpdate.recap = res.recap;
+            volToUpdate.recapCheck = res.blueprintCheck;
+            volToUpdate.recapUpdatedAt = res.updatedAt;
+        }
+        await saveLedger(latestLedger);
+
+        if (res.resolvedHooks.length > 0 || res.carryoverHooks.length > 0) {
+            const hookUpdates = [
+                ...res.resolvedHooks.map(content => ({ action: 'resolve', content })),
+                ...res.carryoverHooks.map(content => ({ action: 'add', content })),
+            ];
+            await applyExtractedStateToLedger(
+                { summary: '', worldUpdates: [], appearanceUpdates: [], hooks: hookUpdates, refCursor: null },
+                Number(targetVol.endChapter || 1),
+                `第 ${targetVol.index} 卷复盘`,
+                null,
+            );
+        }
+
+        updateLiveProgress('outline', {
+            isRunning: false,
+            text: `✅ 第 ${targetVol.index} 卷《${targetVol.title}》复盘完成（覆盖 ${res.coveredChapters} 章 · 已回收 ${res.resolvedHooks.length} 条伏笔），已自动沉淀至后续卷纲与续写上下文！`,
+        });
+        await refreshReaderWidgets();
+        globalThis.toastr?.success?.(`第 ${targetVol.index} 卷复盘与偏离校准已完成！`, '小说续写阅读器');
+    } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('outline', { isRunning: false, isError: false, text: '⏹ 卷末复盘已手动停止。' });
+            await refreshReaderWidgets();
+            return;
+        }
+        updateLiveProgress('outline', { isRunning: false, isError: true, text: `❌ 卷末复盘失败：${error?.message || error}` });
+        globalThis.toastr?.error?.(`卷末复盘失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('outline', ctrl);
+    }
+}
+
 async function runGenerateDirectorOutlineTask({
     userBrief = '',
     selectedHookIds = [],
@@ -1946,10 +2298,15 @@ async function runGenerateDirectorOutlineTask({
     chapterCount = 1,
     paceMode = 'slow',
 } = {}) {
-    const novelData = await loadNovelData();
+    const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
     const continuedChapters = collectContinuedChaptersFromChat(novelData);
-    if (!novelData?.chapters?.length && continuedChapters.length === 0) {
-        globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件后再生成导演大纲', '小说续写阅读器');
+    const canStartFresh = Boolean(
+        hasStoryBlueprint(ledger?.storyBlueprint)
+        || ledger?.characters?.length
+        || String(userBrief || '').trim(),
+    );
+    if (!novelData?.chapters?.length && continuedChapters.length === 0 && !canStartFresh) {
+        globalThis.toastr?.warning?.('请先在上方填写全书总纲/脑洞（或导入原著小说）后再生成分章导演大纲', '小说续写阅读器');
         return;
     }
 
@@ -1964,11 +2321,10 @@ async function runGenerateDirectorOutlineTask({
     }
 
     const count = Math.max(1, Math.min(8, Number(chapterCount) || 1));
-    const ledger = await loadLedger();
     const worldInfoContext = await collectActivatedTavernWorldInfo({
         novelData,
         ledger,
-        extraTexts: [userBrief],
+        extraTexts: [userBrief, ledger?.storyBlueprint?.premise || ''],
     });
     updateLiveProgress('outline', {
         isRunning: true,
@@ -2064,7 +2420,18 @@ async function getLatestChapterAnchorInfo() {
     const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
     const continuedChapters = collectContinuedChaptersFromChat(novelData);
     const excludeFlashback = ledger?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
-    return resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback });
+    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback });
+    const summarySet = new Set(
+        (ledger?.summaries || [])
+            .filter(s => s && Number(s.chapterIndex) > 0 && String(s.summary || '').trim())
+            .map(s => Number(s.chapterIndex)),
+    );
+    const missingSummaryCount = continuedChapters.filter(c => !summarySet.has(Number(c.index))).length;
+    return {
+        ...anchor,
+        continuedCount: continuedChapters.length,
+        missingSummaryCount,
+    };
 }
 
 let deepRewriteInFlight = false;
@@ -2648,14 +3015,17 @@ function mountSettingsPanel() {
     wrapper.className = 'inline-drawer';
     wrapper.innerHTML = `
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>📖 小说续写阅读器 (v1.3 工作台)</b>
+            <b>📖 小说续写与创作工作台 (v1.7)</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content tt-novel-settings-body">
             <div id="tt-novel-status-card" class="tt-novel-status-card">正在读取当前对话状态...</div>
             <div class="tt-novel-action-bar">
                 <button type="button" id="tt-novel-open-workbench" class="menu_button tt-novel-btn-primary">
-                    ✨ 打开小说续写工作台（剧情/人物/文风/八股/设置）
+                    ✨ 打开小说工作台
+                </button>
+                <button type="button" id="tt-novel-quick-new-book" class="menu_button">
+                    🆕 新书立项 / 总纲
                 </button>
                 <label class="menu_button tt-novel-file-label">
                     <i class="fa-solid fa-file-import"></i> 快速导入原著
@@ -2673,6 +3043,9 @@ function mountSettingsPanel() {
 
     wrapper.querySelector('#tt-novel-open-workbench')?.addEventListener('click', () => {
         void openWorkbench('memory');
+    });
+    wrapper.querySelector('#tt-novel-quick-new-book')?.addEventListener('click', () => {
+        void openWorkbench('outline');
     });
     wrapper.querySelector('#tt-novel-quick-import')?.addEventListener('change', async (e) => {
         const file = e.target.files?.[0];
@@ -2694,9 +3067,12 @@ async function refreshSettingsStatusCard() {
     const meta = getRuntimeMeta();
     const openHooksCount = (ledger?.hooks || []).filter(h => h.status !== 'resolved').length;
     const sp = ledger?.styleProfile;
+    const bp = ledger?.storyBlueprint;
     const novelLine = novelData
         ? `📚 <b>原著</b>：《${escapeHtml(novelData.title)}》（${novelData.totalChapters}章 · 锚点 #${novelData.cutoffChapterIndex}）`
-        : '📚 <b>原著</b>：尚未导入';
+        : (hasStoryBlueprint(bp)
+            ? `✍️ <b>作品</b>：《${escapeHtml(bp.title || '新书立项')}》（${bp.creationMode === 'fanfic_new' ? '同人新开坑' : '原创世界观'} · ${bp.volumes?.length || 0}卷蓝图）`
+            : '📚 <b>作品</b>：尚未导入原著或立项新书');
     const scoreChain = Array.isArray(sp?.roundHistory) && sp.roundHistory.length > 0
         ? ` · ${sp.roundHistory.map(r => `R${r.round} ${r.score ?? '?'}分`).join('→')}`
         : '';
@@ -2750,6 +3126,7 @@ export async function init() {
             await refreshSettingsStatusCard();
         },
         onRunArchive: runStoryArchiveTask,
+        onBackfillChapterSummaries: runBackfillMissingChapterSummariesTask,
         onRerunArchiveBatch: (batchIndex) => runRerunArchiveBatchesTask([batchIndex]),
         onRerunFailedArchiveBatches: async () => {
             const cur = await loadLedger();
@@ -2766,7 +3143,11 @@ export async function init() {
         onInstallBundledPurePreset: installBundledPureNovelPreset,
         onExportBundledPurePreset: exportBundledPureNovelPreset,
         onRunStyleDistill: runStyleDistillTask,
+        onGenerateCustomStyleCard: runGenerateCustomStyleCardTask,
         onCompressStyleCard: runCompressStyleCardTask,
+        onSaveStoryBlueprint: handleSaveStoryBlueprint,
+        onGenerateMasterBlueprint: runGenerateMasterBlueprintTask,
+        onGenerateVolumeRecap: runGenerateVolumeRecapTask,
         onGenerateDirectorOutline: runGenerateDirectorOutlineTask,
         onApplyOutlineToChat: applyDirectorOutlineToChatInput,
         getLatestChapterAnchorInfo,

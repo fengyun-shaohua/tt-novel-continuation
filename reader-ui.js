@@ -2,9 +2,18 @@ import { escapeHtml, debounce } from '/scripts/utils.js';
 import { getContext } from '/scripts/extensions.js';
 import { isBoundedChatSurfaceView, jumpBoundedChatSurfaceToMessage, resetChatSurfaceView } from '/script.js';
 import { DEFAULT_CLICHE_TERMS } from './cliche-guard.js';
-import { isContinuedNovelFloor } from './context-assembler.js';
+import { hasStoryBlueprintData, isContinuedNovelFloor, resolveActiveVolume } from './context-assembler.js';
 import { stripNonStoryBlocks } from './parser.js';
-import { loadCanonDb, loadLedger, loadNovelData, normalizeNarrativeConfig, saveCanonDb, saveLedger } from './storage.js';
+import {
+    loadCanonDb,
+    loadLedger,
+    loadNovelData,
+    normalizeNarrativeConfig,
+    normalizeStoryBlueprint,
+    normalizeStoryVolume,
+    saveCanonDb,
+    saveLedger,
+} from './storage.js';
 
 const PROGRESS_META_KEY = 'novel_continuation_progress';
 const TOC_PAGE_LIMIT = 100;
@@ -37,6 +46,13 @@ const outlineDraftUiState = {
     paceMode: 'slow',
     selectedHookIds: null, // null = auto-inherit pinned hooks
     initializedForScope: null,
+    blueprintVolumeCount: 4,
+    blueprintChaptersPerVol: 15,
+};
+
+const customStyleUiState = {
+    styleBrief: '',
+    referenceSample: '',
 };
 
 const liveTaskState = {
@@ -268,9 +284,13 @@ export async function refreshReaderWidgets() {
 
     const badge = document.getElementById('tt-novel-toc-badge');
     if (badge) {
-        badge.textContent = novelData?.totalChapters
-            ? `目录 ${novelData.cutoffChapterIndex}/${novelData.totalChapters}`
-            : '目录';
+        if (novelData?.totalChapters) {
+            badge.textContent = `目录 ${novelData.cutoffChapterIndex}/${novelData.totalChapters}`;
+        } else if (Number(anchorInfo?.continuedCount || 0) > 0) {
+            badge.textContent = `目录 ${anchorInfo.continuedCount}章`;
+        } else {
+            badge.textContent = '目录';
+        }
     }
 
     const wbBadge = document.getElementById('tt-novel-wb-badge');
@@ -311,16 +331,26 @@ function renderWorkbench() {
     if (!bodyEl) return;
 
     const meta = handlers.getRuntimeMeta?.() || {};
+    const bp = cachedLedger?.storyBlueprint;
     if (titleEl) {
-        titleEl.textContent = cachedNovelData?.title
-            ? `📖 《${cachedNovelData.title}》`
-            : '📖 小说续写工作台';
+        if (cachedNovelData?.title) {
+            titleEl.textContent = `📖 《${cachedNovelData.title}》`;
+        } else if (bp?.title) {
+            titleEl.textContent = `✍️ 《${bp.title}》`;
+        } else {
+            titleEl.textContent = '📖 小说续写与创作工作台';
+        }
     }
     if (subEl) {
         const settings = handlers.getSettings?.() || {};
-        const chPart = cachedNovelData?.totalChapters
-            ? `锚点 #${cachedNovelData.cutoffChapterIndex}/${cachedNovelData.totalChapters} · `
-            : '';
+        const continuedCount = Number(cachedAnchorInfo?.continuedCount || 0);
+        let chPart = '';
+        if (cachedNovelData?.totalChapters) {
+            chPart = `锚点 #${cachedNovelData.cutoffChapterIndex}/${cachedNovelData.totalChapters} · `;
+        } else if (hasStoryBlueprintData(bp) || continuedCount > 0) {
+            const modeTag = bp?.creationMode === 'fanfic_new' ? '同人新开坑' : '原创世界观';
+            chPart = `${modeTag} · 已写 ${continuedCount} 章 · `;
+        }
         const autoTag = settings.autoDeepRewrite ? ' · ⚡自动重塑已开' : '';
         subEl.textContent = `${chPart}模型：${meta.activeModel || '当前酒馆模型'} · 预设：${meta.presetLabel || '当前酒馆预设'}${autoTag}`;
     }
@@ -357,33 +387,150 @@ function renderTaskProgressBanner(taskKey, task) {
    TAB 1.5: 🎬 导演大纲 (Author-Authentic Multi-Cut Chapter Beat Director)
    ========================================================================== */
 function renderOutlineTab(bodyEl) {
-    const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], styleProfile: null, draftOutline: null };
+    const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], styleProfile: null, draftOutline: null, storyBlueprint: null };
     const openHooks = (ledger.hooks || []).filter(h => h && h.status !== 'resolved');
     const task = liveTaskState.outline;
     const savedDraft = ledger.draftOutline || null;
+    const bp = normalizeStoryBlueprint(ledger.storyBlueprint);
+    const hasBp = hasStoryBlueprintData(bp);
+    const hasOrigNovel = Boolean(cachedNovelData?.chapters?.length);
+    const nextChIdx = Number(cachedAnchorInfo?.nextChapterIndex || 1);
+    const activeVol = resolveActiveVolume(bp, nextChIdx);
 
     if (outlineDraftUiState.selectedHookIds === null) {
         outlineDraftUiState.selectedHookIds = openHooks.filter(h => h.status === 'pinned').map(h => h.id);
     }
     const selectedHookSet = new Set(outlineDraftUiState.selectedHookIds);
 
-    const anchorText = cachedAnchorInfo?.anchorTitle
-        ? `自动承接【${cachedAnchorInfo.anchorTitle}】结尾${cachedAnchorInfo.shortClosing ? `（“……${cachedAnchorInfo.shortClosing.slice(-36)}”）` : ''} → 策划第 ${cachedAnchorInfo.nextChapterIndex} ${cachedAnchorInfo.chapterUnit}`
-        : '请先导入原著小说';
+    const anchorText = cachedAnchorInfo?.isFreshStart
+        ? `✨ 新书开篇模式 → 准备策划第 1 章${activeVol ? `（第 ${activeVol.index} 卷《${activeVol.title}》）` : ''}`
+        : (cachedAnchorInfo?.anchorTitle
+            ? `自动承接【${cachedAnchorInfo.anchorTitle}】结尾${cachedAnchorInfo.shortClosing ? `（“……${cachedAnchorInfo.shortClosing.slice(-36)}”）` : ''} → 策划第 ${cachedAnchorInfo.nextChapterIndex} ${cachedAnchorInfo.chapterUnit}`
+            : '请先在下方填写全书总纲/脑洞，或导入原著小说');
 
     const nCfg = normalizeNarrativeConfig(ledger.narrativeConfig);
     const povSummary = nCfg.povMode === 'strict_limited' && nCfg.povCharacter
         ? `严格单视角(${nCfg.povCharacter})`
-        : '跟随原著视角';
+        : '自动/多视角';
     const wiSummary = nCfg.worldInfoMode === 'off'
         ? '世界书关闭'
         : (nCfg.worldInfoPriority === 'wi_strict' ? '世界书强一致' : '世界书兜底');
     const refSummary = nCfg.referenceTimelineMode
         ? ` · 🧭对齐基准#${nCfg.referenceCursorChapter || 0}`
         : '';
-    const readyMeta = `已挂载：${ledger.characters?.length || 0} 人物 · ${ledger.chronicle?.length || 0} 编年史 · ${openHooks.length} 伏笔 · ${povSummary} · ${wiSummary}${refSummary}`;
+    const volSummary = bp.volumes.length > 0
+        ? ` · 🗺️ ${bp.volumes.length} 卷蓝图${activeVol ? `（当前第${activeVol.index}卷）` : ''}`
+        : '';
+    const readyMeta = `已挂载：${ledger.characters?.length || 0} 人物 · ${ledger.chronicle?.length || 0} 编年史 · ${openHooks.length} 伏笔 · ${povSummary} · ${wiSummary}${volSummary}${refSummary}`;
 
     const progressHtml = renderTaskProgressBanner('outline', task);
+
+    const bpOpenByDefault = !hasOrigNovel || !hasBp;
+    const volumesHtml = bp.volumes.length === 0
+        ? '<div class="tt-novel-muted">尚未规划 L2 分卷路线图。在上方填好脑洞或粘贴世界观/人设草稿，点「✨ AI 一键生成总纲 + 分卷 + 初始人物与伏笔」，或点下方「+ 新增一卷」手动建卷。</div>'
+        : bp.volumes.map((v, idx) => {
+            const isAct = v.status === 'active';
+            const isDone = v.status === 'completed';
+            const badgeCls = isAct ? 'is-gold' : (isDone ? 'is-ok' : '');
+            const badgeLabel = isAct ? '🔥 连载中' : (isDone ? '✅ 已完结' : '⏳ 规划中');
+            return `
+                <details class="tt-novel-card tt-novel-outline-card ${isDone ? 'is-sent' : ''}" data-vol-id="${escapeHtml(v.id)}" ${isAct ? 'open' : ''}>
+                    <summary class="tt-novel-card-head">
+                        <div class="tt-novel-timeline-meta">
+                            <span class="tt-novel-chip ${badgeCls}">${badgeLabel}</span>
+                            <strong>第 ${v.index} 卷 · ${escapeHtml(v.title)}</strong>
+                            <span class="tt-novel-muted">${escapeHtml(v.chapterRange)}</span>
+                        </div>
+                        <span class="tt-novel-muted">${v.recap ? '📑已复盘' : ''}</span>
+                    </summary>
+                    <div class="tt-novel-edit-grid" style="margin-top: 8px;">
+                        <div class="tt-novel-row-2">
+                            <input type="text" class="text_pole" data-vol-field="title" value="${escapeHtml(v.title)}" placeholder="卷名" />
+                            <input type="text" class="text_pole" data-vol-field="chapterRange" value="${escapeHtml(v.chapterRange)}" placeholder="章号范围（如 第 1~15 章）" />
+                        </div>
+                        <textarea class="text_pole" rows="2" data-vol-field="goal" placeholder="本卷核心目标、主要矛盾与舞台背景">${escapeHtml(v.goal || '')}</textarea>
+                        <textarea class="text_pole" rows="2" data-vol-field="keyTurns" placeholder="关键转折、中段升级与卷末高潮节点">${escapeHtml(v.keyTurns || '')}</textarea>
+                        <input type="text" class="text_pole" data-vol-field="endingHook" value="${escapeHtml(v.endingHook || '')}" placeholder="卷末定格与引向下一卷的悬念钩子" />
+                        ${v.recap ? `
+                            <div class="tt-novel-diff-box" style="border-left-color: #4ac4b7;">
+                                <div class="tt-novel-mini-label">📑 本卷高密度复盘（自动喂给后续分卷与续写）</div>
+                                <textarea class="text_pole" rows="3" data-vol-field="recap">${escapeHtml(v.recap)}</textarea>
+                            </div>
+                        ` : ''}
+                        ${v.recapCheck ? `
+                            <details class="tt-novel-subfold">
+                                <summary>⚖️ 查看本卷 L2 卷纲偏离校准报告</summary>
+                                <div class="tt-novel-pre-wrap">${escapeHtml(v.recapCheck)}</div>
+                            </details>
+                        ` : ''}
+                        <div class="tt-novel-action-bar">
+                            ${!isAct ? `<button type="button" class="menu_button tt-novel-btn-sm tt-novel-btn-primary" data-vol-action="set-active" data-vol-id="${escapeHtml(v.id)}">🔥 设为当前连载卷</button>` : ''}
+                            <button type="button" class="menu_button tt-novel-btn-sm" data-vol-action="toggle-done" data-vol-id="${escapeHtml(v.id)}">${isDone ? '↩️ 恢复规划' : '✅ 标为本卷完结'}</button>
+                            <button type="button" class="menu_button tt-novel-btn-sm" data-vol-action="gen-recap" data-vol-id="${escapeHtml(v.id)}" ${task.running ? 'disabled' : ''}>📑 生成卷末复盘与偏离检查</button>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-vol-action="del-vol" data-vol-id="${escapeHtml(v.id)}" title="删除此卷">🗑️</button>
+                        </div>
+                    </div>
+                </details>
+            `;
+        }).join('');
+
+    const blueprintSectionHtml = `
+        <details class="tt-novel-fold-card tt-novel-card" style="margin-bottom: 10px;" ${bpOpenByDefault ? 'open' : ''}>
+            <summary><b>🗺️ L1 全书总纲 & L2 分卷路线图</b> <span class="tt-novel-muted">（原创世界观 / 同人新开坑 / 续写长线规划通用${bp.title ? ` · 《${escapeHtml(bp.title)}》` : ''}${bp.volumes.length > 0 ? ` · ${bp.volumes.length}卷` : ''}）</span></summary>
+            <div class="tt-novel-edit-grid" style="margin-top: 8px;">
+                <div class="tt-novel-row-3">
+                    <label class="tt-novel-muted">作品书名：
+                        <input type="text" id="tt-novel-bp-title" class="text_pole" value="${escapeHtml(bp.title || cachedNovelData?.title || '')}" placeholder="输入书名（可留空由 AI 起名）" />
+                    </label>
+                    <label class="tt-novel-muted">创作模式：
+                        <select id="tt-novel-bp-mode" class="text_pole">
+                            <option value="original" ${bp.creationMode === 'original' || (!hasOrigNovel && bp.creationMode === 'continuation') ? 'selected' : ''}>🆕 原创世界观（0章开新书）</option>
+                            <option value="fanfic_new" ${bp.creationMode === 'fanfic_new' ? 'selected' : ''}>✨ 同人新开坑（配合世界书）</option>
+                            <option value="continuation" ${hasOrigNovel && bp.creationMode === 'continuation' ? 'selected' : ''}>📖 原著续写后续规划</option>
+                        </select>
+                    </label>
+                    <label class="tt-novel-muted">题材与基调：
+                        <input type="text" id="tt-novel-bp-genre" class="text_pole" value="${escapeHtml(bp.genreAndTone || '')}" placeholder="如：冷峻悬疑 / 职场暗黑博弈" />
+                    </label>
+                </div>
+                <label class="tt-novel-muted">💡 核心脑洞 或 完整世界观/人设草稿（一句话脑洞、大段设定文档都可直接贴这里，同时自动联动酒馆世界书）：
+                    <textarea id="tt-novel-bp-seed" class="text_pole" rows="4" placeholder="写法 A（脑洞起手）：几句话写清主角、核心设定、开篇冲突和你想看的爽点/基调；&#10;写法 B（设定稿起手）：直接把你写好的大段世界观、势力、角色草稿粘贴进来，让 AI 拆解成总纲、分卷和 4 维人物卡！">${escapeHtml(bp.seedNotes || '')}</textarea>
+                </label>
+                <div class="tt-novel-row-2">
+                    <label class="tt-novel-muted">规划总卷数：
+                        <select id="tt-novel-bp-volcount" class="text_pole">
+                            ${[2, 3, 4, 5, 6].map(n => `<option value="${n}" ${Number(outlineDraftUiState.blueprintVolumeCount || 4) === n ? 'selected' : ''}>${n} 卷${n === 4 ? '（标准长篇推荐）' : ''}</option>`).join('')}
+                        </select>
+                    </label>
+                    <label class="tt-novel-muted">每卷预计章数：
+                        <select id="tt-novel-bp-chpervol" class="text_pole">
+                            ${[10, 15, 20, 30].map(n => `<option value="${n}" ${Number(outlineDraftUiState.blueprintChaptersPerVol || 15) === n ? 'selected' : ''}>约 ${n} 章 / 卷</option>`).join('')}
+                        </select>
+                    </label>
+                </div>
+                <div class="tt-novel-action-bar">
+                    <button type="button" id="tt-novel-bp-generate" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
+                        ✨ AI 一键生成全书总纲 + 分卷 + 初始人物与伏笔 (1次API)
+                    </button>
+                    <button type="button" id="tt-novel-bp-save" class="menu_button">💾 保存总纲与分卷</button>
+                    <button type="button" id="tt-novel-bp-add-vol" class="menu_button tt-novel-btn-sm">+ 手动新增一卷</button>
+                </div>
+                <label class="tt-novel-muted">L1 全书总纲（核心主线、主角弧线与冲突脉络）：
+                    <textarea id="tt-novel-bp-premise" class="text_pole" rows="3" placeholder="AI 生成后或手动填写全书总纲，后续每卷分镜与每章正文都会自动对齐此蓝图...">${escapeHtml(bp.premise || '')}</textarea>
+                </label>
+                <div class="tt-novel-row-2">
+                    <label class="tt-novel-muted">世界观硬规则与创作红线：
+                        <textarea id="tt-novel-bp-rules" class="text_pole" rows="2" placeholder="力量/社会规则、绝不能违背的逻辑底线...">${escapeHtml(bp.worldRules || '')}</textarea>
+                    </label>
+                    <label class="tt-novel-muted">终局方向与核心收束：
+                        <textarea id="tt-novel-bp-ending" class="text_pole" rows="2" placeholder="最终高潮冲突与结局走向...">${escapeHtml(bp.endingDirection || '')}</textarea>
+                    </label>
+                </div>
+                <div class="tt-novel-subhead">📚 L2 分卷路线图（共 ${bp.volumes.length} 卷 · 下方 L3 分章分镜自动绑定当前连载卷）</div>
+                <div class="tt-novel-card-stack" id="tt-novel-bp-volumes">${volumesHtml}</div>
+            </div>
+        </details>
+    `;
 
     const hookPickerHtml = openHooks.length === 0
         ? '<div class="tt-novel-muted">当前暂无待填伏笔（可去「📚 剧情与人物」全本归档或手动添加伏笔）。</div>'
@@ -450,8 +597,11 @@ function renderOutlineTab(bodyEl) {
             <div class="tt-novel-muted">${escapeHtml(readyMeta)}</div>
         </div>
 
+        ${progressHtml}
+        ${blueprintSectionHtml}
+
         <section class="tt-novel-section tt-novel-card">
-            <div class="tt-novel-section-title">📝 输入简略过程与结果（可一次规划 1~8 章连贯卷纲，逐章点击续写）</div>
+            <div class="tt-novel-section-title">🎬 L3 分章导演分镜（紧贴当前卷纲 · 一次规划 1~8 章，逐章点击开写）</div>
             <textarea id="tt-novel-outline-brief" class="text_pole" rows="3" placeholder="例如：出海前博士来试探但没挑破照片，设备修好顺手碰一下帘子后门的伏笔；随后登船出海遇远海黑雾白光，凯尔希察觉秘宝漏洞但暂时稳住，最后抵达核心海域。&#10;（也可以留空，点下方「🎲 留空自动构思」让 AI 顺着当前伏笔直接给方案！）">${escapeHtml(outlineDraftUiState.userBrief || '')}</textarea>
             <div class="tt-novel-row-3">
                 <label class="tt-novel-muted">规划章数：
@@ -492,7 +642,7 @@ function renderOutlineTab(bodyEl) {
             </div>
         </section>
 
-        ${progressHtml}
+        ${savedChapters.length > 0 ? '' : ''}
 
         <section class="tt-novel-section">
             <div class="tt-novel-card-head">
@@ -505,6 +655,106 @@ function renderOutlineTab(bodyEl) {
             <div class="tt-novel-card-stack">${chapterCardsHtml}</div>
         </section>
     `;
+
+    const collectBlueprintFromDom = () => {
+        const volCards = [...bodyEl.querySelectorAll('#tt-novel-bp-volumes [data-vol-id]')];
+        const byId = new Map((bp.volumes || []).map(v => [v.id, v]));
+        const volumes = volCards.map((card, i) => {
+            const id = card.getAttribute('data-vol-id');
+            const prev = byId.get(id) || {};
+            const readF = (f) => {
+                const el = card.querySelector(`[data-vol-field="${f}"]`);
+                return el ? String(el.value || '').trim() : (prev[f] || '');
+            };
+            const rangeVal = readF('chapterRange');
+            const nums = [...rangeVal.matchAll(/\d+/g)].map(m => Number(m[0])).filter(n => n > 0);
+            return normalizeStoryVolume({
+                ...prev,
+                id,
+                index: i + 1,
+                title: readF('title') || prev.title,
+                chapterRange: rangeVal || prev.chapterRange,
+                startChapter: nums[0] || prev.startChapter,
+                endChapter: nums[nums.length - 1] || prev.endChapter,
+                goal: readF('goal'),
+                keyTurns: readF('keyTurns'),
+                endingHook: readF('endingHook'),
+                recap: readF('recap'),
+            }, i + 1);
+        });
+        return normalizeStoryBlueprint({
+            creationMode: String(bodyEl.querySelector('#tt-novel-bp-mode')?.value || bp.creationMode || 'original'),
+            title: String(bodyEl.querySelector('#tt-novel-bp-title')?.value || '').trim(),
+            genreAndTone: String(bodyEl.querySelector('#tt-novel-bp-genre')?.value || '').trim(),
+            seedNotes: String(bodyEl.querySelector('#tt-novel-bp-seed')?.value || '').trim(),
+            premise: String(bodyEl.querySelector('#tt-novel-bp-premise')?.value || '').trim(),
+            worldRules: String(bodyEl.querySelector('#tt-novel-bp-rules')?.value || '').trim(),
+            endingDirection: String(bodyEl.querySelector('#tt-novel-bp-ending')?.value || '').trim(),
+            volumes,
+        });
+    };
+
+    bodyEl.querySelector('#tt-novel-bp-volcount')?.addEventListener('change', (e) => {
+        outlineDraftUiState.blueprintVolumeCount = Math.max(2, Math.min(8, Number(e.target.value) || 4));
+    });
+    bodyEl.querySelector('#tt-novel-bp-chpervol')?.addEventListener('change', (e) => {
+        outlineDraftUiState.blueprintChaptersPerVol = Math.max(5, Math.min(50, Number(e.target.value) || 15));
+    });
+    bodyEl.querySelector('#tt-novel-bp-save')?.addEventListener('click', async () => {
+        await handlers.onSaveStoryBlueprint?.(collectBlueprintFromDom());
+        globalThis.toastr?.success?.('已保存全书总纲与分卷路线图！', '小说续写阅读器');
+    });
+    bodyEl.querySelector('#tt-novel-bp-generate')?.addEventListener('click', async () => {
+        const draftBp = collectBlueprintFromDom();
+        await handlers.onSaveStoryBlueprint?.(draftBp);
+        await handlers.onGenerateMasterBlueprint?.({
+            title: draftBp.title,
+            creationMode: draftBp.creationMode,
+            genreAndTone: draftBp.genreAndTone,
+            seedNotes: draftBp.seedNotes,
+            volumeCount: outlineDraftUiState.blueprintVolumeCount,
+            chaptersPerVolume: outlineDraftUiState.blueprintChaptersPerVol,
+        });
+    });
+    bodyEl.querySelector('#tt-novel-bp-add-vol')?.addEventListener('click', async () => {
+        const draftBp = collectBlueprintFromDom();
+        const nextIdx = draftBp.volumes.length + 1;
+        const lastEnd = draftBp.volumes.length > 0 ? Number(draftBp.volumes[draftBp.volumes.length - 1].endChapter || 0) : 0;
+        const step = Number(outlineDraftUiState.blueprintChaptersPerVol || 15);
+        draftBp.volumes.push(normalizeStoryVolume({
+            index: nextIdx,
+            title: `新篇章 ${nextIdx}`,
+            startChapter: lastEnd + 1,
+            endChapter: lastEnd + step,
+            chapterRange: `第 ${lastEnd + 1}~${lastEnd + step} 章`,
+            status: nextIdx === 1 ? 'active' : 'planned',
+        }, nextIdx));
+        await handlers.onSaveStoryBlueprint?.(draftBp);
+    });
+    bodyEl.querySelectorAll('[data-vol-action]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const action = btn.getAttribute('data-vol-action');
+            const volId = btn.getAttribute('data-vol-id');
+            const draftBp = collectBlueprintFromDom();
+            if (action === 'set-active') {
+                for (const v of draftBp.volumes) {
+                    if (v.id === volId) v.status = 'active';
+                    else if (v.status === 'active') v.status = 'planned';
+                }
+                await handlers.onSaveStoryBlueprint?.(draftBp);
+            } else if (action === 'toggle-done') {
+                const target = draftBp.volumes.find(v => v.id === volId);
+                if (target) target.status = target.status === 'completed' ? 'planned' : 'completed';
+                await handlers.onSaveStoryBlueprint?.(draftBp);
+            } else if (action === 'del-vol') {
+                draftBp.volumes = draftBp.volumes.filter(v => v.id !== volId).map((v, i) => ({ ...v, index: i + 1 }));
+                await handlers.onSaveStoryBlueprint?.(draftBp);
+            } else if (action === 'gen-recap') {
+                await handlers.onSaveStoryBlueprint?.(draftBp);
+                await handlers.onGenerateVolumeRecap?.(volId);
+            }
+        });
+    });
 
     const briefEl = bodyEl.querySelector('#tt-novel-outline-brief');
     const chaptersEl = bodyEl.querySelector('#tt-novel-outline-chapters');
@@ -1117,18 +1367,24 @@ function renderMemoryTab(bodyEl) {
 
     const latestWrittenCh = Number(cachedAnchorInfo?.prevChapterIndex || cachedNovelData?.cutoffChapterIndex || 0);
     const archivedTo = Number(ledger.lastArchivedChapter || 0);
-    const unarchivedGap = (archivedTo > 0 && latestWrittenCh > archivedTo) ? (latestWrittenCh - archivedTo) : 0;
-    const gapWarnHtml = unarchivedGap >= 2
-        ? `<div class="tt-novel-banner is-warn">⚠️ 当前最新正文已到 <b>第 ${latestWrittenCh} 章</b>，但编年史仅归档至 <b>第 ${archivedTo} 章</b>（有 ${unarchivedGap} 章尚未并入编年史）。点上方「⚡ 增量补总结新章」可一键补齐人物与编年史；即使暂不归档，新版导演大纲也会自动直读这些未归档章防止失忆！</div>`
-        : '';
+    const unarchivedGap = latestWrittenCh > archivedTo ? (latestWrittenCh - archivedTo) : 0;
+    const missingSumCount = Number(cachedAnchorInfo?.missingSummaryCount || 0);
+    const gapWarnHtml = (archivedTo > 0 && unarchivedGap >= 2)
+        ? `<div class="tt-novel-banner is-warn">⚠️ 当前最新正文已到 <b>第 ${latestWrittenCh} 章</b>，但编年史仅归档至 <b>第 ${archivedTo} 章</b>（有 ${unarchivedGap} 章尚未并入编年史）。点上方「⚡ 增量补总结新章」可一键把新写的原创/续写章并入编年史与人物成长档案！</div>`
+        : (archivedTo === 0 && latestWrittenCh >= 3 && !cachedNovelData?.chapters?.length
+            ? `<div class="tt-novel-banner is-warn">💡 已创作 <b>${latestWrittenCh} 章</b>正文，尚未执行编年史归档。点上方「📚 全本通读归档」可把已写原创章节一键汇总为编年史与 4 维人物成长卡！</div>`
+            : '');
 
     bodyEl.innerHTML = `
         <div class="tt-novel-action-bar">
             <button type="button" id="tt-novel-run-archive-full" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
-                📚 全本通读归档 (并发≤2 · 套预设)
+                📚 全本通读归档 (含原创/续写章 · 并发≤2)
             </button>
-            <button type="button" id="tt-novel-run-archive-inc" class="menu_button ${unarchivedGap >= 2 ? 'tt-novel-btn-primary' : ''}" ${task.running ? 'disabled' : ''}>
-                ⚡ 增量补总结新章${unarchivedGap >= 2 ? ` (+${unarchivedGap}章)` : ''}
+            <button type="button" id="tt-novel-run-archive-inc" class="menu_button ${archivedTo > 0 && unarchivedGap >= 2 ? 'tt-novel-btn-primary' : ''}" ${task.running ? 'disabled' : ''}>
+                ⚡ 增量补总结新章${archivedTo > 0 && unarchivedGap >= 2 ? ` (+${unarchivedGap}章)` : ''}
+            </button>
+            <button type="button" id="tt-novel-backfill-sums" class="menu_button ${missingSumCount > 0 ? 'tt-novel-btn-primary' : ''}" ${task.running ? 'disabled' : ''} title="批量扫描聊天中缺少单章精要总结的原创/续写章节并自动补齐">
+                📝 补齐缺失单章总结${missingSumCount > 0 ? ` (+${missingSumCount}章)` : ''}
             </button>
             <button type="button" id="tt-novel-auto-detect-btn" class="menu_button" ${task.running ? 'disabled' : ''} title="仅需1次API自动分析全书视角、分出基准线/主线并计算当前对齐章号">
                 🤖 自动识别视角与双线
@@ -1208,6 +1464,7 @@ function renderMemoryTab(bodyEl) {
     bodyEl.querySelector('#tt-novel-ncfg-auto-run')?.addEventListener('click', () => handlers.onAutoDetectNarrativeStructure?.());
     bodyEl.querySelector('#tt-novel-run-archive-full')?.addEventListener('click', () => handlers.onRunArchive?.('full'));
     bodyEl.querySelector('#tt-novel-run-archive-inc')?.addEventListener('click', () => handlers.onRunArchive?.('incremental'));
+    bodyEl.querySelector('#tt-novel-backfill-sums')?.addEventListener('click', () => handlers.onBackfillChapterSummaries?.());
     bodyEl.querySelector('#tt-novel-rerun-failed-slices')?.addEventListener('click', () => handlers.onRerunFailedArchiveBatches?.());
     bodyEl.querySelector('#tt-novel-resynth-slices')?.addEventListener('click', () => handlers.onResynthArchive?.());
     bodyEl.querySelectorAll('[data-action="rerun-slice"]').forEach(btn => {
@@ -1745,7 +2002,28 @@ function renderStyleTab(bodyEl) {
         ? `<div class="tt-novel-banner is-warn">⚠️ 当前文风圣经长达 <b>${cardLen} 字</b>（超出理想实战体量 1,800~2,600 字），容易引发跨章节过拟合复读与 Token 浪费。建议直接点下方「✨ 一键去过拟合提纯瘦身」保留全部洞察并压缩至 ~2,200 字！</div>`
         : '';
 
+    const customStyleOpen = !cachedNovelData?.chapters?.length && !sp?.styleCard;
+    const customStyleBoxHtml = `
+        <details class="tt-novel-fold-card tt-novel-card" style="margin-bottom: 10px;" ${customStyleOpen ? 'open' : ''}>
+            <summary><b>✍️ 原创 / 定制文风卡</b> <span class="tt-novel-muted">（0 章开新书适用 · 支持一句话描述目标风格，或直接粘贴参考范文纯提炼笔法）</span></summary>
+            <div class="tt-novel-edit-grid" style="margin-top: 8px;">
+                <label class="tt-novel-muted">目标文风描述（例如：冷峻克制、短段白描、电影感切镜、少心理抒情、台词锋利）：
+                    <input type="text" id="tt-novel-custom-style-brief" class="text_pole" value="${escapeHtml(customStyleUiState.styleBrief || '')}" placeholder="输入你想要的叙事节奏、段长、对白质感与题材调性..." />
+                </label>
+                <label class="tt-novel-muted">可选 · 粘贴参考范文 / 样章（仅提纯句式骨相与语感，绝不把范文剧情带入新书）：
+                    <textarea id="tt-novel-custom-style-sample" class="text_pole" rows="4" placeholder="可粘贴 300~5000 字你喜欢的作者片段或自己写的样章，插件会自动测算客观段长/对话指纹并提炼纯笔法...">${escapeHtml(customStyleUiState.referenceSample || '')}</textarea>
+                </label>
+                <div class="tt-novel-action-bar">
+                    <button type="button" id="tt-novel-custom-style-gen" class="menu_button tt-novel-btn-primary" ${task.running ? 'disabled' : ''}>
+                        ✨ 生成原创定制文风卡 (1次API)
+                    </button>
+                </div>
+            </div>
+        </details>
+    `;
+
     bodyEl.innerHTML = `
+        ${customStyleBoxHtml}
         <div class="tt-novel-action-bar">
             <select id="tt-novel-wb-distill-rounds" class="text_pole" style="width: 108px;">
                 <option value="1" ${Number(settings.distillRounds) === 1 ? 'selected' : ''}>1 轮盲测</option>
@@ -1785,6 +2063,19 @@ function renderStyleTab(bodyEl) {
         </section>
     `;
 
+    bodyEl.querySelector('#tt-novel-custom-style-brief')?.addEventListener('input', (e) => {
+        customStyleUiState.styleBrief = String(e.target.value || '');
+    });
+    bodyEl.querySelector('#tt-novel-custom-style-sample')?.addEventListener('input', (e) => {
+        customStyleUiState.referenceSample = String(e.target.value || '');
+    });
+    bodyEl.querySelector('#tt-novel-custom-style-gen')?.addEventListener('click', () => {
+        const styleBrief = String(bodyEl.querySelector('#tt-novel-custom-style-brief')?.value || '').trim();
+        const referenceSample = String(bodyEl.querySelector('#tt-novel-custom-style-sample')?.value || '').trim();
+        customStyleUiState.styleBrief = styleBrief;
+        customStyleUiState.referenceSample = referenceSample;
+        handlers.onGenerateCustomStyleCard?.({ styleBrief, referenceSample });
+    });
     bodyEl.querySelector('#tt-novel-wb-distill-rounds')?.addEventListener('change', (e) => {
         handlers.onUpdateSetting?.('distillRounds', Math.max(1, Math.min(3, Number(e.target.value) || 2)));
     });
@@ -2429,9 +2720,12 @@ function renderSettingsTab(bodyEl) {
 
     bodyEl.innerHTML = `
         <section class="tt-novel-section tt-novel-card">
-            <div class="tt-novel-section-title">📚 导入原著与游戏设定库（对话级独立隔离）</div>
+            <div class="tt-novel-section-title">📚 新建原创 / 导入原著与设定库（对话级独立隔离）</div>
             <div class="tt-novel-action-bar">
-                <label class="menu_button tt-novel-file-label tt-novel-btn-primary">
+                <button type="button" id="tt-novel-wb-start-original" class="menu_button tt-novel-btn-primary">
+                    🆕 新建原创 / 同人新书（去立项总纲）
+                </button>
+                <label class="menu_button tt-novel-file-label">
                     <i class="fa-solid fa-file-import"></i> 导入原著 (.txt/.md)
                     <input type="file" id="tt-novel-wb-import-txt" accept=".txt,.md,text/plain,text/markdown,*/*" hidden />
                 </label>
@@ -2530,6 +2824,9 @@ function renderSettingsTab(bodyEl) {
         </section>
     `;
 
+    bodyEl.querySelector('#tt-novel-wb-start-original')?.addEventListener('click', () => {
+        void openWorkbench('outline');
+    });
     bodyEl.querySelector('#tt-novel-wb-import-txt')?.addEventListener('change', async (e) => {
         const file = e.target.files?.[0];
         if (file) await handlers.onImportNovelFile?.(file);

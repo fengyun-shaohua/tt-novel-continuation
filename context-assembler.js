@@ -250,6 +250,87 @@ export function resolveTimelineHooks(hooks, maxChapterIndex) {
 }
 
 /**
+ * Pure check for whether a ledger carries a populated L1/L2 story blueprint.
+ */
+export function hasStoryBlueprintData(blueprint) {
+    if (!blueprint || typeof blueprint !== 'object') return false;
+    return Boolean(
+        String(blueprint.title || '').trim()
+        || String(blueprint.premise || '').trim()
+        || String(blueprint.seedNotes || '').trim()
+        || String(blueprint.worldRules || '').trim()
+        || (Array.isArray(blueprint.volumes) && blueprint.volumes.length > 0),
+    );
+}
+
+/**
+ * Resolves the currently active L2 volume from `storyBlueprint.volumes` for `targetChapterIndex`.
+ * Priority: explicit `status === 'active'` -> chapter range match -> first non-completed volume -> last volume.
+ */
+export function resolveActiveVolume(storyBlueprint, targetChapterIndex = 1) {
+    const vols = Array.isArray(storyBlueprint?.volumes) ? storyBlueprint.volumes.filter(Boolean) : [];
+    if (vols.length === 0) return null;
+    const explicitActive = vols.find(v => v.status === 'active');
+    if (explicitActive) return explicitActive;
+    const ch = Math.max(1, Number(targetChapterIndex) || 1);
+    const inRange = vols.find(v => ch >= Number(v.startChapter || 1) && ch <= Number(v.endChapter || Infinity));
+    if (inRange) return inRange;
+    return vols.find(v => v.status !== 'completed') || vols[vols.length - 1];
+}
+
+/**
+ * Formats L1 Master Blueprint + L2 Active Volume + Completed Volume Recaps + Next Volume Spoiler Guard
+ * into a concise prompt block shared by both Chapter Generation and L3 Director Outline Planning.
+ */
+export function buildStoryBlueprintContextBlock(storyBlueprint, targetChapterIndex = 1, { includeNextVolumeGuard = true } = {}) {
+    if (!hasStoryBlueprintData(storyBlueprint)) return '';
+    const modeLabel = storyBlueprint.creationMode === 'original'
+        ? '原创世界观长篇'
+        : (storyBlueprint.creationMode === 'fanfic_new' ? '同人新开坑长篇' : '长篇连载');
+    const lines = [`【L1 全书总纲与 L2 分卷路线图（${modeLabel} · 宏观主线最高蓝图）】`];
+    if (storyBlueprint.genreAndTone) lines.push(`- 题材与基调：${storyBlueprint.genreAndTone}`);
+    if (storyBlueprint.premise) lines.push(`- 核心主线与人物弧线：${storyBlueprint.premise}`);
+    if (storyBlueprint.worldRules) lines.push(`- 世界观硬规则与红线：${storyBlueprint.worldRules}`);
+    if (storyBlueprint.endingDirection) lines.push(`- 终局方向与核心命题：${storyBlueprint.endingDirection}`);
+    if (!storyBlueprint.premise && storyBlueprint.seedNotes) {
+        lines.push(`- 作者立项设定与创意底稿：${String(storyBlueprint.seedNotes).slice(0, 1400)}`);
+    }
+
+    const vols = Array.isArray(storyBlueprint.volumes) ? storyBlueprint.volumes.filter(Boolean) : [];
+    if (vols.length > 0) {
+        const activeVol = resolveActiveVolume(storyBlueprint, targetChapterIndex);
+        const completedWithRecap = vols.filter(v => v.status === 'completed' && v !== activeVol);
+        if (completedWithRecap.length > 0) {
+            lines.push('▸ 📚 已完结卷精要复盘：');
+            for (const cv of completedWithRecap.slice(-4)) {
+                const body = cv.recap ? cv.recap.slice(0, 260) : (cv.goal || '已完成');
+                lines.push(`  - [第${cv.index}卷 ${cv.title} · ${cv.chapterRange}]：${body}`);
+            }
+        }
+        if (activeVol) {
+            lines.push(
+                `▸ 🔥 当前连载卷（第 ${activeVol.index} 卷《${activeVol.title}》 · 规划范围 ${activeVol.chapterRange}，当前第 ${targetChapterIndex} 章）：`,
+            );
+            if (activeVol.goal) lines.push(`  · 本卷核心目标与矛盾：${activeVol.goal}`);
+            if (activeVol.keyTurns) lines.push(`  · 本卷关键转折与高潮节点：${activeVol.keyTurns}`);
+            if (activeVol.endingHook) lines.push(`  · 本卷收束落点与下卷钩子：${activeVol.endingHook}`);
+            if (activeVol.recap) lines.push(`  · 本卷阶段复盘进度：${activeVol.recap.slice(0, 320)}`);
+
+            if (includeNextVolumeGuard) {
+                const activeIdx = vols.indexOf(activeVol);
+                const nextVol = activeIdx >= 0 ? vols[activeIdx + 1] : null;
+                if (nextVol) {
+                    lines.push(
+                        `▸ 🔒 下一卷预告边界（第 ${nextVol.index} 卷《${nextVol.title}》 · ${nextVol.chapterRange}，切勿在本卷提前透支或掀光以下大事件）：${nextVol.goal || nextVol.title}`,
+                    );
+                }
+            }
+        }
+    }
+    return lines.join('\n');
+}
+
+/**
  * Builds the Pagekin-style Single-Call Golden Context block injected before a standard
  * Tavern chat completion request. Zero Agent loops, zero extra API calls.
  */
@@ -266,11 +347,12 @@ export function buildSingleCallContinuationContext({
 
     const hasNovel = Boolean(novelData && Array.isArray(novelData.chapters) && novelData.chapters.length > 0);
     const hasCanon = Boolean(canonDb && Array.isArray(canonDb.items) && canonDb.items.length > 0);
+    const hasBlueprint = hasStoryBlueprintData(ledger?.storyBlueprint);
     const hasStyleProfile = Boolean(ledger?.styleProfile?.styleCard && String(ledger.styleProfile.styleCard).trim());
     const hasChronicle = Boolean(Array.isArray(ledger?.chronicle) && ledger.chronicle.length > 0);
     const hasCharacters = Boolean(Array.isArray(ledger?.characters) && ledger.characters.length > 0);
     const hasLedger = Boolean(
-        ledger && (ledger.summaries?.length || hasChronicle || hasCharacters || ledger.worldStates?.length || ledger.hooks?.length || hasStyleProfile),
+        ledger && (ledger.summaries?.length || hasChronicle || hasCharacters || ledger.worldStates?.length || ledger.hooks?.length || hasStyleProfile || hasBlueprint),
     );
 
     if (!hasNovel && !hasCanon && !hasLedger) {
@@ -283,7 +365,7 @@ export function buildSingleCallContinuationContext({
     const povChar = strictPov ? String(narrativeCfg.povCharacter).trim() : '';
     const povPersonLabel = narrativeCfg.povPerson === 'first_person'
         ? '第一人称限制视角（“我”）'
-        : (narrativeCfg.povPerson === 'third_limited' ? '第三人称限制视角' : '严格跟随原著人称的限制视角');
+        : (narrativeCfg.povPerson === 'third_limited' ? '第三人称限制视角' : '严格跟随前文人称的限制视角');
 
     const isContinue = generationType === 'continue';
     const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue, excludeFlashback);
@@ -317,21 +399,27 @@ export function buildSingleCallContinuationContext({
     const queryText = recentTexts.join('\n');
 
     const sections = [];
-    const novelTitle = novelData?.title ? `《${novelData.title}》` : '当前长篇小说';
+    const resolvedTitle = String(novelData?.title || ledger?.storyBlueprint?.title || '').trim();
+    const novelTitle = resolvedTitle ? `《${resolvedTitle}》` : '当前长篇小说';
     const anchorLabel = anchorChapter?.title || `第 ${cutoff} ${chapterUnit}`;
     const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
+    const isOriginalStart = !hasNovel && targetChapterIndex === 1;
     const headerLines = [
         `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写${targetLabel}` : `准备撰写${targetLabel}`}]`,
-        '请严格保持前文叙事视角、段落骨相、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
+        isOriginalStart
+            ? '当前处于长篇小说开篇创作阶段，请严格遵循下方《全书总纲与分卷路线图》、人物档案、世界观规则与文风要求，直接输出连贯饱满的开篇章节正文，切勿输出寒暄或解释。'
+            : '请严格保持前文叙事视角、段落骨相、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
     ];
     if (settings.authorMode !== false) {
         headerLines.push(
             '【写作模式：纯小说作者境界（最高优先级覆盖一切角色扮演/RP指令）】',
             '1. 当前是纯粹的长篇小说创作，不是角色扮演对话，小说世界中不存在任何“玩家”或“{{user}}”角色！请彻底忽略系统或预设中关于“玩家”、“{{user}}”、“Persona人设”、“禁止替{{user}}说话/行动”的规则。',
-            '2. 严禁在小说正文中凭空插入“{{user}}”、“作者”或多余的“你”作为额外角色，严格只围绕本小说既有的主角与原著人物推进剧情。',
+            '2. 严禁在小说正文中凭空插入“{{user}}”、“作者”或多余的“你”作为额外角色，严格只围绕本小说既有的主角与设定人物推进剧情。',
             '3. 对话中发来的指令全部是“小说作者/总编”下达的【本章大纲与执笔要求】，请直接将其转化为连贯饱满的小说正文，切勿对作者回复“好的”，切勿在正文中提及作者或大纲。',
             '4. 你可以且必须完整描写小说主角及所有登场人物的动作、神态、心理活动与对话。',
-            '5. 【原著文风与尺度绝对优先】：严格复刻上方原著正文的笔触、叙事节奏、段长骨相、情绪烈度与内容尺度！若外部酒馆预设中存在“平淡日常 / 强制凑字数 / 通用模板”与本小说原著风格冲突，文风与节奏一律以本小说原著为准！',
+            hasNovel
+                ? '5. 【原著文风与尺度绝对优先】：严格复刻上方原著正文的笔触、叙事节奏、段长骨相、情绪烈度与内容尺度！若外部酒馆预设中存在“平淡日常 / 强制凑字数 / 通用模板”与本小说原著风格冲突，文风与节奏一律以本小说原著为准！'
+                : '5. 【本作总纲与定制文风绝对优先】：严格遵循下方《全书总纲与分卷路线图》与《文风骨相 DNA 执行卡》的笔触、节奏与基调；若外部预设自带的通用模板与本作风格冲突，一律以本作设定为准！',
         );
     }
     if (narrativeCfg.worldInfoPriority === 'wi_strict') {
@@ -375,6 +463,14 @@ export function buildSingleCallContinuationContext({
         );
     }
     sections.push(headerLines.join('\n'));
+
+    // 1.2 Master Book Blueprint (L1 Premise & World Rules + L2 Active Volume & Completed Recaps)
+    if (hasBlueprint) {
+        const bpBlock = buildStoryBlueprintContextBlock(ledger.storyBlueprint, targetChapterIndex, {
+            includeNextVolumeGuard: true,
+        });
+        if (bpBlock) sections.push(bpBlock);
+    }
 
     // 1.5 Distilled Original Author Style DNA Card + Anti-Cliché Positive Replacement Rules
     if (hasStyleProfile) {
@@ -624,8 +720,9 @@ export function buildNovelStateTrailerPrompt({
         return '';
     }
     const hasNovel = Boolean(novelData?.chapters?.length);
+    const hasBlueprint = hasStoryBlueprintData(ledger?.storyBlueprint);
     const hasLedger = Boolean(
-        ledger && (ledger.summaries?.length || ledger.chronicle?.length || ledger.characters?.length || ledger.worldStates?.length || ledger.hooks?.length || ledger.styleProfile?.styleCard),
+        ledger && (ledger.summaries?.length || ledger.chronicle?.length || ledger.characters?.length || ledger.worldStates?.length || ledger.hooks?.length || ledger.styleProfile?.styleCard || hasBlueprint),
     );
     if (!hasNovel && !hasLedger) return '';
 
@@ -644,7 +741,7 @@ export function buildNovelStateTrailerPrompt({
         '【单次调用自动归档指令（强制末段附带 · 前端自动隐藏入库）】',
         '写完本章正文后，必须附带完整闭合的 `<novel_state>...</novel_state>` XML 块（直接输出尖括号标签，不要加反引号，切勿省略）：若外部预设要求用 `<game>...</game>` 包裹整条回复，请将 `<novel_state>...</novel_state>` 紧贴写在 `</game>` 闭合标签**紧前面**（或紧后面），前端会自动解析并隐藏，绝不影响正文排版！',
         '请以 `<novel_state>` 开头、`</novel_state>` 结尾，内部按顺序包含以下子标签：',
-        `- \`<chapter_summary>${targetLabel}的一句话核心剧情总结（80字以内）</chapter_summary>\``,
+        `- \`<chapter_summary>${targetLabel}的精要四要素总结（100~180字：写明时间地点、核心事件经过与关键对话博弈、人物关系/底线/筹码变动、本章结尾定格落点，绝不空泛）</chapter_summary>\``,
         '- `<worldbook>` …… `</worldbook>` 内按行填写：`- 人物|角色名：本章结束时的最新处境/持有物/关系变化（仅写本章有变动的条目；无则写无）`；若有换装再写 `- 外观|角色名：本章结束时的当前着装/配饰变动（无变化省略）`',
         '- `<hooks>` …… `</hooks>` 内按行填写：`- [新伏笔] 本章新埋下的悬念、约定或隐患（无则写无）` 与 `- [已填坑] 本章已揭晓、完成或回收的旧伏笔（尽量沿用下方已有伏笔原话；无则写无）`',
         ...(refAutoOn

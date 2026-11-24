@@ -741,7 +741,7 @@ export async function runStoryAndCharacterArchivePipeline({
         .sort((a, b) => a.index - b.index);
 
     if (allChapters.length === 0) {
-        throw new Error('没有可供归档总结的章节内容，请先导入原著小说');
+        throw new Error('没有可供归档总结的章节内容，请先导入原著小说，或先创作至少 1 章正文后再执行归档');
     }
 
     const maxAvailableChapter = allChapters[allChapters.length - 1].index;
@@ -1099,7 +1099,7 @@ export async function summarizeSingleChapterState({
 
     const promptParts = [
         `请为《${novelTitle}》第 ${chapterIndex} 章${chapterTitle ? `（${chapterTitle}）` : ''}输出完整闭合的 \`<novel_state>...</novel_state>\` 存档块（以 \`<novel_state>\` 开头、\`</novel_state>\` 结尾，直接输出尖括号标签不要加反引号）：`,
-        `- \`<chapter_summary>第 ${chapterIndex} 章的具体核心事件经过与结果（60~140字，写明地点、出场人物、关键进展，绝不空泛）</chapter_summary>\``,
+        `- \`<chapter_summary>第 ${chapterIndex} 章的四要素精要总结（100~180字：写明时间地点、核心事件经过与关键对话博弈、人物关系/底线/筹码变动、本章结尾定格落点，绝不空泛或避重就轻）</chapter_summary>\``,
         '- `<worldbook>` …… `</worldbook>` 内按行写：`- 人物|角色名：本章结束时的最新处境/持有物/关系变化（仅写有变动的；无则写无）`；有换装再写 `- 外观|角色名：本章发生的着装或外观变化（无变化省略）`',
         '- `<hooks>` …… `</hooks>` 内按行写：`- [新伏笔] 本章新埋下的悬念、约定或把柄（无则写无）` 与 `- [已填坑] 本章回收或解决的旧伏笔（尽量沿用下方原话；无则写无）`',
         ...(refAutoOn
@@ -1147,4 +1147,236 @@ export async function summarizeSingleChapterState({
         };
     }
     throw new Error('单章自动总结未返回有效的 <novel_state> 结构');
+}
+
+/**
+ * Batch-summarizes all chapters missing a structured entry in `ledger.summaries`,
+ * using bounded concurrency (<= 2), empty/refusal guards, cooperative AbortSignal cancellation,
+ * and per-chapter persistence callbacks so completed chapters are never lost on interruption.
+ */
+export async function summarizeMissingChaptersBatch({
+    novelTitle = '当前小说',
+    chapters = [],
+    ledger = null,
+    callModel,
+    maxConcurrency = 2,
+    signal = null,
+    onChapterCompleted = null,
+    onProgress = () => {},
+}) {
+    throwIfAborted(signal);
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+
+    const existingSummarySet = new Set(
+        (ledger?.summaries || [])
+            .filter(s => s && Number(s.chapterIndex) > 0 && String(s.summary || '').trim())
+            .map(s => Number(s.chapterIndex)),
+    );
+
+    const candidates = (chapters || [])
+        .filter(c => c && Number(c.index) > 0 && !existingSummarySet.has(Number(c.index)))
+        .sort((a, b) => Number(a.index) - Number(b.index));
+
+    const validTargets = [];
+    let skippedCount = 0;
+    for (const ch of candidates) {
+        const cleanBody = cleanTagText(ch.content || '');
+        if (!cleanBody || cleanBody.length < 80 || (cleanBody.length < 400 && isModelRefusalText(cleanBody))) {
+            skippedCount += 1;
+            continue;
+        }
+        validTargets.push({ ...ch, cleanBody });
+    }
+
+    if (validTargets.length === 0) {
+        return { summarizedCount: 0, skippedCount, failedCount: 0, results: [] };
+    }
+
+    const concurrency = Math.max(1, Math.min(2, Number(maxConcurrency) || 2));
+    let done = 0;
+    let summarizedCount = 0;
+    let failedCount = 0;
+
+    onProgress({
+        step: 0,
+        totalSteps: validTargets.length,
+        label: `发现 ${validTargets.length} 章缺少单章精要总结，开始批量补齐（并发 ≤ ${concurrency}）...`,
+    });
+
+    const tasks = validTargets.map(ch => async () => {
+        try {
+            const extracted = await summarizeSingleChapterState({
+                novelTitle,
+                chapterIndex: ch.index,
+                chapterTitle: ch.title || `第 ${ch.index} 章`,
+                chapterText: ch.cleanBody,
+                ledger,
+                callModel,
+                signal,
+            });
+            if (typeof onChapterCompleted === 'function') {
+                await onChapterCompleted({ chapter: ch, extracted });
+            }
+            summarizedCount += 1;
+            done += 1;
+            onProgress({
+                step: done,
+                totalSteps: validTargets.length,
+                label: `✅ 已补齐第 ${ch.index} 章《${ch.title || `第 ${ch.index} 章`}》单章总结（${done}/${validTargets.length}）`,
+            });
+            return { chapterIndex: ch.index, status: 'ok', extracted };
+        } catch (err) {
+            if (isAbortError(err) || signal?.aborted) throw err;
+            failedCount += 1;
+            done += 1;
+            onProgress({
+                step: done,
+                totalSteps: validTargets.length,
+                label: `⚠️ 第 ${ch.index} 章补总结跳过：${err?.message || err}（${done}/${validTargets.length}）`,
+            });
+            return { chapterIndex: ch.index, status: 'error', error: err?.message || String(err) };
+        }
+    });
+
+    const results = await runBoundedPool(tasks, concurrency, { signal });
+    throwIfAborted(signal);
+    return { summarizedCount, skippedCount, failedCount, results };
+}
+
+/**
+ * Generates a high-density Volume-Level Recap + L2 Blueprint Drift Audit in 1 API call.
+ * Synthesizes actual written chapter summaries/chronicle/prose inside the volume's chapter range,
+ * audits completion & drift against the L2 volume plan, and tracks resolved vs carryover hooks.
+ */
+export async function generateVolumeRecapAndAudit({
+    novelTitle = '当前小说',
+    volume,
+    allChapters = [],
+    ledger = null,
+    worldInfoContext = '',
+    callModel,
+    signal = null,
+}) {
+    throwIfAborted(signal);
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+    if (!volume || typeof volume !== 'object') {
+        throw new Error('缺少需要复盘的目标卷信息');
+    }
+
+    const startCh = Math.max(1, Number(volume.startChapter) || 1);
+    const endCh = Math.max(startCh, Number(volume.endChapter) || startCh + 19);
+
+    const summaryByCh = new Map(
+        (ledger?.summaries || [])
+            .filter(s => s && Number(s.chapterIndex) >= startCh && Number(s.chapterIndex) <= endCh && String(s.summary || '').trim())
+            .map(s => [Number(s.chapterIndex), s]),
+    );
+    const volChronicle = (ledger?.chronicle || [])
+        .filter(e => e && Number(e.endChapter || e.startChapter || 0) >= startCh && Number(e.startChapter || 0) <= endCh)
+        .sort((a, b) => (a.startChapter || 0) - (b.startChapter || 0));
+    const volChapters = (allChapters || [])
+        .filter(c => c && Number(c.index) >= startCh && Number(c.index) <= endCh && String(c.content || '').trim())
+        .sort((a, b) => Number(a.index) - Number(b.index));
+
+    if (summaryByCh.size === 0 && volChronicle.length === 0 && volChapters.length === 0) {
+        throw new Error(`第 ${volume.index} 卷（第 ${startCh}~${endCh} 章）尚无已写正文、单章总结或编年史可供复盘`);
+    }
+
+    const chapterDigests = [];
+    const seenCh = new Set();
+    for (const ch of volChapters) {
+        seenCh.add(Number(ch.index));
+        const sum = summaryByCh.get(Number(ch.index));
+        if (sum?.summary) {
+            chapterDigests.push(`- 第 ${ch.index} 章《${ch.title || sum.title || ''}》：${sum.summary}`);
+        } else {
+            const clean = cleanTagText(ch.content || '').replace(/\s+/g, ' ');
+            const head = clean.slice(0, 140);
+            const tail = clean.length > 260 ? ` …… 结尾：${clean.slice(-120)}` : '';
+            chapterDigests.push(`- 第 ${ch.index} 章《${ch.title || ''}》（正文摘录）：${head}${tail}`);
+        }
+    }
+    for (const [idx, sum] of [...summaryByCh.entries()].sort((a, b) => a[0] - b[0])) {
+        if (!seenCh.has(idx)) {
+            chapterDigests.push(`- 第 ${idx} 章《${sum.title || ''}》：${sum.summary}`);
+        }
+    }
+
+    const openHooks = (ledger?.hooks || []).filter(h => h && h.status !== 'resolved').slice(-15);
+    const systemPrompt = [
+        '你是专业长篇小说总编与卷末复盘官，负责把一卷已写完（或阶段性已写）的章节提炼成高密度《卷级总复盘》，并对照原定 L2 卷纲做客观的完成度与偏离诊断。',
+        '绝对纪律：只依据真实已发生的章节事实复盘，直白具体、不回避关键事件与底线变化，不凭空捏造尚未发生的剧情；严格按指定 XML 标签输出。',
+    ].join('\n');
+
+    const promptParts = [
+        `请为《${novelTitle}》第 ${volume.index} 卷《${volume.title}》（规划范围：${volume.chapterRange}）生成高密度《卷级总复盘》与《卷纲对照校准报告》：`,
+        '',
+        '【原定 L2 卷纲目标】：',
+        `- 本卷核心目标：${volume.goal || '（未填写）'}`,
+        `- 关键转折与高潮规划：${volume.keyTurns || '（未填写）'}`,
+        `- 原定卷末落点与下卷钩子：${volume.endingHook || '（未填写）'}`,
+    ];
+    if (volChronicle.length > 0) {
+        promptParts.push('', '【本卷已归档编年史事件】：');
+        for (const e of volChronicle) {
+            promptParts.push(`- (${e.chapterRange}) ${e.title}：${e.summary}`);
+        }
+    }
+    if (chapterDigests.length > 0) {
+        promptParts.push('', `【本卷实际章节进展（共 ${chapterDigests.length} 章）】：`, ...chapterDigests);
+    }
+    if (openHooks.length > 0) {
+        promptParts.push('', '【当前未回收伏笔总账（请判断哪些已在本卷回收、哪些需顺延下一卷）】：');
+        for (const h of openHooks) {
+            promptParts.push(`- (#${h.plantedChapter || 1}) ${h.content}`);
+        }
+    }
+    if (worldInfoContext && String(worldInfoContext).trim()) {
+        promptParts.push('', '【世界书设定参考】：', String(worldInfoContext).slice(0, 3000));
+    }
+
+    promptParts.push(
+        '',
+        '严格按以下 4 个 XML 标签输出（直接输出尖括号标签不要加反引号）：',
+        '- `<volume_recap>` …… `</volume_recap>`：300~500 字高密度卷级总复盘（按时间因果写清本卷实际完成的主线推进、核心人物关系/立场/筹码与着装变化、重要得失与卷末局势定格，供后续各卷长期参考）',
+        '- `<blueprint_check>` …… `</blueprint_check>`：对照原定 L2 卷纲的 3 项客观校准（① 已完成的关键节点；② 实际写作中偏离或新生长出的精彩分支；③ 尚未完成、建议顺延到下一卷收尾的事项）',
+        '- `<resolved_hooks>` …… `</resolved_hooks>`：本卷已经回收/揭晓的旧伏笔（每条一行，尽量沿用上方伏笔原话；无则写无）',
+        '- `<carryover_hooks>` …… `</carryover_hooks>`：本卷新埋下或需要顺延到下一卷重点推进的伏笔（每条一行；无则写无）',
+    );
+
+    const raw = await callModel({
+        stage: `volume_recap_v${volume.index}`,
+        systemPrompt,
+        prompt: promptParts.join('\n'),
+    });
+    throwIfAborted(signal);
+
+    const cleaned = cleanTagText(raw);
+    if (!/<volume_recap>/i.test(cleaned) && isModelRefusalText(cleaned)) {
+        throw new Error(`模型返回了拒答/道歉内容：${cleaned.slice(0, 120)}`);
+    }
+
+    const recap = extractInner(cleaned, 'volume_recap') || cleaned;
+    const blueprintCheck = extractInner(cleaned, 'blueprint_check');
+    const parseHookLines = (tag) => extractInner(cleaned, tag)
+        .split('\n')
+        .map(l => l.replace(/^[\s\-*•·\d.、]+/, '').replace(/^[\[【]?(?:已回收|已填坑|新伏笔|顺延|待填)[\]】]?[:：\s\-—]*/i, '').trim())
+        .filter(l => l && !isPlaceholder(l));
+
+    if (!recap || recap.length < 30) {
+        throw new Error('生成的卷末复盘内容过短或为空，请重试');
+    }
+
+    return {
+        recap,
+        blueprintCheck,
+        resolvedHooks: parseHookLines('resolved_hooks'),
+        carryoverHooks: parseHookLines('carryover_hooks'),
+        coveredChapters: chapterDigests.length,
+        updatedAt: Date.now(),
+    };
 }

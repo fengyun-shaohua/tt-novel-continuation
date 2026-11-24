@@ -6,9 +6,14 @@
  * through `callModel` (which applies the user's selected API + Tavern preset).
  */
 
-import { buildUnarchivedRecentChaptersBridge } from './context-assembler.js';
+import {
+    buildStoryBlueprintContextBlock,
+    buildUnarchivedRecentChaptersBridge,
+    hasStoryBlueprintData,
+    resolveActiveVolume,
+} from './context-assembler.js';
 import { stripNonStoryBlocks } from './parser.js';
-import { isModelRefusalText } from './story-archiver.js';
+import { isModelRefusalText, parseCharacterProfiles } from './story-archiver.js';
 import { cleanDistillProse, throwIfAborted } from './style-distiller.js';
 
 const PACE_LABELS = Object.freeze({
@@ -40,6 +45,7 @@ export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { 
 
     const latestContinued = sortedContinued.length > 0 ? sortedContinued[sortedContinued.length - 1] : null;
     const anchorCh = latestContinued || origCutoffCh;
+    const isFreshStart = !anchorCh && cutoff === 0;
     const prevChapterIndex = anchorCh ? Number(anchorCh.index || cutoff) : cutoff;
     const nextChapterIndex = prevChapterIndex + 1;
     const sampleTitle = origCutoffCh?.title || novelData?.chapters?.[0]?.title || '';
@@ -53,9 +59,10 @@ export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { 
         prevChapterIndex,
         nextChapterIndex,
         chapterUnit,
-        anchorTitle: anchorCh?.title || `第 ${prevChapterIndex} ${chapterUnit}`,
+        anchorTitle: isFreshStart ? '新书开篇（从第 1 章起笔）' : (anchorCh?.title || `第 ${prevChapterIndex} ${chapterUnit}`),
         tailSnippet,
         shortClosing,
+        isFreshStart,
     };
 }
 
@@ -197,17 +204,34 @@ export function buildDirectorOutlinePrompt({
         '7. 严格按要求的 `<chapter_outline index="章号" title="章节简短标题">...</chapter_outline>` 标签输出每一章，不要输出额外寒暄或解释。',
     ].join('\n');
 
+    const bookTitle = String(novelData?.title || ledger?.storyBlueprint?.title || '').trim() || '当前长篇小说';
+    const isFreshOriginal = Boolean(anchor.isFreshStart);
+    const activeVolume = resolveActiveVolume(ledger?.storyBlueprint, anchor.nextChapterIndex);
+    const blueprintBlock = buildStoryBlueprintContextBlock(ledger?.storyBlueprint, anchor.nextChapterIndex, {
+        includeNextVolumeGuard: true,
+    });
+
     const parts = [
-        `【目标作品】：《${novelData?.title || '当前长篇小说'}》`,
-        isMulti
-            ? `【规划目标】：紧接【${anchor.anchorTitle}】结尾，一次性连贯规划 **连续 ${targetChapters} ${anchor.chapterUnit}**（第 ${anchor.nextChapterIndex} ~ ${endChapterIndex} ${anchor.chapterUnit}）的分章导演大纲！`
-            : `【规划目标】：紧接【${anchor.anchorTitle}】结尾，策划【第 ${anchor.nextChapterIndex} ${anchor.chapterUnit}】的详细分镜导演大纲。`,
-        `【规划规格】：每章分 **${targetScenes} 个自然切镜**；整体推进步幅：**${paceDesc}**。`,
+        `【目标作品】：《${bookTitle}》`,
+        isFreshOriginal
+            ? (isMulti
+                ? `【规划目标】：作为新书开篇，一次性连贯规划 **开篇连续 ${targetChapters} ${anchor.chapterUnit}**（第 1 ~ ${endChapterIndex} ${anchor.chapterUnit}）的分章导演大纲！`
+                : `【规划目标】：作为新书开篇，策划【第 1 ${anchor.chapterUnit}】的详细分镜导演大纲（立住核心人物、开场矛盾与钩子）。`)
+            : (isMulti
+                ? `【规划目标】：紧接【${anchor.anchorTitle}】结尾，一次性连贯规划 **连续 ${targetChapters} ${anchor.chapterUnit}**（第 ${anchor.nextChapterIndex} ~ ${endChapterIndex} ${anchor.chapterUnit}）的分章导演大纲！`
+                : `【规划目标】：紧接【${anchor.anchorTitle}】结尾，策划【第 ${anchor.nextChapterIndex} ${anchor.chapterUnit}】的详细分镜导演大纲。`),
+        `【规划规格】：每章分 **${targetScenes} 个自然切镜**；整体推进步幅：**${paceDesc}**。${activeVolume ? `当前对应卷纲：第 ${activeVolume.index} 卷《${activeVolume.title}》（${activeVolume.chapterRange}）。` : ''}`,
         '',
         brief
             ? `【作者提供的简略过程与结果（最高剧情指令，必须完整落实${isMulti ? `并合理分配到第 ${anchor.nextChapterIndex}~${endChapterIndex} ${anchor.chapterUnit}中层层递进` : '并自然展开'}，不得擅自改写作者指定的结果）】：\n${brief}`
-            : `【作者未填写具体过程】：请基于下方最新结尾、近期编年史与待填伏笔，自主构思一版最贴合原著走向与节奏的${isMulti ? `连续 ${targetChapters} ${anchor.chapterUnit}` : '下一章'}分镜大纲！`,
+            : (isFreshOriginal
+                ? `【作者未填写具体分章过程】：请严格依据下方《L1 全书总纲与 L2 分卷路线图》、核心人物档案与世界书设定，自主构思一版极具张力与节奏感的开篇第 1~${endChapterIndex} ${anchor.chapterUnit}分镜大纲！`
+                : `【作者未填写具体过程】：请基于下方最新结尾、卷纲路线、近期编年史与待填伏笔，自主构思一版最贴合本作走向与节奏的${isMulti ? `连续 ${targetChapters} ${anchor.chapterUnit}` : '下一章'}分镜大纲！`),
     ];
+
+    if (blueprintBlock) {
+        parts.push('', blueprintBlock);
+    }
 
     if (anchor.tailSnippet) {
         parts.push(
@@ -432,4 +456,280 @@ export async function generateDirectorOutline({
         anchorTitle: anchor.anchorTitle,
         generatedAt: Date.now(),
     };
+}
+
+function extractBlueprintTag(text, tag) {
+    const m = String(text || '').match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'));
+    return m ? m[1].trim() : '';
+}
+
+function isEmptyBlueprintPlaceholder(val) {
+    const s = String(val || '').trim();
+    return !s || /^(?:无|暂无|none|n\/a|-|—|省略)$/i.test(s);
+}
+
+/**
+ * Builds the unified L1 Master Blueprint + L2 Volume Roadmap + Initial 4-Dim Characters + Initial Hooks prompt.
+ * Supports BOTH a 1-sentence brainwave (expanded via creativity + WorldInfo) AND a large pasted
+ * worldbuilding/character draft (faithfully structured without overwriting author facts).
+ */
+export function buildMasterBlueprintPrompt({
+    title = '',
+    creationMode = 'original', // 'original' | 'fanfic_new' | 'continuation'
+    genreAndTone = '',
+    seedNotes = '',
+    volumeCount = 4,
+    chaptersPerVolume = 15,
+    startChapter = 1,
+    narrativeConfig = null,
+    worldInfoContext = '',
+    novelData = null,
+    existingLedger = null,
+} = {}) {
+    const targetVols = Math.max(2, Math.min(8, Number(volumeCount) || 4));
+    const perVol = Math.max(5, Math.min(50, Number(chaptersPerVolume) || 15));
+    const startCh = Math.max(1, Number(startChapter) || 1);
+    const modeDesc = creationMode === 'original'
+        ? '原创世界观长篇小说（从零开新书）'
+        : (creationMode === 'fanfic_new' ? '同人新开坑长篇小说（依托原作世界书/设定从第 1 章起笔）' : '长篇续写后续卷纲规划');
+    const strictPov = narrativeConfig?.povMode === 'strict_limited' && Boolean(String(narrativeConfig?.povCharacter || '').trim());
+    const povChar = strictPov ? String(narrativeConfig.povCharacter).trim() : '';
+    const hasSeed = Boolean(String(seedNotes || '').trim());
+    const isLargeDraft = String(seedNotes || '').trim().length >= 300;
+
+    const systemPrompt = [
+        '你是顶级长篇小说总策划与结构架构师，负责为作者建立【逻辑严密、冲突清晰、分卷递进、人物立体不 OOC】的全书 L1 总纲、L2 分卷路线图、初始核心人物 4 维档案与长线伏笔总账。',
+        '【核心策划纪律】：',
+        '1. 若作者提供了详细的设定草稿或世界书，必须 100% 忠实拆解并吸收其中的人物、势力、能力规则与既定因果，绝不擅自篡改作者原设；若作者只给了简短脑洞，则顺着其核心看点补全扎实的因果链与人物动机。',
+        '2. 每一卷（L2）必须有独立且递进的核心矛盾、清晰的中段转折与卷末高潮，各卷之间严禁原地重复套路；预计章号区间必须连续衔接。',
+        '3. 核心人物必须有独立立场、私心顾虑、说话方式特征与防 OOC 红线，拒绝工具人化、拒绝贴标签式的扁平人设。',
+        ...(strictPov ? [`4. 本书锁定「${povChar}」严格单视角（Limited POV），所有主线推进与伏笔揭晓必须规划为可通过「${povChar}」的所见所闻逐步触达。`] : []),
+        '5. 严格按要求的 XML 标签输出，不要输出寒暄、开场白或额外解释。',
+    ].join('\n');
+
+    const parts = [
+        `【策划类型】：${modeDesc}`,
+        title ? `【暂定书名】：《${title}》` : '【暂定书名】：尚未命名（请根据题材给出一个有质感、不俗套的书名）',
+        genreAndTone ? `【题材与基调】：${genreAndTone}` : '',
+        `【分卷规划规模】：规划 **${targetVols} 卷**（从第 ${startCh} 章起，每卷约 ${perVol} 章，可按剧情体量自然微调起止章号）。`,
+        '',
+        hasSeed
+            ? (isLargeDraft
+                ? `【作者提供的完整世界观 / 人设 / 剧情草稿（最高设定权威——请完整拆解、结构化并补齐分卷节拍，严禁遗漏核心人物与设定）】：\n${String(seedNotes).trim().slice(0, 14000)}`
+                : `【作者提供的核心脑洞与开篇想法（最高创意指令——请以此为核心展开成完整的全书总纲、分卷路线、核心人物与伏笔）】：\n${String(seedNotes).trim()}`)
+            : '【作者未填额外草稿】：请结合下方已激活酒馆世界书、现有剧情与人物信息，规划一份完整可落地的全书总纲与分卷路线图！',
+    ].filter(Boolean);
+
+    if (worldInfoContext && String(worldInfoContext).trim()) {
+        parts.push(
+            '',
+            '【已激活酒馆世界书设定（世界观底骨、人物外貌/能力与势力规则必须严格贴合此处）】：',
+            String(worldInfoContext).trim(),
+        );
+    }
+
+    const existingChronicle = (existingLedger?.chronicle || []).slice(-10);
+    if (existingChronicle.length > 0) {
+        parts.push('', '【已有前文剧情编年史（后续卷纲必须承接此处，不可推翻重写）】：');
+        for (const e of existingChronicle) {
+            parts.push(`- (${e.chapterRange}) ${e.title}：${e.summary}`);
+        }
+    } else if (novelData?.chapters?.length > 0) {
+        parts.push('', `【已导入原著进度】：《${novelData.title}》共 ${novelData.totalChapters} 章，当前锚点第 ${novelData.cutoffChapterIndex} 章。`);
+    }
+
+    const existingChars = (existingLedger?.characters || []).slice(0, 10);
+    if (existingChars.length > 0) {
+        parts.push('', '【已有核心人物档案（请在输出中保留并按需要补充新登场核心角色）】：');
+        for (const c of existingChars) {
+            parts.push(`- ${c.name}${c.role ? `（${c.role}）` : ''}：${c.currentSituation || c.canonFoundation || ''}`);
+        }
+    }
+
+    const vol1End = startCh + perVol - 1;
+    parts.push(
+        '',
+        '严格按以下 4 个顶级 XML 块输出完整立项蓝图（直接输出尖括号标签不要加反引号）：',
+        '- 块 1：`<book_blueprint>` …… `</book_blueprint>`（内部依次包含以下单行子标签）：',
+        `  · \`<title>${title || '作品正式书名'}</title>\``,
+        '  · `<genre_tone>题材定位、叙事基调与核心看点（1~2句）</genre_tone>`',
+        '  · `<premise>250~500字全书总纲：核心开端事件、主线驱动矛盾、主角成长/变化弧线与多线交织脉络</premise>`',
+        '  · `<world_rules>世界观硬规则、力量/社会/机构运作体系与创作不可违背的逻辑底线（150~350字）</world_rules>`',
+        '  · `<ending_direction>全书终局方向、最终高潮核心冲突与主题收束（100~220字）</ending_direction>`',
+        `- 块 2：\`<volumes>\` …… \`</volumes>\`（按推进顺序输出 **${targetVols} 卷**；每卷以 \`<volume>\` 开头、\`</volume>\` 结尾，内部依次包含）：`,
+        '  · `<title>本卷简短有力的卷名（不含“第X卷”前缀）</title>`',
+        `  · \`<chapters>第 ${startCh}~${vol1End} 章</chapters>\``,
+        '  · `<goal>本卷核心目标、主要矛盾与舞台背景（80~160字）</goal>`',
+        '  · `<key_turns>本卷 3~5 个关键转折、中段冲突升级与卷末高潮节点（120~240字）</key_turns>`',
+        '  · `<ending_hook>本卷结尾定格画面与引向下一卷的核心悬念（50~100字）</ending_hook>`',
+        '- 块 3：`<characters>` …… `</characters>`（输出 **3~8 位**核心人物；每位以 `<character>` 开头、`</character>` 结尾，内部依次包含）：',
+        '  · `<name>人物姓名</name>`',
+        '  · `<role>核心身份与在主线中的位置</role>`',
+        '  · `<canon_foundation>能力体系、出身履历、世界观/原作底骨与深层动机</canon_foundation>`',
+        '  · `<current_appearance>稳定外貌特征与开篇常服/配饰锚点</current_appearance>`',
+        '  · `<current_situation>开篇/当前所处境地、手里筹码、弱点与对主角/他人的初始态度</current_situation>`',
+        '  · `<voice_and_quotes>说话长短习惯、语气口癖、微动作特征 + 2 句示范性原味台词</voice_and_quotes>`',
+        '  · `<ooc_red_lines>绝对 OOC 红线（明确列出 2~3 个绝不能写崩的雷区）</ooc_red_lines>`',
+        '- 块 4：`<hooks>` …… `</hooks>`（列出 **5~10 条**贯穿全书与前两卷的核心伏笔/暗线，每条一行：`[新伏笔] 具体伏笔内容 (#预计埋下章号)`）',
+    );
+
+    return { systemPrompt, prompt: parts.join('\n') };
+}
+
+/**
+ * Deterministically parses L1 Blueprint, L2 Volumes, initial 4-Dim Characters, and initial Hooks.
+ */
+export function parseMasterBlueprintResponse(rawText, {
+    creationMode = 'original',
+    fallbackTitle = '',
+    fallbackGenre = '',
+    seedNotes = '',
+    startChapter = 1,
+} = {}) {
+    const cleaned = cleanDistillProse(rawText);
+    const bpInner = extractBlueprintTag(cleaned, 'book_blueprint') || cleaned;
+    const title = extractBlueprintTag(bpInner, 'title').replace(/^[《「『]+|[》」』]+$/g, '').trim() || String(fallbackTitle || '').trim();
+    const genreAndTone = extractBlueprintTag(bpInner, 'genre_tone') || String(fallbackGenre || '').trim();
+    const premise = extractBlueprintTag(bpInner, 'premise');
+    const worldRules = extractBlueprintTag(bpInner, 'world_rules');
+    const endingDirection = extractBlueprintTag(bpInner, 'ending_direction');
+
+    const volumesInner = extractBlueprintTag(cleaned, 'volumes') || cleaned;
+    const volumes = [];
+    const volRegex = /<volume>([\s\S]*?)<\/volume>/gi;
+    let m;
+    let cursor = Math.max(1, Number(startChapter) || 1);
+    while ((m = volRegex.exec(volumesInner)) !== null) {
+        const block = m[1];
+        const idx = volumes.length + 1;
+        const vTitle = extractBlueprintTag(block, 'title').replace(/^第\s*\d+\s*卷[\s·：:.\-]*/, '').trim() || `第 ${idx} 卷`;
+        const rangeRaw = extractBlueprintTag(block, 'chapters');
+        const nums = [...rangeRaw.matchAll(/\d+/g)].map(n => Number(n[0])).filter(n => n > 0);
+        const startCh = nums[0] || cursor;
+        const endCh = nums[nums.length - 1] >= startCh ? nums[nums.length - 1] : (startCh + 14);
+        cursor = endCh + 1;
+        volumes.push({
+            id: `vol_${idx}_${Date.now().toString(36)}`,
+            index: idx,
+            title: vTitle,
+            chapterRange: rangeRaw || `第 ${startCh}~${endCh} 章`,
+            startChapter: startCh,
+            endChapter: endCh,
+            goal: extractBlueprintTag(block, 'goal'),
+            keyTurns: extractBlueprintTag(block, 'key_turns'),
+            endingHook: extractBlueprintTag(block, 'ending_hook'),
+            status: idx === 1 ? 'active' : 'planned',
+            recap: '',
+            recapCheck: '',
+            recapUpdatedAt: 0,
+        });
+    }
+
+    const characters = parseCharacterProfiles(cleaned, Math.max(1, Number(startChapter) || 1));
+
+    const hooksInner = extractBlueprintTag(cleaned, 'hooks');
+    const hooks = [];
+    if (hooksInner) {
+        const lines = hooksInner.split('\n').map(l => l.replace(/^[\s\-*•·\d.、]+/, '').trim()).filter(Boolean);
+        for (const line of lines) {
+            if (isEmptyBlueprintPlaceholder(line)) continue;
+            const chMatch = line.match(/\(#?第?\s*(\d+)\s*章?\)\s*$/);
+            const plantedChapter = chMatch ? Number(chMatch[1]) : Math.max(1, Number(startChapter) || 1);
+            const content = line
+                .replace(/^[\[【]?(?:新伏笔|待填|伏笔|暗线|open)[\]】]?[:：\s\-—]*/i, '')
+                .replace(/\(#?第?\s*\d+\s*章?\)\s*$/, '')
+                .trim();
+            if (!isEmptyBlueprintPlaceholder(content)) {
+                hooks.push({
+                    id: `hook_bp_${Date.now().toString(36)}_${hooks.length + 1}`,
+                    content,
+                    plantedChapter,
+                    autoExtracted: true,
+                    status: 'open',
+                });
+            }
+        }
+    }
+
+    return {
+        blueprint: {
+            creationMode,
+            title,
+            genreAndTone,
+            seedNotes: String(seedNotes || '').trim(),
+            premise,
+            worldRules,
+            endingDirection,
+            volumes,
+            updatedAt: Date.now(),
+        },
+        characters,
+        hooks,
+    };
+}
+
+/**
+ * Generates L1 Master Blueprint + L2 Volume Roadmap + Initial Characters + Initial Hooks in 1 API call.
+ */
+export async function generateMasterBlueprint({
+    title = '',
+    creationMode = 'original',
+    genreAndTone = '',
+    seedNotes = '',
+    volumeCount = 4,
+    chaptersPerVolume = 15,
+    startChapter = 1,
+    narrativeConfig = null,
+    worldInfoContext = '',
+    novelData = null,
+    existingLedger = null,
+    callModel,
+    signal = null,
+}) {
+    throwIfAborted(signal);
+    if (typeof callModel !== 'function') {
+        throw new Error('缺少可用的模型调用函数 callModel');
+    }
+    if (!String(seedNotes || '').trim() && !String(worldInfoContext || '').trim() && !novelData?.chapters?.length && !existingLedger?.chronicle?.length) {
+        throw new Error('请先输入核心脑洞/世界观人设草稿（或挂载已激活的酒馆世界书）后再生成总纲');
+    }
+
+    const { systemPrompt, prompt } = buildMasterBlueprintPrompt({
+        title,
+        creationMode,
+        genreAndTone,
+        seedNotes,
+        volumeCount,
+        chaptersPerVolume,
+        startChapter,
+        narrativeConfig,
+        worldInfoContext,
+        novelData,
+        existingLedger,
+    });
+
+    const raw = await callModel({
+        stage: 'master_blueprint_generate',
+        systemPrompt,
+        prompt,
+    });
+    throwIfAborted(signal);
+
+    const cleanedRaw = cleanDistillProse(raw);
+    const hasBlueprintTags = /<(?:book_blueprint|volumes|volume)\b/i.test(cleanedRaw);
+    if (!hasBlueprintTags && isModelRefusalText(cleanedRaw)) {
+        throw new Error(`模型返回了拒答/道歉内容（未覆盖现有总纲）：${cleanedRaw.slice(0, 120)}`);
+    }
+
+    const parsed = parseMasterBlueprintResponse(raw, {
+        creationMode,
+        fallbackTitle: title || novelData?.title || '',
+        fallbackGenre: genreAndTone,
+        seedNotes,
+        startChapter,
+    });
+    if (!hasStoryBlueprintData(parsed.blueprint) && parsed.blueprint.volumes.length === 0) {
+        throw new Error('未能解析出有效的全书总纲或分卷规划，请检查模型/预设后重试');
+    }
+    return parsed;
 }

@@ -377,7 +377,10 @@ function renderOutlineTab(bodyEl) {
     const wiSummary = nCfg.worldInfoMode === 'off'
         ? '世界书关闭'
         : (nCfg.worldInfoPriority === 'wi_strict' ? '世界书强一致' : '世界书兜底');
-    const readyMeta = `已挂载：${ledger.characters?.length || 0} 人物 · ${ledger.chronicle?.length || 0} 编年史 · ${openHooks.length} 伏笔 · ${povSummary} · ${wiSummary}`;
+    const refSummary = nCfg.referenceTimelineMode
+        ? ` · 🧭对齐基准#${nCfg.referenceCursorChapter || 0}`
+        : '';
+    const readyMeta = `已挂载：${ledger.characters?.length || 0} 人物 · ${ledger.chronicle?.length || 0} 编年史 · ${openHooks.length} 伏笔 · ${povSummary} · ${wiSummary}${refSummary}`;
 
     const progressHtml = renderTaskProgressBanner('outline', task);
 
@@ -682,6 +685,9 @@ function renderMemoryTab(bodyEl) {
     const povBadge = nCfg.povMode === 'strict_limited' && nCfg.povCharacter
         ? `🔒 单视角：${nCfg.povCharacter}`
         : '👁️ 跟随原著视角';
+    const refBadge = nCfg.referenceTimelineMode
+        ? ` · 🧭 基准对齐#${nCfg.referenceCursorChapter || 0}`
+        : '';
     const wiBadge = nCfg.worldInfoMode === 'off'
         ? '🌐 后台世界书：关'
         : `🌐 后台世界书：${nCfg.worldInfoPriority === 'wi_strict' ? '严格遵循世界书' : '小说优先·世界书兜底'}`;
@@ -689,7 +695,7 @@ function renderMemoryTab(bodyEl) {
     const narrativeConfigHtml = `
         <details class="tt-novel-fold-card tt-novel-narrative-box">
             <summary>
-                🧭 本书叙事视角、时间线与世界书规则（${escapeHtml(povBadge)} · ${escapeHtml(wiBadge)}）
+                🧭 本书叙事视角、时间线与世界书规则（${escapeHtml(povBadge)}${escapeHtml(refBadge)} · ${escapeHtml(wiBadge)}）
             </summary>
             <div class="tt-novel-edit-grid" style="margin-top: 8px;">
                 <div class="tt-novel-row-3">
@@ -734,8 +740,25 @@ function renderMemoryTab(bodyEl) {
                     </label>
                     <label class="tt-novel-check-row">
                         <input type="checkbox" id="tt-novel-ncfg-skip-fb" ${nCfg.excludeFlashbackFromAnchor !== false ? 'checked' : ''} />
-                        <span>续写锚点与检索自动跳过「倒叙/他视角」章节（可在「📑 目录」按区间标注）</span>
+                        <span>续写锚点与检索自动跳过「倒叙/插叙」章节（可在「📑 目录」按区间标注）</span>
                     </label>
+                </div>
+                <div class="tt-novel-custom-api-box">
+                    <label class="tt-novel-check-row" style="margin-bottom: 6px;">
+                        <input type="checkbox" id="tt-novel-ncfg-ref-mode" ${nCfg.referenceTimelineMode ? 'checked' : ''} />
+                        <span><b>🧭 启用「平行视角 · 对照已完结基准时间线」模式</b>（适合“A视角已完结、续写B视角太监线”：先在「📑 目录」把已完结A视角区间标为「🧭 基准时间线」，再填写当前已对齐的基准章号）</span>
+                    </label>
+                    <div class="tt-novel-row-3">
+                        <label>基准时间线名称：
+                            <input type="text" id="tt-novel-ncfg-ref-label" class="text_pole" value="${escapeHtml(nCfg.referencePovLabel || '')}" placeholder="例如：博士视角原著" />
+                        </label>
+                        <label>当前已对齐基准章号（Cursor）：
+                            <input type="number" id="tt-novel-ncfg-ref-cursor" class="text_pole" min="0" value="${Number(nCfg.referenceCursorChapter || 0)}" />
+                        </label>
+                        <label>前方基准路标视野（章数）：
+                            <input type="number" id="tt-novel-ncfg-ref-window" class="text_pole" min="2" max="20" value="${Number(nCfg.referenceLookaheadChapters || 8)}" />
+                        </label>
+                    </div>
                 </div>
                 <div class="tt-novel-action-bar">
                     <button type="button" id="tt-novel-ncfg-save" class="menu_button tt-novel-btn-sm tt-novel-btn-primary">💾 保存本书叙事与世界书规则</button>
@@ -859,8 +882,9 @@ function renderMemoryTab(bodyEl) {
                                 <input type="text" class="text_pole" data-field="chapterRange" value="${escapeHtml(evt.chapterRange || '')}" placeholder="章号如 #1-#7" />
                                 <input type="text" class="text_pole" data-field="timeLabel" value="${escapeHtml(evt.timeLabel || '')}" placeholder="时间阶段" />
                                 <select class="text_pole" data-field="timelinePhase">
-                                    <option value="main" ${evt.timelinePhase !== 'flashback' ? 'selected' : ''}>主线推进</option>
-                                    <option value="flashback" ${evt.timelinePhase === 'flashback' ? 'selected' : ''}>倒叙/他视角补完</option>
+                                    <option value="main" ${evt.timelinePhase !== 'flashback' && evt.timelinePhase !== 'reference' ? 'selected' : ''}>主线推进</option>
+                                    <option value="reference" ${evt.timelinePhase === 'reference' ? 'selected' : ''}>🧭 基准时间线</option>
+                                    <option value="flashback" ${evt.timelinePhase === 'flashback' ? 'selected' : ''}>⏪ 倒叙/插叙</option>
                                 </select>
                             </div>
                             <div class="tt-novel-row-2">
@@ -885,7 +909,7 @@ function renderMemoryTab(bodyEl) {
                     <div class="tt-novel-card-head">
                         <div class="tt-novel-timeline-meta">
                             <span class="tt-novel-chip is-gold">${escapeHtml(evt.chapterRange || `#${evt.startChapter || 1}`)}</span>
-                            ${evt.timelinePhase === 'flashback' ? '<span class="tt-novel-chip is-warn">倒叙/他视角</span>' : ''}
+                            ${evt.timelinePhase === 'reference' ? '<span class="tt-novel-chip is-ok">🧭 基准线</span>' : (evt.timelinePhase === 'flashback' ? '<span class="tt-novel-chip is-warn">倒叙/插叙</span>' : '')}
                             ${evt.pov ? `<span class="tt-novel-chip">视角:${escapeHtml(evt.pov)}</span>` : ''}
                             <strong>${escapeHtml(evt.title)}</strong>
                             ${evt.timeLabel ? `<span class="tt-novel-muted">${escapeHtml(evt.timeLabel)}</span>` : ''}
@@ -1142,6 +1166,10 @@ function renderMemoryTab(bodyEl) {
             worldInfoBudgetChars: Number(bodyEl.querySelector('#tt-novel-ncfg-wi-budget')?.value || 12000),
             strictTimelineOrder: Boolean(bodyEl.querySelector('#tt-novel-ncfg-strict-tl')?.checked),
             excludeFlashbackFromAnchor: Boolean(bodyEl.querySelector('#tt-novel-ncfg-skip-fb')?.checked),
+            referenceTimelineMode: Boolean(bodyEl.querySelector('#tt-novel-ncfg-ref-mode')?.checked),
+            referencePovLabel: String(bodyEl.querySelector('#tt-novel-ncfg-ref-label')?.value || '').trim(),
+            referenceCursorChapter: Number(bodyEl.querySelector('#tt-novel-ncfg-ref-cursor')?.value || 0),
+            referenceLookaheadChapters: Number(bodyEl.querySelector('#tt-novel-ncfg-ref-window')?.value || 8),
         };
         if (patch.povMode === 'strict_limited' && !patch.povCharacter) {
             globalThis.toastr?.warning?.('已选「严格限制单视角」，请填写视角人物名称（如主角名）', '小说续写阅读器');
@@ -1374,7 +1402,8 @@ function renderMemoryTab(bodyEl) {
                     target.endChapter = nums[nums.length - 1];
                 }
                 target.timeLabel = val('timeLabel');
-                target.timelinePhase = val('timelinePhase') === 'flashback' ? 'flashback' : 'main';
+                const tp = val('timelinePhase');
+                target.timelinePhase = (tp === 'reference' || tp === 'flashback') ? tp : 'main';
                 target.pov = val('pov');
                 target.title = val('title') || target.title;
                 target.participants = val('participants').split(/[、,，\s]+/).filter(Boolean);
@@ -2059,9 +2088,10 @@ function renderTocTab(bodyEl) {
                 <div class="tt-novel-row-2">
                     <input type="text" id="tt-novel-newch-title" class="text_pole" placeholder="章节标题（例如：第 78 章 新的开始）" />
                     <select id="tt-novel-newch-role" class="text_pole">
-                        <option value="main">主线正叙</option>
-                        <option value="flashback">倒叙 / 他视角补完</option>
-                        <option value="skip">跳过 / 废稿</option>
+                        <option value="main">▶️ 当前续写主线</option>
+                        <option value="reference">🧭 基准时间线（已完结对照视角）</option>
+                        <option value="flashback">⏪ 倒叙 / 插叙</option>
+                        <option value="skip">⏭️ 跳过 / 废稿</option>
                     </select>
                 </div>
                 <textarea id="tt-novel-newch-content" class="text_pole" rows="5" placeholder="粘贴或输入章节正文..."></textarea>
@@ -2081,8 +2111,9 @@ function renderTocTab(bodyEl) {
             <div class="tt-novel-edit-grid" style="margin-top: 8px;">
                 <input type="text" id="tt-novel-toc-bulk-range" class="text_pole" value="${escapeHtml(tocBulkRangeText)}" placeholder="输入章号或区间，如：78-135 或 10, 22-25" />
                 <div class="tt-novel-action-bar">
-                    <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_flashback">⏪ 设为倒叙/他视角</button>
-                    <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_main">▶️ 设为主线正叙</button>
+                    <button type="button" class="menu_button tt-novel-btn-sm tt-novel-btn-primary" data-bulk-action="mark_reference">🧭 设为基准时间线</button>
+                    <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_main">▶️ 设为续写主线</button>
+                    <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_flashback">⏪ 设为倒叙/插叙</button>
                     <button type="button" class="menu_button tt-novel-btn-sm" data-bulk-action="mark_skip">⏭️ 设为跳过</button>
                     <button type="button" class="menu_button tt-novel-btn-sm tt-novel-btn-stop" data-bulk-action="delete">🗑️ 批量删除</button>
                 </div>
@@ -2112,9 +2143,10 @@ function renderTocTab(bodyEl) {
 
         if (novel?.chapters?.length) {
             const cutoff = novel.cutoffChapterIndex || novel.totalChapters;
+            const refCount = novel.chapters.filter(c => c.timelineRole === 'reference').length;
             const fbCount = novel.chapters.filter(c => c.timelineRole === 'flashback').length;
             const skipCount = novel.chapters.filter(c => c.timelineRole === 'skip').length;
-            const extraMeta = `${fbCount > 0 ? ` · ${fbCount}章倒叙` : ''}${skipCount > 0 ? ` · ${skipCount}章跳过` : ''}`;
+            const extraMeta = `${refCount > 0 ? ` · ${refCount}章基准线` : ''}${fbCount > 0 ? ` · ${fbCount}章倒叙` : ''}${skipCount > 0 ? ` · ${skipCount}章跳过` : ''}`;
             rows.push(`<div class="tt-novel-toc-divider">📚 原著章节（共 ${novel.totalChapters} 章 · 当前锚点 #${cutoff}${extraMeta}）</div>`);
             let visible = novel.chapters;
             if (q) {
@@ -2136,8 +2168,9 @@ function renderTocTab(bodyEl) {
                                 <div class="tt-novel-row-2">
                                     <input type="text" class="text_pole" data-field="title" value="${escapeHtml(ch.title)}" placeholder="章节标题" />
                                     <select class="text_pole" data-field="timelineRole">
-                                        <option value="main" ${ch.timelineRole !== 'flashback' && ch.timelineRole !== 'skip' ? 'selected' : ''}>▶️ 主线正叙</option>
-                                        <option value="flashback" ${ch.timelineRole === 'flashback' ? 'selected' : ''}>⏪ 倒叙 / 他视角补完</option>
+                                        <option value="main" ${ch.timelineRole !== 'reference' && ch.timelineRole !== 'flashback' && ch.timelineRole !== 'skip' ? 'selected' : ''}>▶️ 当前续写主线</option>
+                                        <option value="reference" ${ch.timelineRole === 'reference' ? 'selected' : ''}>🧭 基准时间线（对照原著）</option>
+                                        <option value="flashback" ${ch.timelineRole === 'flashback' ? 'selected' : ''}>⏪ 倒叙 / 插叙</option>
                                         <option value="skip" ${ch.timelineRole === 'skip' ? 'selected' : ''}>⏭️ 跳过 / 废稿</option>
                                     </select>
                                 </div>
@@ -2157,9 +2190,11 @@ function renderTocTab(bodyEl) {
                 const role = ch.timelineRole || 'main';
                 const tagClass = isAfter ? 'masked' : (isCutoff ? 'cutoff' : 'orig');
                 const tagText = isAfter ? '屏蔽' : (isCutoff ? '夺舍点' : `#${ch.index}`);
-                const roleChip = role === 'flashback'
-                    ? '<span class="tt-novel-chip is-warn">倒叙</span>'
-                    : (role === 'skip' ? '<span class="tt-novel-chip is-danger">跳过</span>' : '');
+                const roleChip = role === 'reference'
+                    ? '<span class="tt-novel-chip is-ok">🧭基准</span>'
+                    : (role === 'flashback'
+                        ? '<span class="tt-novel-chip is-warn">倒叙</span>'
+                        : (role === 'skip' ? '<span class="tt-novel-chip is-danger">跳过</span>' : ''));
                 rows.push(`
                     <div class="tt-novel-toc-item ${isCutoff ? 'is-cutoff' : ''} ${isAfter ? 'is-masked' : ''}">
                         <div class="tt-novel-toc-item-main" data-action="view-orig" data-orig-index="${ch.index}">

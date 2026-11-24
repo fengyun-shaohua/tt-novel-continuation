@@ -642,21 +642,14 @@ export function buildNovelStateTrailerPrompt({
 
     const lines = [
         '【单次调用自动归档指令（强制末段附带 · 前端自动隐藏入库）】',
-        '写完本章正文后，必须附带如下 `<novel_state>...</novel_state>` XML 块（切勿省略）：若外部预设要求用 `<game>...</game>` 包裹整条回复，请直接将 `<novel_state>...</novel_state>` 紧贴写在 `</game>` 闭合标签**紧前面**（或紧后面），前端会自动解析并从正文里隐藏，绝不影响排版！',
-        '<novel_state>',
-        `<summary>${targetLabel}的一句话核心剧情总结（80字以内）</summary>`,
-        '<worldbook>',
-        '- 人物|角色名：本章结束时的最新处境/持有物/关系变化（仅写本章有变动的条目；无则写无）',
-        '- 外观|角色名：本章结束时的当前着装/配饰变动（仅在发生换装或明显外观变化时填写；无变化则省略）',
-        '</worldbook>',
-        '<hooks>',
-        '- [新伏笔] 本章新埋下的悬念、约定或隐患（若无则写无）',
-        '- [已填坑] 本章已揭晓、完成或回收的旧伏笔（尽量沿用下方已有伏笔原话；若无则写无）',
-        '</hooks>',
+        '写完本章正文后，必须附带完整闭合的 `<novel_state>...</novel_state>` XML 块（直接输出尖括号标签，不要加反引号，切勿省略）：若外部预设要求用 `<game>...</game>` 包裹整条回复，请将 `<novel_state>...</novel_state>` 紧贴写在 `</game>` 闭合标签**紧前面**（或紧后面），前端会自动解析并隐藏，绝不影响正文排版！',
+        '请以 `<novel_state>` 开头、`</novel_state>` 结尾，内部按顺序包含以下子标签：',
+        `- \`<chapter_summary>${targetLabel}的一句话核心剧情总结（80字以内）</chapter_summary>\``,
+        '- `<worldbook>` …… `</worldbook>` 内按行填写：`- 人物|角色名：本章结束时的最新处境/持有物/关系变化（仅写本章有变动的条目；无则写无）`；若有换装再写 `- 外观|角色名：本章结束时的当前着装/配饰变动（无变化省略）`',
+        '- `<hooks>` …… `</hooks>` 内按行填写：`- [新伏笔] 本章新埋下的悬念、约定或隐患（无则写无）` 与 `- [已填坑] 本章已揭晓、完成或回收的旧伏笔（尽量沿用下方已有伏笔原话；无则写无）`',
         ...(refAutoOn
-            ? [`<ref_cursor>写完本章后已对齐覆盖的【${nCfg.referencePovLabel || '基准时间线'}】最大章号（纯数字，当前为 ${curRefCursor}；若本章推进并覆盖了后续基准章节请填新章号，否则保持 ${curRefCursor}）</ref_cursor>`]
+            ? [`- \`<ref_cursor>写完本章后已对齐覆盖的【${nCfg.referencePovLabel || '基准时间线'}】最大章号（纯数字，当前为 ${curRefCursor}；若本章推进并覆盖了后续基准章节请填新章号，否则保持 ${curRefCursor}）</ref_cursor>\``]
             : []),
-        '</novel_state>',
     ];
     if (openHooks.length > 0) {
         lines.push('▸ 当前待填伏笔参考（若本章已回收，请在 `<hooks>` 中用 `[已填坑]` 标出）：');

@@ -422,7 +422,7 @@ export function extractNovelStateBlock(rawMessageText) {
     const hooks = [];
 
     for (const inner of innerBlocks) {
-        const summaryMatch = inner.match(/<summary>([\s\S]*?)(?:<\/summary>|$)/i);
+        const summaryMatch = inner.match(/<(?:chapter_summary|summary)>([\s\S]*?)(?:<\/(?:chapter_summary|summary)>|$)/i);
         if (summaryMatch && !isEmptyPlaceholder(summaryMatch[1])) {
             summary = summaryMatch[1].trim();
         }

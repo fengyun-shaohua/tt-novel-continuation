@@ -468,7 +468,7 @@ export function buildDeepRewritePrompt({
         ? [
             '',
             '【可选末段状态块】：在 `</content>` 之后另起一行附带 `<novel_state>` 块（前端会自动提取入账并隐藏，绝不混入正文）：',
-            `<novel_state><summary>第 ${chapterIndex} 章一句话核心总结（80字内）</summary><worldbook>- 人物|角色名：本章状态变动（无则写无）\n- 外观|角色名：着装变动（无变化省略）</worldbook><hooks>- [新伏笔] 本章新埋线索（无则写无）\n- [已填坑] 本章回收旧伏笔（无则写无）</hooks>${refAutoOn ? `<ref_cursor>${curRefCursor}或推进后的新基准章号(纯数字)</ref_cursor>` : ''}</novel_state>`,
+            `<novel_state><chapter_summary>第 ${chapterIndex} 章一句话核心总结（80字内）</chapter_summary><worldbook>- 人物|角色名：本章状态变动（无则写无）；外观|角色名：着装变动（无变化省略）</worldbook><hooks>- [新伏笔] 本章新埋线索（无则写无）；[已填坑] 本章回收旧伏笔（无则写无）</hooks>${refAutoOn ? `<ref_cursor>${curRefCursor}或推进后的新基准章号(纯数字)</ref_cursor>` : ''}</novel_state>`,
         ]
         : [];
 

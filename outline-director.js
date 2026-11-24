@@ -344,17 +344,17 @@ export function buildDirectorOutlinePrompt({
     const perChapterBudget = targetChapters >= 5 ? '220 ~ 360 字' : '280 ~ 480 字';
     parts.push(
         '',
-        `请严格输出 **${targetChapters} 个** \`<chapter_outline>\` 标签块（从第 ${anchor.nextChapterIndex} ${anchor.chapterUnit}到第 ${endChapterIndex} ${anchor.chapterUnit}，每章独立完整、可直接复制发给 AI 续写，每章约 ${perChapterBudget}）：`,
-        `<chapter_outline index="${anchor.nextChapterIndex}" title="第 ${anchor.nextChapterIndex} ${anchor.chapterUnit} · 简短标题">`,
-        `【第 ${anchor.nextChapterIndex} ${anchor.chapterUnit} 导演分镜大纲（承接：${anchor.anchorTitle}）】`,
-        `1. （时间·地点·镜头定位）具体客观事件、对话试探焦点、信息差...`,
-        `2. （切镜转场·时间·地点）...`,
-        `...（共 ${targetScenes} 个清晰镜头，冷热交替，最后一个镜头给出收尾定格并自然引出下一章）`,
-        '',
-        '【本章执笔纪律】',
-        '- 严格复刻原著短段骨相与切镜节奏，不原地水字数、不写网文八股形容词；',
-        '- （针对本章人物反应边界与“暂不摊牌”的精准控制要求）',
-        '</chapter_outline>',
+        `请严格输出 **${targetChapters} 个** \`<chapter_outline index="章号" title="章节简短标题">...</chapter_outline>\` 标签块（从第 ${anchor.nextChapterIndex} ${anchor.chapterUnit}到第 ${endChapterIndex} ${anchor.chapterUnit}，直接输出尖括号标签不要加反引号，每章独立完整、可直接复制发给 AI 续写，每章约 ${perChapterBudget}）：`,
+        `- 起始标签写法：\`<chapter_outline index="${anchor.nextChapterIndex}" title="第 ${anchor.nextChapterIndex} ${anchor.chapterUnit} · 简短标题">\``,
+        `- 块内正文结构：`,
+        `  【第 ${anchor.nextChapterIndex} ${anchor.chapterUnit} 导演分镜大纲（承接：${anchor.anchorTitle}）】`,
+        `  1. （时间·地点·镜头定位）具体客观事件、对话试探焦点、信息差...`,
+        `  2. （切镜转场·时间·地点）...`,
+        `  ...（共 ${targetScenes} 个清晰镜头，冷热交替，最后一个镜头给出收尾定格并自然引出下一章）`,
+        '  【本章执笔纪律】',
+        '  - 严格复刻原著短段骨相与切镜节奏，不原地水字数、不写网文八股形容词；',
+        '  - （针对本章人物反应边界与“暂不摊牌”的精准控制要求）',
+        '- 结束标签写法：`</chapter_outline>`',
         ...(isMulti
             ? [`（接着按相同格式依次输出第 ${anchor.nextChapterIndex + 1} ${anchor.chapterUnit} 直至第 ${endChapterIndex} ${anchor.chapterUnit}，共 ${targetChapters} 个独立 \`<chapter_outline>\` 块）`]
             : []),

@@ -471,7 +471,7 @@ async function mountOriginalAnchorChaptersToChat(novelData, upToChapterIndex, { 
     const excludeFlashback = ledgerForMount?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
     const selectedChapters = novelData.chapters.filter(c => {
         if (!c || c.index < 1 || c.index > maxChapter) return false;
-        if (c.timelineRole === 'skip') return false;
+        if (c.timelineRole === 'skip' || c.timelineRole === 'reference') return false;
         if (excludeFlashback && c.timelineRole === 'flashback') return false;
         return true;
     });
@@ -2118,6 +2118,7 @@ async function handleBulkUpdateOriginalChapters({ rangeText = '', action = 'mark
 
     const roleMap = {
         mark_main: 'main',
+        mark_reference: 'reference',
         mark_flashback: 'flashback',
         mark_skip: 'skip',
     };
@@ -2135,7 +2136,13 @@ async function handleBulkUpdateOriginalChapters({ rangeText = '', action = 'mark
     });
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
-    const roleName = nextRole === 'flashback' ? '倒叙/他视角' : (nextRole === 'skip' ? '跳过' : '主线正叙');
+    const roleLabelMap = {
+        main: '主线正叙',
+        reference: '基准时间线',
+        flashback: '倒叙/插叙',
+        skip: '跳过',
+    };
+    const roleName = roleLabelMap[nextRole] || '主线正叙';
     globalThis.toastr?.success?.(`已将 ${touched} 个章节标记为「${roleName}」`, '小说续写阅读器');
 }
 

@@ -77,7 +77,7 @@ import {
 const SETTINGS_KEY = 'novel_continuation';
 const EXTENSION_PROMPT_TAG = 'novel_continuation_golden_context';
 const EXTENSION_PROMPT_TRAILER_TAG = 'novel_continuation_state_trailer';
-const BUNDLED_PURE_PRESET_NAME = 'TT小说续写专用-纯净版';
+const BUNDLED_PURE_PRESET_NAME = 'TT小说续写专用-猫神融合版';
 const BUNDLED_PURE_PRESET_URL = new URL('./presets/novel-continuation-pure.json', import.meta.url);
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -756,6 +756,38 @@ async function loadBundledPureNovelPreset() {
     if (!presetObj || !Array.isArray(presetObj.prompts) || !Array.isArray(presetObj.prompt_order)) {
         throw new Error('插件内置预设 JSON 格式异常（缺少 prompts 或 prompt_order）');
     }
+
+    const parts = presetObj._bundledParts;
+    if (parts && typeof parts === 'object') {
+        delete presetObj._bundledParts;
+        const fetchPart = async (relPath) => {
+            if (!relPath) return null;
+            const partUrl = new URL(relPath, BUNDLED_PURE_PRESET_URL).href;
+            const res = await fetch(partUrl, { cache: 'no-cache' });
+            if (!res.ok) {
+                throw new Error(`无法读取预设组件 ${relPath}（HTTP ${res.status}）`);
+            }
+            return await res.json();
+        };
+        const [frpData, regexData, helperData] = await Promise.all([
+            fetchPart(parts.frp),
+            fetchPart(parts.regex),
+            fetchPart(parts.helper),
+        ]);
+        presetObj.extensions = presetObj.extensions && typeof presetObj.extensions === 'object'
+            ? presetObj.extensions
+            : {};
+        if (frpData?.frpScript && presetObj.extensions.SPreset?.FinalRequestProcessing) {
+            presetObj.extensions.SPreset.FinalRequestProcessing.script = frpData.frpScript;
+        }
+        if (Array.isArray(regexData?.regex_scripts)) {
+            presetObj.extensions.regex_scripts = regexData.regex_scripts;
+        }
+        if (helperData?.tavern_helper && typeof helperData.tavern_helper === 'object') {
+            presetObj.extensions.tavern_helper = helperData.tavern_helper;
+        }
+    }
+
     return presetObj;
 }
 

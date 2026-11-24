@@ -57,6 +57,7 @@ import {
     syncWorldUpdatesToTavernLorebook,
 } from './storage.js';
 import {
+    detectNovelNarrativeStructure,
     rerunArchiveBatches,
     runStoryAndCharacterArchivePipeline,
     synthesizeArchiveFromBatches,
@@ -328,7 +329,9 @@ async function onMessageReceived(messageId, type) {
             chapterIndex,
             summary: extracted.summary,
             worldUpdates: extracted.worldUpdates,
+            appearanceUpdates: extracted.appearanceUpdates,
             hooks: extracted.hooks,
+            refCursor: extracted.refCursor,
         };
         msg.extra.novelContinuationState = stateRecord;
         msg.extra.novelContinuationStateBySwipe = msg.extra.novelContinuationStateBySwipe || {};
@@ -1147,8 +1150,111 @@ function getLatestClicheStatus() {
 }
 
 /* ==========================================================================
-   Background Tasks: Archive / Style Distillation / Surgical De-Cliché
+   Background Tasks: Auto-Structure / Archive / Style Distillation / De-Cliché
    ========================================================================== */
+async function applyDetectedNarrativeStructure(novelData, ledger, detected) {
+    const refSet = new Set(detected.referenceIndices || []);
+    const fbSet = new Set(detected.flashbackIndices || []);
+    const skipSet = new Set(detected.skipIndices || []);
+    const mainSet = new Set(detected.mainIndices || []);
+
+    if (Array.isArray(novelData?.chapters)) {
+        for (const ch of novelData.chapters) {
+            const idx = Number(ch.index);
+            if (skipSet.has(idx)) ch.timelineRole = 'skip';
+            else if (refSet.has(idx)) ch.timelineRole = 'reference';
+            else if (fbSet.has(idx)) ch.timelineRole = 'flashback';
+            else if (mainSet.has(idx) || refSet.size > 0 || fbSet.size > 0 || skipSet.size > 0) ch.timelineRole = 'main';
+        }
+        await saveNovelData(novelData);
+    }
+
+    ledger.narrativeConfig = normalizeNarrativeConfig({
+        ...(ledger.narrativeConfig || {}),
+        ...(detected.narrativeConfig || {}),
+    });
+    ledger.refCursorBase = ledger.narrativeConfig.referenceCursorChapter || 0;
+
+    if (Array.isArray(ledger.chronicle)) {
+        for (const evt of ledger.chronicle) {
+            const st = Number(evt.startChapter || 0);
+            if (refSet.has(st)) evt.timelinePhase = 'reference';
+            else if (fbSet.has(st)) evt.timelinePhase = 'flashback';
+            else if (mainSet.has(st)) evt.timelinePhase = 'main';
+        }
+    }
+    await saveLedger(ledger);
+}
+
+async function runAutoDetectNarrativeStructureTask() {
+    const novelData = await loadNovelData();
+    const continuedChapters = collectContinuedChaptersFromChat(novelData);
+    if (!novelData?.chapters?.length) {
+        globalThis.toastr?.warning?.('请先导入原著小说 TXT/MD 文件后再自动识别', '小说续写阅读器');
+        return;
+    }
+
+    const ctrl = beginBackgroundTaskController('memory');
+    let caller;
+    try {
+        caller = createPresetModelCaller({ signal: ctrl.signal });
+    } catch (err) {
+        endBackgroundTaskController('memory', ctrl);
+        globalThis.toastr?.warning?.(err?.message || String(err), '小说续写阅读器');
+        return;
+    }
+
+    updateLiveProgress('memory', {
+        isRunning: true,
+        isError: false,
+        text: `⏳ 使用 [${caller.modelLabel}] 自动分析全书视角结构与双线时间坐标（仅需 1 次 API）...`,
+    });
+
+    try {
+        const detected = await detectNovelNarrativeStructure({
+            novelData,
+            continuedChapters,
+            callModel: caller.callModel,
+            signal: ctrl.signal,
+        });
+        const ledger = await loadLedger();
+        await applyDetectedNarrativeStructure(novelData, ledger, detected);
+        await mountOriginalAnchorChaptersToChat(novelData, novelData.cutoffChapterIndex, {
+            focusChapterIndex: novelData.viewingChapterIndex || novelData.cutoffChapterIndex,
+        });
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+
+        const nc = ledger.narrativeConfig;
+        const summaryMsg = [
+            nc.povMode === 'strict_limited' ? `锁定单视角「${nc.povCharacter}」` : '多视角/自动模式',
+            nc.referenceTimelineMode
+                ? `平行基准线「${nc.referencePovLabel || '基准线'}」(${detected.referenceIndices.length}章, 当前对齐#${nc.referenceCursorChapter})`
+                : '常规单线推进',
+            detected.reasoning ? `依据：${detected.reasoning}` : '',
+        ].filter(Boolean).join(' · ');
+
+        updateLiveProgress('memory', {
+            isRunning: false,
+            text: `✅ 自动识别并应用完成：${summaryMsg}`,
+        });
+        globalThis.toastr?.success?.(`已自动识别并配置：${summaryMsg}`, '小说续写阅读器');
+    } catch (error) {
+        if (isAbortError(error) || ctrl.signal.aborted) {
+            updateLiveProgress('memory', { isRunning: false, isError: false, text: '⏹ 自动结构识别已手动停止。' });
+            return;
+        }
+        updateLiveProgress('memory', {
+            isRunning: false,
+            isError: true,
+            text: `❌ 自动识别失败：${error?.message || error}`,
+        });
+        globalThis.toastr?.error?.(`自动识别失败：${error?.message || error}`, '小说续写阅读器');
+    } finally {
+        endBackgroundTaskController('memory', ctrl);
+    }
+}
+
 async function runStoryArchiveTask(mode = 'full') {
     const novelData = await loadNovelData();
     const continuedChapters = collectContinuedChaptersFromChat(novelData);
@@ -1181,6 +1287,23 @@ async function runStoryArchiveTask(mode = 'full') {
     });
 
     try {
+        const curCfg = normalizeNarrativeConfig(existingLedger.narrativeConfig);
+        const hasManualRoles = Boolean(novelData?.chapters?.some(c => c.timelineRole && c.timelineRole !== 'main'));
+        const isUnconfigured = curCfg.povMode === 'auto' && !curCfg.referenceTimelineMode && !hasManualRoles;
+        if (mode === 'full' && curCfg.autoDetectOnArchive !== false && isUnconfigured && novelData?.chapters?.length >= 4) {
+            updateLiveProgress('memory', {
+                isRunning: true,
+                text: `⏳ [${caller.modelLabel}] 正在自动识别全书叙事视角与双线结构...`,
+            });
+            const detected = await detectNovelNarrativeStructure({
+                novelData,
+                continuedChapters,
+                callModel: caller.callModel,
+                signal: ctrl.signal,
+            });
+            await applyDetectedNarrativeStructure(novelData, existingLedger, detected);
+        }
+
         const result = await runStoryAndCharacterArchivePipeline({
             novelData: novelData || { title: '当前小说', cutoffChapterIndex: 0, totalChapters: 0, chapters: [] },
             continuedChapters,
@@ -2305,6 +2428,7 @@ export async function init() {
         onUpdateSetting: handleUpdateSetting,
         onToggleSetting: handleToggleSetting,
         onStopTask: stopBackgroundTask,
+        onAutoDetectNarrativeStructure: runAutoDetectNarrativeStructureTask,
         onUpdateNarrativeConfig: handleUpdateNarrativeConfig,
         onEditOriginalChapter: handleEditOriginalChapter,
         onAddOriginalChapter: handleAddOriginalChapter,

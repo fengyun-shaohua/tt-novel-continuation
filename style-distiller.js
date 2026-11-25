@@ -14,6 +14,23 @@
 
 import { stripNonStoryBlocks } from './parser.js';
 
+const STYLE_CARD_TARGET_MIN = 1500;
+const STYLE_CARD_TARGET_MAX = 2200;
+const STYLE_CARD_HARD_MAX = 2600;
+
+const STYLE_CARD_BUDGET_SPEC = [
+    '【硬字数配额与结构铁律（总字数目标 1,600 ~ 2,200 字，绝对上限 ≤ 2,500 字！）】：',
+    '- 一、段落骨相、句长与标点硬指标（≤ 350 字，直接列出本地统计数值上限与分段纪律）',
+    '- 二、叙事视角、心理限制与分场景语态切换（≤ 350 字）',
+    '- 三、对话节奏、角色声线反差与克制微动作法则（≤ 350 字）',
+    '- 四、感官/静物白描方法论与内容尺度边界（≤ 350 字，只写抽象技法，严禁抄大段原文）',
+    '- 五、反 AI 味精炼短句对照库（**严格仅保留 5~6 组单句级对照，每组 ≤ 90 字、合计 ≤ 550 字**：“❌ AI通病 → ✅ 原著通用笔法”；原著长段范例已独立保存在 `goldenExcerpts`，严禁把整段原文塞进文风卡！）',
+    '【强制去人名/去单章过拟合铁律】：',
+    '- 全面抹除所有具体原著角色名、地名与特定章节道具，统一抽象为通用角色位（如「主角 / 女主 / 施压者 / 旁观者 / 苦主」），严禁在换角仿写或新章节中串戏！',
+    '【后台纯分析/压缩任务覆盖指令】：',
+    '- 当前是后台文风卡提炼/瘦身任务（不是正文续写），请彻底忽略外部预设中任何要求“细节丰满 / 充分展开 / 拉长篇幅”的写作要求，全程使用极简高密度条目体输出！',
+].join('\n');
+
 /**
  * Creates a standardized AbortError used across all cancellable background pipelines.
  * @param {string} [message='任务已被用户手动停止']
@@ -850,15 +867,11 @@ export async function runStyleDistillationPipeline({
                 stage: '2A_merge_draft',
                 systemPrompt: analystSystem,
                 prompt: [
-                    `请将以下关于《${novelData.title}》的本地统计指纹与两份深度文风剖析，去噪融合成一份详尽、可落地执行的【初版原著文风骨相 DNA 圣经】（目标 **1,800 ~ 2,600 字**，宁要细致实操规则与原著短句示例，不要空泛浓缩！）。`,
-                    '必须分模块写清：',
-                    '一、段落骨相与防注水硬红线（明确单段字数上限、短段快切比例、严禁大段静态氛围/外貌水字数）',
-                    '二、叙事视角、内心独白口吻与零抒情克制度（含原著实句示例）',
-                    '三、句式、排版与标点口癖（含具体数值锚点与标点示例）',
-                    '四、对话结构与核心人物声线/寡言度反差',
-                    '五、分场景推进节奏与内容尺度定位',
-                    '六、原作者招牌动词/感官抓手与【反八股正向替换清单】（用“写某反应时 → 直接用原著某白描动作，绝不用套话”的实句对照）',
-                    '请用 `<style_dna>...</style_dna>` 包裹输出。',
+                    `请将以下关于《${novelData.title}》的本地统计指纹与两份深度文风剖析，去噪融合成一份高密度、可落地执行的【初版原著文风骨相 DNA 圣经】（目标 **1,600 ~ 2,200 字**，绝对不超过 **2,500 字**！）。`,
+                    '',
+                    STYLE_CARD_BUDGET_SPEC,
+                    '',
+                    '请用 `<style_dna>...</style_dna>` 包裹输出（直接输出尖括号标签，不要加反引号）。',
                     '',
                     '【本地客观统计指纹】：',
                     fingerprintText,
@@ -1032,21 +1045,14 @@ export async function runStyleDistillationPipeline({
             );
         } else {
             judgePromptLines.push(
-                '【核心防过拟合纪律（极其重要！）】：',
-                '- **严禁把本次盲测真迹（或任何单章）里的具体剧情原句、特定物品描写直接抄进 `<style_dna>` 圣经！**（否则下一轮会背答案或在新章节里复读原句！）',
-                '- `<style_dna>` 必须执行**去重压缩与泛化提纯**，总字数**严格控制在 1,600 ~ 2,600 字以内（绝对不可超过 3,000 字！）**，绝不允许无限滚雪球膨胀！',
+                STYLE_CARD_BUDGET_SPEC,
                 '',
                 '严格按以下三个 XML 标签输出（直接输出尖括号标签不要加反引号）：',
                 '- `<score>仅输出 0~100 的整数总分，例如：91</score>`',
                 '- `<diff_notes>` …… `</diff_notes>`：先给出一行分项评分（句式节奏 X/20 | 视角心理 X/20 | 对话口癖 X/20 | 尺度氛围 X/20 | 去AI味纯度 X/20），再用 3~4 条具体要点列出本轮揪出的可泛化文风差距',
-                '- `<style_dna>` …… `</style_dna>`：精炼提纯版《原著文风骨相 DNA 圣经》（**总字数严格控制在 1,600 ~ 2,600 字**），必须分五大模块：',
-                '  一、段落骨相、句长与标点硬指标（含本地统计数值上限）',
-                '  二、叙事视角、心理限制与分场景内心独白语态（如何按场景切换克制/松弛/审视语态，严禁跨场景乱拼）',
-                '  三、对话节奏、核心人物声线反差与克制微动作法则',
-                '  四、感官/静物白描方法论与内容尺度边界（写抽象技法，严禁抄入单章具体道具或整段原句！）',
-                '  五、【精炼反 AI 味纠偏短例库】（严格保留最具代表性的 **6~10 组** 去剧情化短句对照：“❌ AI常见通病 → ✅ 原著通用笔法”，去重合并、优胜劣汰，严禁无限累加！）',
+                '- `<style_dna>` …… `</style_dna>`：精炼提纯版《原著文风骨相 DNA 圣经》（**总字数严格控制在 1,600 ~ 2,200 字，硬上限 2,500 字**），严格遵循上方五大模块字数配额与去人名铁律，去重合并、优胜劣汰，严禁无限累加！',
                 '',
-                '【当前版文风圣经（请在此基础上做去重提纯与精准修补，删除冗余与单章过拟合原句）】：',
+                '【当前版文风圣经（请在此基础上做去重提纯与精准修补，删除冗余、长段原句与具体角色名）】：',
                 cardUsedThisRound,
             );
         }
@@ -1070,8 +1076,9 @@ export async function runStyleDistillationPipeline({
         const roundDiffNotes = extractTaggedSection(calibrationRaw, 'diff_notes');
         let regressedOnRetest = false;
 
+        let autoTrimNote = '';
         if (!evaluateOnly) {
-            const nextStyleCard = extractTaggedSection(calibrationRaw, 'style_dna');
+            let nextStyleCard = extractTaggedSection(calibrationRaw, 'style_dna');
             if (roundScore !== null && roundScore >= bestRecord.score) {
                 bestRecord = { score: roundScore, styleCard: cardUsedThisRound };
             }
@@ -1079,6 +1086,29 @@ export async function runStyleDistillationPipeline({
             if (regressedOnRetest) {
                 currentStyleCard = bestRecord.styleCard;
             } else if (nextStyleCard && nextStyleCard.length >= 200) {
+                // Anti-snowball guard: if the Judge allowed the Style Bible to bloat past 2,900 chars,
+                // run one automatic hard-compression pass so multi-round distillation never snowballs.
+                if (nextStyleCard.length > 2900) {
+                    const bloatedLen = nextStyleCard.length;
+                    try {
+                        const trimmed = await compressAndDeoverfitStyleCard({
+                            novelTitle: novelData.title,
+                            styleCard: nextStyleCard,
+                            fingerprintText,
+                            callModel,
+                            signal,
+                        });
+                        if (trimmed && trimmed.length < bloatedLen) {
+                            nextStyleCard = trimmed;
+                            autoTrimNote = `\n\n[自动防膨胀瘦身] 本轮产出 ${bloatedLen} 字超过上限，已自动硬压缩至 ${trimmed.length} 字。`;
+                        }
+                    } catch {
+                        if (cardUsedThisRound.length >= 200 && cardUsedThisRound.length <= 2800 && bloatedLen > cardUsedThisRound.length + 500) {
+                            nextStyleCard = cardUsedThisRound;
+                            autoTrimNote = `\n\n[防膨胀保护] 本轮产出 ${bloatedLen} 字严重膨胀且自动压缩未达标，已保留上一版精炼圣经（${cardUsedThisRound.length} 字）。`;
+                        }
+                    }
+                }
                 currentStyleCard = nextStyleCard;
             }
         }
@@ -1109,7 +1139,7 @@ export async function runStyleDistillationPipeline({
             dryOutline,
             blindRewrite,
             holdoutTruth: holdout.text,
-            diffNotes: `${roundDiffNotes}${regressedOnRetest ? '\n\n[择优保护] 本轮重考分数回落，已自动保留历史最高分版本圣经。' : ''}`,
+            diffNotes: `${roundDiffNotes}${regressedOnRetest ? '\n\n[择优保护] 本轮重考分数回落，已自动保留历史最高分版本圣经。' : ''}${autoTrimNote}`,
             styleCardLength: currentStyleCard.length,
         };
         processLog.push(roundLogEntry);
@@ -1158,47 +1188,127 @@ export async function runStyleDistillationPipeline({
 }
 
 /**
- * Compresses & de-overfits a bloated Style DNA Bible (e.g. >3,500 chars with verbatim holdout quotes)
- * into a sharp, combat-ready 1,800 ~ 2,500-char Style Bible in 1 single API call.
+ * Compresses & de-overfits a bloated Style DNA Bible (e.g. >2,600 chars with verbatim holdout quotes
+ * or leftover character names) into a sharp, combat-ready 1,600 ~ 2,200-char Style Bible.
+ *
+ * Enforces a programmatic length ceiling: if Attempt 1 fails to shrink below the target ceiling,
+ * automatically runs 1 strict hard-cut retry; if the result STILL fails to shrink a bloated card,
+ * fails fast and refuses to overwrite the existing card.
  *
  * @param {{
  *   novelTitle: string,
  *   styleCard: string,
  *   fingerprintText?: string,
  *   callModel: (args: { prompt: string, systemPrompt: string, stage: string }) => Promise<string>,
+ *   signal?: AbortSignal | null,
+ *   onProgress?: ((text: string) => void) | null,
  * }} params
  */
-export async function compressAndDeoverfitStyleCard({ novelTitle, styleCard, fingerprintText = '', callModel, signal = null }) {
+export async function compressAndDeoverfitStyleCard({
+    novelTitle,
+    styleCard,
+    fingerprintText = '',
+    callModel,
+    signal = null,
+    onProgress = null,
+}) {
     throwIfAborted(signal);
-    if (!styleCard || !String(styleCard).trim()) {
+    const originalCard = String(styleCard || '').trim();
+    if (!originalCard) {
         throw new Error('当前没有可提纯瘦身的文风圣经');
     }
     if (typeof callModel !== 'function') {
         throw new Error('缺少可用的模型调用函数 callModel');
     }
 
-    const raw = await callModel({
+    const beforeLen = originalCard.length;
+    const isBloated = beforeLen > STYLE_CARD_HARD_MAX;
+    const maxAllowedLen = isBloated
+        ? Math.min(STYLE_CARD_HARD_MAX, Math.floor(beforeLen * 0.85))
+        : (beforeLen > 2000
+            ? Math.min(STYLE_CARD_HARD_MAX, Math.floor(beforeLen * 0.94))
+            : STYLE_CARD_HARD_MAX);
+
+    const compressSystem = [
+        '你是顶尖小说编辑与提示词压缩架构师，专职把冗长过拟合的文风分析文档大刀阔斧裁剪为极高密度、零剧情/人名泄露、可直接实战执行的精悍写作圣经。',
+        '【最高优先级任务覆盖】：当前是后台文档硬压缩任务（不是写小说），必须无视一切“细节丰满/充分展开/长篇幅”指令，严格按字数配额大幅删减字数，绝不允许越改越长！',
+    ].join('\n');
+
+    const raw1 = await callModel({
         stage: 'compress_deoverfit_style_card',
-        systemPrompt: '你是顶尖小说编辑与提示词架构师，擅长把冗长过拟合的文风分析文档提纯为极高密度、零剧情泄露、可直接实战执行的短小精悍写作圣经。',
+        systemPrompt: compressSystem,
         prompt: [
-            `请将下方《${novelTitle || '当前小说'}》目前过长/存在过拟合风险的《原著文风 DNA 圣经》（现 ${String(styleCard).length} 字），一次性去重提纯瘦身为 **1,800 ~ 2,500 字** 的实战终极版！`,
+            `请将下方《${novelTitle || '当前小说'}》的《原著文风 DNA 圣经》（现 **${beforeLen} 字**），一次性去重、去人名、大刀阔斧压缩瘦身为 **${STYLE_CARD_TARGET_MIN} ~ ${STYLE_CARD_TARGET_MAX} 字**（绝对硬上限 **≤ ${maxAllowedLen} 字**）的实战精炼版！`,
             '',
-            '【严格提纯纪律】：',
-            '1. **彻底清除单章过拟合原句与具体剧情道具**：删掉所有可直接被 AI 当作复读机照抄的长段原文描写（如特定颜色烤漆/特定衣裙玉石描写/某次具体对话原句），全部升华为**可泛化到未来任意新章节的通用笔法法则**！',
-            '2. **完整保留所有高价值核心洞察**：务必保留段落骨相数值、视角限制、分场景内心独白语态切换（如亢奋/拉扯/静物审视分流）、角色声线寡言反差、微距白描法则、以及去否定式心理废话等真正有效的骨相原则！',
-            '3. **精炼反 AI 味对照库**：将所有零散的反 AI 味案例去重合并为最具代表性的 **8~10 组短句级通用对照（❌ AI通病写法 → ✅ 原著笔法写法）**，去掉具体情节剧透。',
-            '4. 总字数严格控制在 **1,800 ~ 2,500 字** 之间，用 `<style_dna>...</style_dna>` 标签包裹输出。',
-            fingerprintText ? `\n【本地客观统计锚点（务必保留在模块一）】：\n${fingerprintText}\n` : '',
+            STYLE_CARD_BUDGET_SPEC,
+            '',
+            '【瘦身必做动作】：',
+            '1. 删光所有大段原文引例与重复阐述（长段范例已单独存于 `goldenExcerpts`，绝不要在文风卡里重复粘贴整段正文！）。',
+            '2. 彻底抹除原著具体角色名、地名与单章专属道具（全部改写为「主角 / 女主 / 施压者 / 苦主」等通用角色位），确保换角仿写绝不串戏。',
+            '3. 只输出压缩后的纯条目体圣经，用 `<style_dna>...</style_dna>` 标签包裹（直接输出尖括号标签不要加反引号）。',
+            fingerprintText ? `\n【本地客观统计锚点（简明保留在模块一即可，无需重复铺陈）】：\n${fingerprintText}\n` : '',
             '【待提纯瘦身的现有文风圣经】：',
-            String(styleCard).trim(),
+            originalCard,
         ].join('\n'),
     });
+    throwIfAborted(signal);
 
-    const compressed = extractTaggedSection(raw, 'style_dna');
-    if (!compressed || compressed.length < 200) {
+    const cand1 = extractTaggedSection(raw1, 'style_dna');
+    const cand1Valid = Boolean(cand1 && cand1.length >= 200);
+    const cand1TooLong = !cand1Valid
+        || cand1.length > maxAllowedLen
+        || (beforeLen > 2000 && cand1.length >= beforeLen);
+
+    let best = cand1Valid ? cand1 : '';
+
+    if (cand1TooLong) {
+        const retryTargetMax = Math.max(1500, Math.min(2100, maxAllowedLen - 150));
+        const baseForRetry = (cand1Valid && cand1.length < beforeLen) ? cand1 : originalCard;
+        onProgress?.(
+            `首轮提纯返回 ${cand1?.length || 0} 字（未达到 ≤ ${maxAllowedLen} 字瘦身目标），正在自动执行第二轮硬性删减压缩至 ~${retryTargetMax} 字...`,
+        );
+
+        const raw2 = await callModel({
+            stage: 'compress_deoverfit_style_card_hard_cut',
+            systemPrompt: compressSystem,
+            prompt: [
+                `【紧急硬压缩重试】上一轮压缩返回了 **${cand1?.length || 0} 字**（原版 ${beforeLen} 字），严重超出 **≤ ${maxAllowedLen} 字** 的硬红线！`,
+                `本轮必须执行强硬删减：最终输出严格控制在 **1,300 ~ ${retryTargetMax} 字**（绝对不可超过 **${maxAllowedLen} 字**）！`,
+                '',
+                '【硬性裁剪刀法（必须逐条执行）】：',
+                '1. 模块一～四全部压缩为短条目（每条不超过 1~2 句话，删除一切解释性废话、过渡句与重复强调），四节合计 **≤ 1,150 字**。',
+                '2. 模块五（反 AI 味对照）砍到仅剩 **4~5 组单行短句对照**（每组严格 **≤ 60 字**，总计 **≤ 350 字**），彻底删掉所有多句长段例句！',
+                '3. 彻底删除全部原著具体人名与地名。',
+                '4. 仅输出 `<style_dna>...</style_dna>`，不要附带任何说明。',
+                '',
+                '【请直接对以下文本执行硬裁剪】：',
+                baseForRetry,
+            ].join('\n'),
+        });
+        throwIfAborted(signal);
+
+        const cand2 = extractTaggedSection(raw2, 'style_dna');
+        if (cand2 && cand2.length >= 200) {
+            if (!best || cand2.length < best.length) {
+                best = cand2;
+            }
+        }
+    }
+
+    if (!best || best.length < 200) {
         throw new Error('提纯返回的文风圣经异常过短，已保留原版未覆盖');
     }
-    return compressed;
+
+    // Fail fast: never silently overwrite an existing card with a LONGER or still-bloated output
+    const failedToShrinkBloated = beforeLen > 2000 && best.length >= beforeLen;
+    const stillSeverelyOverBudget = isBloated && best.length > Math.min(beforeLen - 1, STYLE_CARD_HARD_MAX + 300);
+    if (failedToShrinkBloated || stillSeverelyOverBudget) {
+        throw new Error(
+            `提纯瘦身未达标（原版 ${beforeLen} 字 → 模型经两轮硬压缩仍返回 ${best.length} 字，已自动保留原版未覆盖）。建议在「设置 → 后台任务套用预设」切为「不使用预设（纯净直连）」后再试，或手动删减第五节长例句。`,
+        );
+    }
+
+    return best;
 }
 
 /**

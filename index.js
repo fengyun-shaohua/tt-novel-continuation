@@ -2079,6 +2079,9 @@ async function runCompressStyleCardTask() {
             fingerprintText: sp.fingerprintText || '',
             signal: ctrl.signal,
             callModel: caller.callModel,
+            onProgress: (text) => {
+                updateLiveProgress('style', { isRunning: true, isError: false, text });
+            },
         });
         sp.styleCard = compressed;
         sp.distilledAt = Date.now();

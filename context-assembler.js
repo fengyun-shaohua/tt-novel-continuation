@@ -1,4 +1,5 @@
 import {
+    lookupLoreEntriesByName,
     searchCanonDatabaseCjk,
     searchOriginalChaptersCjk,
     stripNonStoryBlocks,
@@ -51,7 +52,32 @@ export function resolveActiveAnchorChapter(novelData, excludeFlashback = true) {
     return novelData.chapters.find(c => Number(c.index) === cutoff) || novelData.chapters[novelData.chapters.length - 1];
 }
 
-export function resolveCurrentTargetChapterIndex(chat, novelData, isContinue = false, excludeFlashback = true) {
+export function resolveCurrentTargetChapterIndex(
+    chat,
+    novelData,
+    isContinue = false,
+    excludeFlashback = true,
+    recastConfig = null,
+) {
+    const isRecast = Boolean(recastConfig?.enabled && Array.isArray(novelData?.chapters) && novelData.chapters.length > 0);
+    if (isRecast) {
+        if (!Array.isArray(chat)) return 1;
+        let lastOriginalFloorIdx = -1;
+        chat.forEach((msg, idx) => {
+            if (msg?.extra?.novelContinuationOrigin === 'original') {
+                lastOriginalFloorIdx = idx;
+            }
+        });
+        let continuedFloors = 0;
+        chat.forEach((msg, idx) => {
+            if (isContinuedNovelFloor(msg, idx, lastOriginalFloorIdx)) {
+                continuedFloors += 1;
+            }
+        });
+        if (isContinue && continuedFloors > 0) return continuedFloors;
+        return continuedFloors + 1;
+    }
+
     const activeAnchor = Array.isArray(novelData?.chapters) && novelData.chapters.length > 0
         ? resolveActiveAnchorChapter(novelData, excludeFlashback)
         : null;
@@ -76,6 +102,147 @@ export function resolveCurrentTargetChapterIndex(chat, novelData, isContinue = f
         return baseChapter + continuedFloors;
     }
     return baseChapter + continuedFloors + 1;
+}
+
+/**
+ * Resolves the source original chapter referenced by Recast Mode (`sourceCursorChapter`, 1-based).
+ */
+export function resolveRecastSourceChapter(novelData, recastConfig, offset = 0) {
+    if (!recastConfig?.enabled || !Array.isArray(novelData?.chapters) || novelData.chapters.length === 0) {
+        return null;
+    }
+    const baseCursor = Math.max(1, Number(recastConfig.sourceCursorChapter) || 1);
+    const targetIdx = baseCursor + Math.max(0, Number(offset) || 0);
+    if (targetIdx > novelData.chapters.length) return null;
+    return novelData.chapters.find(c => Number(c.index) === targetIdx) || novelData.chapters[targetIdx - 1] || null;
+}
+
+/**
+ * Formats an original chapter cleanly for Recast Mode structural & prose reference.
+ */
+export function formatSourceChapterExcerpt(chapter, maxChars = 5200) {
+    const clean = stripNonStoryBlocks(chapter?.content || '').trim();
+    if (!clean) return '';
+    if (clean.length <= maxChars) return clean;
+    const headLen = Math.floor(maxChars * 0.42);
+    const midLen = Math.floor(maxChars * 0.2);
+    const tailLen = Math.max(400, maxChars - headLen - midLen);
+    const midStart = Math.max(headLen, Math.floor((clean.length - midLen) / 2));
+    return [
+        clean.slice(0, headLen).trimEnd(),
+        '……（原著中段骨架抽样）……',
+        clean.slice(midStart, midStart + midLen).trim(),
+        '……（原著后半与结尾落点）……',
+        clean.slice(-tailLen).trimStart(),
+    ].join('\n\n');
+}
+
+const RECAST_FIDELITY_GUIDES = Object.freeze({
+    strict: '紧贴原著分镜：保留原著本章几乎全部场景顺序、切镜节奏、事件节点与段长结构，只将涉及替换角色的台词、心理、微动作、外貌着装和局部反应 100% 转化为新角色的真实人设。',
+    balanced: '保主线顺因果（推荐）：保留原著本章的核心事件骨架、叙事节奏与文风质感；允许因新角色真实性格、能力与行事底线的差异，自然推导出不同的对话交锋、微动作与局部因果涟漪（严禁硬拗回原女主台词）。',
+    free: '借骨架自由重塑：仅借鉴原著本章的开场情境、核心冲突引子与原作者行文质感，其余推进完全顺从新角色的性格动机与前文已产生的蝴蝶效应自由展开。',
+});
+
+/**
+ * Builds the unified Chapter-by-Chapter Role-Swap / Recast prompt block shared by
+ * both Single-Call Generation (`buildSingleCallContinuationContext`) and Director Outline (`buildDirectorOutlinePrompt`).
+ */
+export function buildRecastModePromptBlock({
+    novelData = null,
+    recastConfig = null,
+    loreItems = [],
+    includeSourceText = true,
+    sourceChapterCount = 1,
+    maxSourceChars = 5200,
+} = {}) {
+    if (!recastConfig?.enabled || !Array.isArray(novelData?.chapters) || novelData.chapters.length === 0) {
+        return { text: '', pinnedBaseTitles: [], sourceChapters: [] };
+    }
+
+    const mappings = (Array.isArray(recastConfig.mappings) ? recastConfig.mappings : [])
+        .filter(m => m && (m.fromName || m.toName || m.toProfile));
+    const fidelityDesc = RECAST_FIDELITY_GUIDES[recastConfig.fidelity] || RECAST_FIDELITY_GUIDES.balanced;
+    const count = Math.max(1, Math.min(3, Number(sourceChapterCount) || 1));
+    const sourceChapters = [];
+    for (let i = 0; i < count; i += 1) {
+        const ch = resolveRecastSourceChapter(novelData, recastConfig, i);
+        if (ch) sourceChapters.push(ch);
+    }
+    if (sourceChapters.length === 0) {
+        return { text: '', pinnedBaseTitles: [], sourceChapters: [] };
+    }
+
+    const fromNames = mappings.map(m => m.fromName).filter(Boolean);
+    const toNames = mappings.map(m => m.toName).filter(Boolean);
+    const pinnedBaseTitles = [];
+
+    const firstSrc = sourceChapters[0];
+    const lastSrc = sourceChapters[sourceChapters.length - 1];
+    const rangeTag = sourceChapters.length > 1
+        ? `原著第 ${firstSrc.index}~${lastSrc.index} 章对照重塑`
+        : `原著第 ${firstSrc.index} 章《${firstSrc.title || `第 ${firstSrc.index} 章`}》对照重塑`;
+
+    const lines = [
+        `【逐章换角仿写 / 角色重塑最高协议（${rangeTag}）】`,
+        `- 改编保真策略：${fidelityDesc}`,
+        '- 绝对创作红线：',
+        ...(fromNames.length > 0
+            ? [`  1. 【零残名铁律】：正文中严禁残留或误写被替换的原著角色名（${fromNames.join('、')}）及其专属绰号/外貌特征！`]
+            : ['  1. 【零串戏铁律】：严格按照下方角色替换表执行重塑，不得混入原被替换角色的姓名与特征！']),
+        `  2. 【严禁机械换皮 OOC】：绝对不要只把名字替换成「${toNames.join(' / ') || '新角色'}」却照搬原角色的性格、撒娇/暴躁模板或台词习惯！必须依据下方新角色的真实底骨（外貌、常服、性格、能力与说话语气），重新演绎每一句对话、微表情与行动选择。`,
+        '  3. 【复刻原著文风与节奏】：严格学习下方原著对照范本的断句长短、叙事距离、对话密度与切镜频率，拒绝套用廉价网文腔；同时自然承接前几章已经产生的改写蝴蝶效应。',
+    ];
+
+    if (mappings.length > 0) {
+        lines.push('', '▸ 角色替换映射与新角色完整底骨档案：');
+        for (const m of mappings) {
+            const pairLabel = m.fromName && m.toName
+                ? `原著「${m.fromName}」 → 替换为「${m.toName}」`
+                : (m.toName ? `核心新登场角色「${m.toName}」` : `原著「${m.fromName}」调整`);
+            lines.push(`◆ ${pairLabel}`);
+            if (m.toProfile) {
+                lines.push(`  · 作者指定新角色要点：${m.toProfile}`);
+            }
+            if (m.toName && Array.isArray(loreItems) && loreItems.length > 0) {
+                const hit = lookupLoreEntriesByName(m.toName, loreItems, { maxChars: 1500 });
+                if (hit?.summary) {
+                    pinnedBaseTitles.push(hit.item.baseTitle || hit.item.title);
+                    const userAlreadyHasFull = m.toProfile && m.toProfile.length >= 200 && hit.summary.slice(0, 60) && m.toProfile.includes(hit.summary.slice(0, 60));
+                    if (!userAlreadyHasFull) {
+                        lines.push(`  · 纯净资料库完整原设底骨（[${hit.item.category || '角色'}] ${hit.item.title}）：\n${hit.summary}`);
+                    }
+                }
+            }
+            if (m.note) {
+                lines.push(`  · 剧情与关系适配说明：${m.note}`);
+            }
+        }
+    }
+
+    if (recastConfig.extraRules) {
+        lines.push('', `▸ 额外世界观与背景微调要求：\n${recastConfig.extraRules}`);
+    }
+
+    if (includeSourceText) {
+        const perBudget = sourceChapters.length > 1
+            ? Math.max(1800, Math.floor(maxSourceChars / sourceChapters.length))
+            : maxSourceChars;
+        for (const ch of sourceChapters) {
+            const excerpt = formatSourceChapterExcerpt(ch, perBudget);
+            if (!excerpt) continue;
+            lines.push(
+                '',
+                `▸ 【原著第 ${ch.index} 章《${ch.title || `第 ${ch.index} 章`}》对照范本（供复刻文风、段长节奏与剧情骨架；请按上方替换表彻底重塑，严禁照抄被替换原名与原性格）】：`,
+                excerpt,
+            );
+        }
+    }
+
+    return {
+        text: lines.join('\n'),
+        pinnedBaseTitles,
+        sourceChapters,
+    };
 }
 
 /**
@@ -340,14 +507,19 @@ export function buildSingleCallContinuationContext({
     novelData,
     ledger,
     canonDb,
+    loreBundle = null,
     settings,
     generationType = 'normal',
     hasExternalLwbSummary = false,
 }) {
     if (!settings?.enabled) return '';
 
+    const unifiedLoreItems = Array.isArray(loreBundle?.items)
+        ? loreBundle.items
+        : (Array.isArray(canonDb?.items) ? canonDb.items : []);
+    const worldCores = Array.isArray(loreBundle?.worldCores) ? loreBundle.worldCores : [];
     const hasNovel = Boolean(novelData && Array.isArray(novelData.chapters) && novelData.chapters.length > 0);
-    const hasCanon = Boolean(canonDb && Array.isArray(canonDb.items) && canonDb.items.length > 0);
+    const hasCanon = unifiedLoreItems.length > 0 || worldCores.length > 0;
     const hasBlueprint = hasStoryBlueprintData(ledger?.storyBlueprint);
     const hasStyleProfile = Boolean(ledger?.styleProfile?.styleCard && String(ledger.styleProfile.styleCard).trim());
     const hasChronicle = Boolean(Array.isArray(ledger?.chronicle) && ledger.chronicle.length > 0);
@@ -361,6 +533,8 @@ export function buildSingleCallContinuationContext({
     }
 
     const narrativeCfg = ledger?.narrativeConfig || {};
+    const recastCfg = narrativeCfg.recast || null;
+    const isRecastMode = Boolean(recastCfg?.enabled && hasNovel);
     const excludeFlashback = narrativeCfg.excludeFlashbackFromAnchor !== false;
     const strictPov = narrativeCfg.povMode === 'strict_limited' && Boolean(String(narrativeCfg.povCharacter || '').trim());
     const povChar = strictPov ? String(narrativeCfg.povCharacter).trim() : '';
@@ -369,14 +543,16 @@ export function buildSingleCallContinuationContext({
         : (narrativeCfg.povPerson === 'third_limited' ? '第三人称限制视角' : '严格跟随前文人称的限制视角');
 
     const isContinue = generationType === 'continue';
-    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue, excludeFlashback);
+    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, isContinue, excludeFlashback, recastCfg);
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
-    const anchorChapter = (hasNovel && cutoff > 0)
+    const anchorChapter = (!isRecastMode && hasNovel && cutoff > 0)
         ? resolveActiveAnchorChapter(novelData, excludeFlashback)
         : null;
+    const recastSourceChapter = isRecastMode ? resolveRecastSourceChapter(novelData, recastCfg, 0) : null;
     const activeAnchorIndex = Number(anchorChapter?.index || cutoff);
-    const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
-    const mountedOriginalCount = Array.isArray(chat)
+    const sampleTitleForUnit = recastSourceChapter?.title || anchorChapter?.title || novelData?.chapters?.[0]?.title || '';
+    const chapterUnit = sampleTitleForUnit && /节\s*$/.test(sampleTitleForUnit.trim()) ? '节' : '章';
+    const mountedOriginalCount = (!isRecastMode && Array.isArray(chat))
         ? chat
             .filter(m => m?.extra?.novelContinuationOrigin === 'original')
             .reduce((sum, m) => sum + Math.max(1, Number(m?.extra?.novelMergedChapterCount) || 1), 0)
@@ -394,8 +570,16 @@ export function buildSingleCallContinuationContext({
             }
         }
     }
-    if (anchorChapter?.content) {
+    if (recastSourceChapter?.content) {
+        recentTexts.push(stripNonStoryBlocks(recastSourceChapter.content).slice(0, 1200));
+    } else if (anchorChapter?.content) {
         recentTexts.push(anchorChapter.content.slice(-700));
+    }
+    const recastTargetNames = isRecastMode
+        ? (recastCfg.mappings || []).map(m => String(m?.toName || '').trim()).filter(Boolean)
+        : [];
+    if (recastTargetNames.length > 0) {
+        recentTexts.push(recastTargetNames.join(' '));
     }
     const queryText = recentTexts.join('\n');
 
@@ -406,10 +590,14 @@ export function buildSingleCallContinuationContext({
     const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
     const isOriginalStart = !hasNovel && targetChapterIndex === 1;
     const headerLines = [
-        `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写${targetLabel}` : `准备撰写${targetLabel}`}]`,
-        isOriginalStart
-            ? '当前处于长篇小说开篇创作阶段，请严格遵循下方《全书总纲与分卷路线图》、人物档案、世界观规则与文风要求，直接输出连贯饱满的开篇章节正文，切勿输出寒暄或解释。'
-            : '请严格保持前文叙事视角、段落骨相、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。',
+        isRecastMode
+            ? `[小说逐章换角仿写总纲 · ${novelTitle} · ${isContinue ? `继续扩写重塑${targetLabel}` : `撰写重塑${targetLabel}`}${recastSourceChapter ? `（对照原著第 ${recastSourceChapter.index} ${chapterUnit}）` : ''}]`
+            : `[小说续写上下文总纲 · ${novelTitle} · ${isContinue ? `继续扩写${targetLabel}` : `准备撰写${targetLabel}`}]`,
+        isRecastMode
+            ? '当前处于「逐章换角仿写 / 角色重塑模式」，请严格以原著对照范本的文风、段长节奏与剧情骨架为蓝本，将替换角色的言行、心理、外貌服装与互动因果 100% 替换为新角色的真实人设，直接输出连贯饱满的小说正文，切勿输出寒暄或解释。'
+            : (isOriginalStart
+                ? '当前处于长篇小说开篇创作阶段，请严格遵循下方《全书总纲与分卷路线图》、人物档案、世界观规则与文风要求，直接输出连贯饱满的开篇章节正文，切勿输出寒暄或解释。'
+                : '请严格保持前文叙事视角、段落骨相、人物口癖与时代背景，直接输出连贯饱满的小说章节正文，切勿输出寒暄或解释。'),
     ];
     if (settings.authorMode !== false) {
         headerLines.push(
@@ -475,6 +663,23 @@ export function buildSingleCallContinuationContext({
             includeNextVolumeGuard: true,
         });
         if (bpBlock) sections.push(bpBlock);
+    }
+
+    // 1.25 Chapter-by-Chapter Role-Swap / Recast Protocol + Source Chapter Template + Pinned Target Profiles
+    let recastPinnedBaseTitles = [];
+    if (isRecastMode) {
+        const recastBlock = buildRecastModePromptBlock({
+            novelData,
+            recastConfig: recastCfg,
+            loreItems: unifiedLoreItems,
+            includeSourceText: true,
+            sourceChapterCount: 1,
+            maxSourceChars: 5200,
+        });
+        if (recastBlock.text) {
+            sections.push(recastBlock.text);
+            recastPinnedBaseTitles = recastBlock.pinnedBaseTitles;
+        }
     }
 
     // 1.5 Distilled Original Author Style DNA Card + Live Samples + Anti-Cliché Positive Replacement Rules
@@ -668,7 +873,8 @@ export function buildSingleCallContinuationContext({
     }
 
     // 4. Tier 2: Local CJK Flashback Retrieval from Imported Original Novel (<= cutoffChapterIndex)
-    if (hasNovel && queryText.trim()) {
+    // Skipped in Recast Mode so unrelated late-novel chapters never leak into Recast Chapter N.
+    if (hasNovel && !isRecastMode && queryText.trim()) {
         const hits = searchOriginalChaptersCjk(queryText, novelData.chapters, {
             cutoffChapterIndex: anchorChapter?.index || cutoff,
             excludeTailCount: hasOriginalFloorInChat ? Math.max(1, mountedOriginalCount) : 1,
@@ -688,25 +894,45 @@ export function buildSingleCallContinuationContext({
         }
     }
 
-    // 5. Tier 3: Supplementary Fanfic Canon Database with Butterfly-Effect Protection
-    if (hasCanon && queryText.trim()) {
-        const canonHits = searchCanonDatabaseCjk(queryText, canonDb.items, {
-            topK: Number(settings.maxCanonHits) || 4,
-            maxItemChars: 450,
-        });
-        if (canonHits.length > 0) {
-            const tier3Lines = [
-                '【第三优先级：同人补充原作设定数据库（注意蝴蝶效应保护：原作设定提供世界观、能力、历史与性格底骨；若与【第一/第二优先级】中本作品已改写的同人剧情冲突，严格以本作品已发生的事实为准！）】',
-            ];
-            for (const item of canonHits) {
-                tier3Lines.push(`  - [${item.category}] ${item.title}：${item.content}`);
+    // 5. Tier 3: Unified Clean Lore Library (Global Reusable Fandom Packs + Per-Chat Canon DB)
+    if (hasCanon) {
+        const tier3Lines = [];
+        if (worldCores.length > 0) {
+            let coreBudget = 2400;
+            for (const wc of worldCores) {
+                if (coreBudget < 200 || !wc?.digest) continue;
+                const clipped = wc.digest.length > coreBudget ? `${wc.digest.slice(0, coreBudget)}……` : wc.digest;
+                tier3Lines.push(`▸ 作品基础世界观总纲（${wc.packName || '全局资料库'}）：\n${clipped}`);
+                coreBudget -= clipped.length;
             }
-            sections.push(tier3Lines.join('\n'));
+        }
+        if (unifiedLoreItems.length > 0 && queryText.trim()) {
+            const pinnedSet = new Set(recastPinnedBaseTitles);
+            const rawHits = searchCanonDatabaseCjk(queryText, unifiedLoreItems, {
+                topK: (Number(settings.maxCanonHits) || 4) + pinnedSet.size,
+                maxItemChars: 1400,
+                pinnedNames: recastTargetNames,
+            });
+            const canonHits = rawHits
+                .filter(it => !(pinnedSet.has(it.baseTitle || it.title) && it.chunkKind === 'core'))
+                .slice(0, Number(settings.maxCanonHits) || 4);
+            if (canonHits.length > 0) {
+                tier3Lines.push('▸ 按本章内容精准召回的原作人物/势力/地理设定（完整核心档案，防 OOC 与外貌服装错乱）：');
+                for (const item of canonHits) {
+                    tier3Lines.push(`  - [${item.category}] ${item.title}：\n${item.content}`);
+                }
+            }
+        }
+        if (tier3Lines.length > 0) {
+            sections.push([
+                '【第三优先级：同人补充原作设定数据库（全局纯净资料库 · 注意蝴蝶效应保护：原作设定提供世界观、外貌服装、能力与性格底骨；若与【第一/第二优先级】中本作品已改写的同人剧情冲突，严格以本作品已发生的事实为准！）】',
+                ...tier3Lines,
+            ].join('\n\n'));
         }
     }
 
     // 6. Fallback Style & Cliffhanger Anchor when no original chapter floor is mounted in chat
-    if (anchorChapter && !hasOriginalFloorInChat) {
+    if (anchorChapter && !hasOriginalFloorInChat && !isRecastMode) {
         sections.push(
             `【原著断更处锚点 · 第 ${anchorChapter.index} ${chapterUnit}《${anchorChapter.title}》结尾原文（请严格模仿其文风笔触紧接着往下写）】\n${anchorChapter.content.slice(-1500)}`,
         );
@@ -738,20 +964,28 @@ export function buildNovelStateTrailerPrompt({
     if (!hasNovel && !hasLedger) return '';
 
     const nCfg = ledger?.narrativeConfig || {};
+    const recastCfg = nCfg.recast || null;
+    const isRecastMode = Boolean(recastCfg?.enabled && hasNovel);
     const excludeFlashback = nCfg.excludeFlashbackFromAnchor !== false;
-    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, false, excludeFlashback);
+    const targetChapterIndex = resolveCurrentTargetChapterIndex(chat, novelData, false, excludeFlashback, recastCfg);
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.totalChapters || 0);
-    const anchorChapter = (hasNovel && cutoff > 0) ? resolveActiveAnchorChapter(novelData, excludeFlashback) : null;
-    const chapterUnit = anchorChapter?.title && /节\s*$/.test(anchorChapter.title.trim()) ? '节' : '章';
+    const anchorChapter = (!isRecastMode && hasNovel && cutoff > 0) ? resolveActiveAnchorChapter(novelData, excludeFlashback) : null;
+    const recastSrcCh = isRecastMode ? resolveRecastSourceChapter(novelData, recastCfg, 0) : null;
+    const chapterUnit = (recastSrcCh?.title || anchorChapter?.title) && /节\s*$/.test(String(recastSrcCh?.title || anchorChapter?.title).trim()) ? '节' : '章';
     const targetLabel = `第 ${targetChapterIndex} ${chapterUnit}`;
     const openHooks = resolveTimelineHooks(ledger?.hooks || [], targetChapterIndex - 1).slice(-8);
     const refAutoOn = Boolean(nCfg.referenceTimelineMode && nCfg.autoAdvanceRefCursor !== false);
     const curRefCursor = Number(nCfg.referenceCursorChapter || 0);
+    const recastFromNames = isRecastMode ? (recastCfg.mappings || []).map(m => m?.fromName).filter(Boolean) : [];
+    const recastToNames = isRecastMode ? (recastCfg.mappings || []).map(m => m?.toName).filter(Boolean) : [];
 
     const lines = [
         '【落笔前最后自检（紧贴正文生效，防长上下文稀释）】',
         '1. 人物严格遵循前文《核心人物防 OOC 档案》当前阶段的气质、说话长度与着装，严禁被无关世界书词条串戏，严禁未铺垫就光速黑化或脸谱化；',
         '2. 笔触严格对齐《灵魂语感活样本》与《文风骨相执行卡》，杜绝“如遭雷击/冻结成冰/狰狞邪异/裂开一道弧度/声音沙哑/喉结滚动/空气仿佛凝固”等高频 AI 网文腔。',
+        ...(isRecastMode ? [
+            `3. 【换角仿写终检】：正文绝不残留被替换原名（${recastFromNames.join('、') || '原角色'}）；新角色（${recastToNames.join('、') || '目标角色'}）的外貌着装、性格底色与对话语气 100% 遵循其纯净资料库档案（严禁机械改名换皮 OOC），同时保持原著第 ${recastSrcCh?.index || targetChapterIndex} ${chapterUnit}的段长与叙事节奏。`,
+        ] : []),
         '',
         '【单次调用自动归档指令（强制末段附带 · 前端自动隐藏入库）】',
         '写完本章正文后，必须附带完整闭合的 `<novel_state>...</novel_state>` XML 块（直接输出尖括号标签，不要加反引号，切勿省略）：若外部预设要求用 `<game>...</game>` 包裹整条回复，请将 `<novel_state>...</novel_state>` 紧贴写在 `</game>` 闭合标签**紧前面**（或紧后面），前端会自动解析并隐藏，绝不影响正文排版！',
@@ -761,6 +995,9 @@ export function buildNovelStateTrailerPrompt({
         '- `<hooks>` …… `</hooks>` 内按行填写：`- [新伏笔] 本章新埋下的悬念、约定或隐患（无则写无）` 与 `- [已填坑] 本章已揭晓、完成或回收的旧伏笔（尽量沿用下方已有伏笔原话；无则写无）`',
         ...(refAutoOn
             ? [`- \`<ref_cursor>写完本章后已对齐覆盖的【${nCfg.referencePovLabel || '基准时间线'}】最大章号（纯数字，当前为 ${curRefCursor}；若本章推进并覆盖了后续基准章节请填新章号，否则保持 ${curRefCursor}）</ref_cursor>\``]
+            : []),
+        ...(isRecastMode && recastCfg.autoAdvanceCursor !== false && recastSrcCh
+            ? [`- \`<recast_cursor>${recastSrcCh.index}</recast_cursor>\`（纯数字：本章完成对照重塑的原著章号，用于自动推进到下一章）`]
             : []),
     ];
     if (openHooks.length > 0) {

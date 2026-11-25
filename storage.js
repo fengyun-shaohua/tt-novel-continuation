@@ -14,9 +14,53 @@ export const EXTENSION_NAMESPACE = 'novel-continuation';
 const KEY_NOVEL_DATA = 'novel_data_v1';
 const KEY_LEDGER = 'timeline_ledger_v1';
 const KEY_CANON_DB = 'canon_db_v1';
+const KEY_GLOBAL_LORE_INDEX = 'lore_packs_index_v1';
+const GLOBAL_LORE_TABLE = 'global_lore';
 const CHAT_SCOPE_META_KEY = 'novelContinuationScopeId';
 
 const memoryStoreCache = new Map();
+let globalLoreIndexCache = null;
+const globalLorePackDataCache = new Map();
+
+export const DEFAULT_RECAST_CONFIG = Object.freeze({
+    enabled: false,
+    sourceCursorChapter: 1,
+    autoAdvanceCursor: true,
+    fidelity: 'balanced', // 'strict' | 'balanced' | 'free'
+    mappings: [], // Array<{ id: string, fromName: string, toName: string, toProfile: string, note: string }>
+    extraRules: '',
+});
+
+export function normalizeRecastMapping(raw, idx = 0) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    return {
+        id: String(src.id || `recast_${idx + 1}_${Date.now().toString(36)}`).trim(),
+        fromName: String(src.fromName || '').trim(),
+        toName: String(src.toName || '').trim(),
+        toProfile: String(src.toProfile || '').trim(),
+        note: String(src.note || '').trim(),
+    };
+}
+
+export function normalizeRecastConfig(raw = null) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const cursorNum = Number(src.sourceCursorChapter);
+    const fidelity = ['strict', 'balanced', 'free'].includes(src.fidelity) ? src.fidelity : 'balanced';
+    const mappings = Array.isArray(src.mappings)
+        ? src.mappings
+            .filter(m => m && typeof m === 'object')
+            .map((m, i) => normalizeRecastMapping(m, i))
+            .filter(m => m.fromName || m.toName || m.toProfile || m.note)
+        : [];
+    return {
+        enabled: Boolean(src.enabled),
+        sourceCursorChapter: Number.isFinite(cursorNum) && cursorNum >= 1 ? Math.floor(cursorNum) : 1,
+        autoAdvanceCursor: src.autoAdvanceCursor !== false,
+        fidelity,
+        mappings,
+        extraRules: String(src.extraRules || '').trim(),
+    };
+}
 
 export const DEFAULT_NARRATIVE_CONFIG = Object.freeze({
     povMode: 'auto', // 'auto' | 'strict_limited'
@@ -33,6 +77,9 @@ export const DEFAULT_NARRATIVE_CONFIG = Object.freeze({
     referenceLookaheadChapters: 8,
     autoAdvanceRefCursor: true,
     autoDetectOnArchive: true,
+    activeLorePackIds: [],
+    includeLorePackWorldCore: true,
+    recast: DEFAULT_RECAST_CONFIG,
 });
 
 export function normalizeNarrativeConfig(raw = null) {
@@ -47,6 +94,9 @@ export function normalizeNarrativeConfig(raw = null) {
     const worldInfoBudgetChars = Number.isFinite(budget)
         ? Math.max(2000, Math.min(40000, Math.round(budget)))
         : DEFAULT_NARRATIVE_CONFIG.worldInfoBudgetChars;
+    const activeLorePackIds = Array.isArray(src.activeLorePackIds)
+        ? [...new Set(src.activeLorePackIds.map(id => String(id || '').trim()).filter(Boolean))]
+        : [];
     return {
         povMode,
         povCharacter: String(src.povCharacter || '').trim(),
@@ -66,6 +116,9 @@ export function normalizeNarrativeConfig(raw = null) {
             : 8,
         autoAdvanceRefCursor: src.autoAdvanceRefCursor !== false,
         autoDetectOnArchive: src.autoDetectOnArchive !== false,
+        activeLorePackIds,
+        includeLorePackWorldCore: src.includeLorePackWorldCore !== false,
+        recast: normalizeRecastConfig(src.recast),
     };
 }
 
@@ -201,6 +254,7 @@ export function createEmptyLedger() {
         storyBlueprint: normalizeStoryBlueprint(),
         refCursorBase: null,
         refCursorHistory: {},
+        recastCursorHistory: {},
         lastArchivedChapter: 0,
         archiveBatches: [],
         archiveNeedsResynth: false,
@@ -432,6 +486,7 @@ export async function loadLedger() {
         storyBlueprint: normalizeStoryBlueprint(raw.storyBlueprint),
         refCursorBase: Number.isFinite(Number(raw.refCursorBase)) ? Number(raw.refCursorBase) : null,
         refCursorHistory: raw.refCursorHistory && typeof raw.refCursorHistory === 'object' ? raw.refCursorHistory : {},
+        recastCursorHistory: raw.recastCursorHistory && typeof raw.recastCursorHistory === 'object' ? raw.recastCursorHistory : {},
         lastArchivedChapter: Number(raw.lastArchivedChapter || 0),
         archiveBatches,
         archiveNeedsResynth: Boolean(raw.archiveNeedsResynth),
@@ -567,6 +622,171 @@ export async function saveCanonDb(canonDb) {
     await store.set(KEY_CANON_DB, canonDb);
 }
 
+/* ==========================================================================
+   Global Reusable Fandom Lore Packs (Shared Across All Characters & Chats)
+   ========================================================================== */
+function getGlobalLoreStore() {
+    return globalThis.__TAURITAVERN__?.api?.extension?.store || null;
+}
+
+export async function listGlobalLorePacks() {
+    if (Array.isArray(globalLoreIndexCache)) {
+        return [...globalLoreIndexCache];
+    }
+    const extStore = getGlobalLoreStore();
+    if (!extStore) return [];
+    try {
+        const res = await extStore.tryGetJson({
+            namespace: EXTENSION_NAMESPACE,
+            table: GLOBAL_LORE_TABLE,
+            key: KEY_GLOBAL_LORE_INDEX,
+        });
+        const list = Array.isArray(res?.value) ? res.value : [];
+        globalLoreIndexCache = list;
+        return [...list];
+    } catch {
+        return [];
+    }
+}
+
+export async function loadGlobalLorePack(packId) {
+    const id = String(packId || '').trim();
+    if (!id) return null;
+    if (globalLorePackDataCache.has(id)) {
+        return globalLorePackDataCache.get(id);
+    }
+    const extStore = getGlobalLoreStore();
+    if (!extStore) return null;
+    try {
+        const res = await extStore.tryGetJson({
+            namespace: EXTENSION_NAMESPACE,
+            table: GLOBAL_LORE_TABLE,
+            key: `pack_data_${id}`,
+        });
+        if (res?.found && res.value && typeof res.value === 'object') {
+            globalLorePackDataCache.set(id, res.value);
+            return res.value;
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+export async function saveGlobalLorePack(packMeta, packData) {
+    const extStore = getGlobalLoreStore();
+    if (!extStore) throw new Error('TauriTavern 扩展存储未就绪');
+    const id = String(packMeta?.id || packData?.id || `pack_${Date.now().toString(36)}`).trim();
+    const meta = {
+        ...packMeta,
+        id,
+        importedAt: Number(packMeta?.importedAt || Date.now()),
+    };
+    const data = {
+        id,
+        name: meta.name || '未命名资料库',
+        worldCoreDigest: String(packData?.worldCoreDigest || ''),
+        items: Array.isArray(packData?.items) ? packData.items : [],
+    };
+    await extStore.setJson({
+        namespace: EXTENSION_NAMESPACE,
+        table: GLOBAL_LORE_TABLE,
+        key: `pack_data_${id}`,
+        value: data,
+    });
+    globalLorePackDataCache.set(id, data);
+
+    const existing = await listGlobalLorePacks();
+    const nextIndex = [meta, ...existing.filter(p => p && p.id !== id)];
+    await extStore.setJson({
+        namespace: EXTENSION_NAMESPACE,
+        table: GLOBAL_LORE_TABLE,
+        key: KEY_GLOBAL_LORE_INDEX,
+        value: nextIndex,
+    });
+    globalLoreIndexCache = nextIndex;
+    return meta;
+}
+
+export async function deleteGlobalLorePack(packId) {
+    const id = String(packId || '').trim();
+    if (!id) return;
+    const extStore = getGlobalLoreStore();
+    globalLorePackDataCache.delete(id);
+    const existing = await listGlobalLorePacks();
+    const nextIndex = existing.filter(p => p && p.id !== id);
+    globalLoreIndexCache = nextIndex;
+    if (!extStore) return;
+    try {
+        await extStore.deleteJson({
+            namespace: EXTENSION_NAMESPACE,
+            table: GLOBAL_LORE_TABLE,
+            key: `pack_data_${id}`,
+        });
+    } catch {
+        // Ignore missing pack data
+    }
+    await extStore.setJson({
+        namespace: EXTENSION_NAMESPACE,
+        table: GLOBAL_LORE_TABLE,
+        key: KEY_GLOBAL_LORE_INDEX,
+        value: nextIndex,
+    });
+}
+
+/**
+ * Resolves the unified active lore bundle (enabled Global Lore Packs + per-chat `canonDb`)
+ * so generation, director outlines, blueprints, and recast lookup share one source of truth.
+ */
+export async function loadActiveLoreBundle(ledger = null, perChatCanonDb = null) {
+    const nCfg = normalizeNarrativeConfig(ledger?.narrativeConfig);
+    const activeIds = nCfg.activeLorePackIds || [];
+    const indexList = await listGlobalLorePacks();
+    const validIds = activeIds.filter(id => indexList.some(p => p && p.id === id));
+
+    const loadedPacks = (await Promise.all(validIds.map(id => loadGlobalLorePack(id)))).filter(Boolean);
+    const items = [];
+    const worldCores = [];
+
+    for (const pack of loadedPacks) {
+        if (Array.isArray(pack.items) && pack.items.length > 0) {
+            items.push(...pack.items);
+        }
+        if (nCfg.includeLorePackWorldCore !== false && pack.worldCoreDigest && String(pack.worldCoreDigest).trim()) {
+            worldCores.push({
+                packId: pack.id,
+                packName: pack.name || pack.id,
+                digest: String(pack.worldCoreDigest).trim(),
+            });
+        }
+    }
+
+    const privateItems = Array.isArray(perChatCanonDb?.items) ? perChatCanonDb.items : [];
+    if (privateItems.length > 0) {
+        items.push(...privateItems);
+    }
+
+    return {
+        items,
+        worldCores,
+        activePacks: loadedPacks.map(p => ({ id: p.id, name: p.name, itemCount: p.items?.length || 0 })),
+    };
+}
+
+export function listAvailableTavernWorldbooks() {
+    return Array.isArray(world_names) ? [...world_names].filter(Boolean) : [];
+}
+
+export async function loadTavernWorldbookRawJson(bookName) {
+    const name = String(bookName || '').trim();
+    if (!name) throw new Error('请先选择一本酒馆世界书');
+    const data = await loadWorldInfo(name);
+    if (!data || typeof data.entries !== 'object') {
+        throw new Error(`未能读取世界书「${name}」或该世界书无有效条目`);
+    }
+    return JSON.stringify(data);
+}
+
 /**
  * Rolls back all ledger records (summaries, character states, hooks) generated after `maxChapterIndex`.
  */
@@ -603,6 +823,22 @@ export async function pruneLedgerAfterChapter(maxChapterIndex) {
         ledger.refCursorHistory = kept;
         if (restoredCursor !== null && ledger.narrativeConfig?.referenceTimelineMode && ledger.narrativeConfig?.autoAdvanceRefCursor !== false) {
             ledger.narrativeConfig.referenceCursorChapter = restoredCursor;
+        }
+    }
+    if (ledger.recastCursorHistory && typeof ledger.recastCursorHistory === 'object') {
+        const keptRecast = {};
+        let maxDoneSrc = 0;
+        for (const [k, v] of Object.entries(ledger.recastCursorHistory)) {
+            const chNum = Number(k);
+            const srcNum = Number(v);
+            if (Number.isFinite(chNum) && chNum <= maxChapterIndex && Number.isFinite(srcNum) && srcNum >= 1) {
+                keptRecast[k] = srcNum;
+                if (srcNum > maxDoneSrc) maxDoneSrc = srcNum;
+            }
+        }
+        ledger.recastCursorHistory = keptRecast;
+        if (ledger.narrativeConfig?.recast?.enabled && ledger.narrativeConfig.recast.autoAdvanceCursor !== false) {
+            ledger.narrativeConfig.recast.sourceCursorChapter = Math.max(1, maxDoneSrc + 1);
         }
     }
     await saveLedger(ledger);
@@ -722,6 +958,29 @@ export async function applyExtractedStateToLedger(extracted, chapterIndex, chapt
             }
         }
         ledger.narrativeConfig.referenceCursorChapter = effectiveMaxCursor;
+    }
+
+    // Auto-advance (or swipe-update) recast source cursor when Recast Mode is enabled
+    const recastCfg = ledger.narrativeConfig?.recast;
+    if (recastCfg?.enabled && recastCfg.autoAdvanceCursor !== false) {
+        ledger.recastCursorHistory = ledger.recastCursorHistory && typeof ledger.recastCursorHistory === 'object'
+            ? ledger.recastCursorHistory
+            : {};
+        const prevRecorded = Number(ledger.recastCursorHistory[String(chapterIndex)]);
+        const completedSrc = Number.isFinite(Number(extracted.recastCursor)) && Number(extracted.recastCursor) >= 1
+            ? Math.floor(Number(extracted.recastCursor))
+            : (Number.isFinite(prevRecorded) && prevRecorded >= 1
+                ? Math.floor(prevRecorded)
+                : Math.max(1, Number(recastCfg.sourceCursorChapter || 1)));
+        ledger.recastCursorHistory[String(chapterIndex)] = completedSrc;
+        let maxDoneSrc = 0;
+        for (const v of Object.values(ledger.recastCursorHistory)) {
+            const n = Number(v);
+            if (Number.isFinite(n) && n >= 1) maxDoneSrc = Math.max(maxDoneSrc, n);
+        }
+        if (maxDoneSrc >= 1) {
+            recastCfg.sourceCursorChapter = maxDoneSrc + 1;
+        }
     }
 
     await saveLedger(ledger);

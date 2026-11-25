@@ -382,6 +382,10 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     gap: 3px;
 }
 
+.tt-novel-seg.is-3 {
+    grid-template-columns: repeat(3, 1fr);
+}
+
 .tt-novel-seg-btn {
     padding: 6px 10px;
     border: none;
@@ -1423,4 +1427,78 @@ body.tt-novel-immersive #chat .mes[is_user="false"] .mes_text h3 {
     font-size: 0.78rem;
     line-height: 1.45;
     cursor: pointer;
+}
+
+/* Global Reusable Lore Packs & Chapter-by-Chapter Recast Mode (v1.9) */
+.tt-novel-pack-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    background: rgba(255, 255, 255, 0.025);
+    transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.tt-novel-pack-card.is-active {
+    border-color: rgba(212, 163, 89, 0.45);
+    background: rgba(212, 163, 89, 0.06);
+}
+
+.tt-novel-pack-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.tt-novel-pack-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.83rem;
+    font-weight: 600;
+    cursor: pointer;
+    min-width: 0;
+}
+
+.tt-novel-pack-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    font-size: 0.72rem;
+    opacity: 0.78;
+}
+
+.tt-novel-recast-row {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.tt-novel-recast-pair {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr auto auto;
+    align-items: center;
+    gap: 6px;
+}
+
+.tt-novel-recast-arrow {
+    font-size: 0.78rem;
+    opacity: 0.65;
+    padding: 0 2px;
+}
+
+@media (max-width: 600px) {
+    .tt-novel-recast-pair {
+        grid-template-columns: 1fr;
+    }
+    .tt-novel-recast-arrow {
+        display: none;
+    }
 }

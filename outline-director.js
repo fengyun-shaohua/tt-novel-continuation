@@ -7,10 +7,12 @@
  */
 
 import {
+    buildRecastModePromptBlock,
     buildStoryBlueprintContextBlock,
     buildUnarchivedRecentChaptersBridge,
     hasStoryBlueprintData,
     resolveActiveVolume,
+    resolveRecastSourceChapter,
 } from './context-assembler.js';
 import { stripNonStoryBlocks } from './parser.js';
 import { isModelRefusalText, parseCharacterProfiles } from './story-archiver.js';
@@ -26,7 +28,34 @@ const PACE_LABELS = Object.freeze({
  * Resolves the latest chapter ending (either latest continued chapter or cutoff original chapter)
  * so the Director Outline always connects seamlessly to the exact last sentence.
  */
-export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { excludeFlashback = true } = {}) {
+export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { excludeFlashback = true, recastConfig = null } = {}) {
+    const sortedContinued = [...(continuedChapters || [])]
+        .filter(c => c && String(c.content || '').trim())
+        .sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
+    const latestContinued = sortedContinued.length > 0 ? sortedContinued[sortedContinued.length - 1] : null;
+    const sampleTitle = novelData?.chapters?.[0]?.title || '';
+    const chapterUnit = /节\s*$/.test(String(sampleTitle).trim()) ? '节' : '章';
+
+    if (recastConfig?.enabled && Array.isArray(novelData?.chapters) && novelData.chapters.length > 0) {
+        const srcCh = resolveRecastSourceChapter(novelData, recastConfig, 0);
+        const prevChapterIndex = latestContinued ? Number(latestContinued.index || sortedContinued.length) : 0;
+        const nextChapterIndex = prevChapterIndex + 1;
+        const cleanBody = latestContinued ? stripNonStoryBlocks(latestContinued.content || '').replace(/<\/?game>/gi, '').trim() : '';
+        return {
+            prevChapterIndex,
+            nextChapterIndex,
+            chapterUnit,
+            anchorTitle: latestContinued
+                ? `${latestContinued.title || `第 ${prevChapterIndex} ${chapterUnit}`}（换角重塑）`
+                : `换角仿写开篇（对照原著第 ${srcCh?.index || 1} ${chapterUnit}）`,
+            tailSnippet: cleanBody.slice(-1400),
+            shortClosing: cleanBody.replace(/\s+/g, ' ').slice(-90),
+            isFreshStart: !latestContinued,
+            isRecastMode: true,
+            recastSourceChapter: srcCh,
+        };
+    }
+
     const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
     const eligibleOriginals = (novelData?.chapters || [])
         .filter(c => {
@@ -39,17 +68,13 @@ export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { 
     const origCutoffCh = eligibleOriginals.length > 0
         ? eligibleOriginals[eligibleOriginals.length - 1]
         : ((novelData?.chapters || []).find(c => c && Number(c.index) === cutoff) || null);
-    const sortedContinued = [...(continuedChapters || [])]
-        .filter(c => c && String(c.content || '').trim())
-        .sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
 
-    const latestContinued = sortedContinued.length > 0 ? sortedContinued[sortedContinued.length - 1] : null;
     const anchorCh = latestContinued || origCutoffCh;
     const isFreshStart = !anchorCh && cutoff === 0;
     const prevChapterIndex = anchorCh ? Number(anchorCh.index || cutoff) : cutoff;
     const nextChapterIndex = prevChapterIndex + 1;
-    const sampleTitle = origCutoffCh?.title || novelData?.chapters?.[0]?.title || '';
-    const chapterUnit = /节\s*$/.test(String(sampleTitle).trim()) ? '节' : '章';
+    const origSampleTitle = origCutoffCh?.title || sampleTitle;
+    const resolvedUnit = /节\s*$/.test(String(origSampleTitle).trim()) ? '节' : '章';
 
     const cleanBody = anchorCh ? stripNonStoryBlocks(anchorCh.content || '').replace(/<\/?game>/gi, '').trim() : '';
     const tailSnippet = cleanBody.slice(-1400);
@@ -58,11 +83,13 @@ export function resolveLatestChapterAnchor(novelData, continuedChapters = [], { 
     return {
         prevChapterIndex,
         nextChapterIndex,
-        chapterUnit,
-        anchorTitle: isFreshStart ? '新书开篇（从第 1 章起笔）' : (anchorCh?.title || `第 ${prevChapterIndex} ${chapterUnit}`),
+        chapterUnit: resolvedUnit,
+        anchorTitle: isFreshStart ? '新书开篇（从第 1 章起笔）' : (anchorCh?.title || `第 ${prevChapterIndex} ${resolvedUnit}`),
         tailSnippet,
         shortClosing,
         isFreshStart,
+        isRecastMode: false,
+        recastSourceChapter: null,
     };
 }
 
@@ -164,15 +191,18 @@ export function buildDirectorOutlinePrompt({
     chapterCount = 1,
     paceMode = 'slow',
     worldInfoContext = '',
+    loreItems = [],
 }) {
     const narrativeCfg = ledger?.narrativeConfig || {};
+    const recastCfg = narrativeCfg.recast || null;
+    const isRecastMode = Boolean(recastCfg?.enabled && novelData?.chapters?.length);
     const excludeFlashback = narrativeCfg.excludeFlashbackFromAnchor !== false;
     const strictPov = narrativeCfg.povMode === 'strict_limited' && Boolean(String(narrativeCfg.povCharacter || '').trim());
     const povChar = strictPov ? String(narrativeCfg.povCharacter).trim() : '';
     const povPersonLabel = narrativeCfg.povPerson === 'first_person'
         ? '第一人称限制视角'
         : (narrativeCfg.povPerson === 'third_limited' ? '第三人称限制视角' : '跟随原著人称的限制视角');
-    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback });
+    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback, recastConfig: recastCfg });
     const targetChapters = Math.max(1, Math.min(8, Number(chapterCount) || 1));
     const targetScenes = Math.max(2, Math.min(6, Number(sceneCount) || 4));
     const paceDesc = PACE_LABELS[paceMode] || PACE_LABELS.slow;
@@ -203,6 +233,9 @@ export function buildDirectorOutlinePrompt({
         ...(narrativeCfg.referenceTimelineMode ? [
             `6.5 【平行视角 · 严守基准时间线铁律】：你正在以当前视角续写平行线！下方提供了已完结的【${narrativeCfg.referencePovLabel || '基准时间线'}】事件蓝图与进度指针。必须严格按基准时间线的先后顺序推进与补完幕后细节：已走过的基准节点严禁重复再写，前方既定节点（如见面、通话、出行、关键转折）的时间点与对外交集结果必须 100% 严丝合缝，严禁凭空编造与基准时间线矛盾或重复的大事件！`,
         ] : []),
+        ...(isRecastMode ? [
+            '6.8 【逐章换角仿写 · 分镜重塑铁律】：你正在对下方提供的原著对照章节执行「换角仿写分镜策划」！必须严格保留原著的切镜节奏、事件骨架与信息差结构，但把涉及被替换角色的每个镜头、每句台词焦点与动作反应 100% 改造成新角色的真实性格、常服外貌与行为逻辑——严禁在大纲中残留被替换原名，严禁机械换皮 OOC！',
+        ] : []),
         '7. 严格按要求的 `<chapter_outline index="章号" title="章节简短标题">...</chapter_outline>` 标签输出每一章，不要输出额外寒暄或解释。',
     ].join('\n');
 
@@ -212,24 +245,42 @@ export function buildDirectorOutlinePrompt({
     const blueprintBlock = buildStoryBlueprintContextBlock(ledger?.storyBlueprint, anchor.nextChapterIndex, {
         includeNextVolumeGuard: true,
     });
+    const recastBlock = isRecastMode
+        ? buildRecastModePromptBlock({
+            novelData,
+            recastConfig: recastCfg,
+            loreItems,
+            includeSourceText: true,
+            sourceChapterCount: Math.min(3, targetChapters),
+            maxSourceChars: 6000,
+        })
+        : null;
 
     const parts = [
         `【目标作品】：《${bookTitle}》`,
-        isFreshOriginal
-            ? (isMulti
-                ? `【规划目标】：作为新书开篇，一次性连贯规划 **开篇连续 ${targetChapters} ${anchor.chapterUnit}**（第 1 ~ ${endChapterIndex} ${anchor.chapterUnit}）的分章导演大纲！`
-                : `【规划目标】：作为新书开篇，策划【第 1 ${anchor.chapterUnit}】的详细分镜导演大纲（立住核心人物、开场矛盾与钩子）。`)
-            : (isMulti
-                ? `【规划目标】：紧接【${anchor.anchorTitle}】结尾，一次性连贯规划 **连续 ${targetChapters} ${anchor.chapterUnit}**（第 ${anchor.nextChapterIndex} ~ ${endChapterIndex} ${anchor.chapterUnit}）的分章导演大纲！`
-                : `【规划目标】：紧接【${anchor.anchorTitle}】结尾，策划【第 ${anchor.nextChapterIndex} ${anchor.chapterUnit}】的详细分镜导演大纲。`),
+        isRecastMode
+            ? `【规划目标】：处于「逐章换角仿写模式」，请对照下方原著第 ${anchor.recastSourceChapter?.index || 1}${isMulti ? `~${Math.min(novelData.chapters.length, (anchor.recastSourceChapter?.index || 1) + targetChapters - 1)}` : ''} ${anchor.chapterUnit}，策划重塑版 **第 ${anchor.nextChapterIndex}${isMulti ? ` ~ ${endChapterIndex}` : ''} ${anchor.chapterUnit}** 的详细分镜导演大纲！`
+            : (isFreshOriginal
+                ? (isMulti
+                    ? `【规划目标】：作为新书开篇，一次性连贯规划 **开篇连续 ${targetChapters} ${anchor.chapterUnit}**（第 1 ~ ${endChapterIndex} ${anchor.chapterUnit}）的分章导演大纲！`
+                    : `【规划目标】：作为新书开篇，策划【第 1 ${anchor.chapterUnit}】的详细分镜导演大纲（立住核心人物、开场矛盾与钩子）。`)
+                : (isMulti
+                    ? `【规划目标】：紧接【${anchor.anchorTitle}】结尾，一次性连贯规划 **连续 ${targetChapters} ${anchor.chapterUnit}**（第 ${anchor.nextChapterIndex} ~ ${endChapterIndex} ${anchor.chapterUnit}）的分章导演大纲！`
+                    : `【规划目标】：紧接【${anchor.anchorTitle}】结尾，策划【第 ${anchor.nextChapterIndex} ${anchor.chapterUnit}】的详细分镜导演大纲。`)),
         `【规划规格】：每章分 **${targetScenes} 个自然切镜**；整体推进步幅：**${paceDesc}**。${activeVolume ? `当前对应卷纲：第 ${activeVolume.index} 卷《${activeVolume.title}》（${activeVolume.chapterRange}）。` : ''}`,
         '',
         brief
             ? `【作者提供的简略过程与结果（最高剧情指令，必须完整落实${isMulti ? `并合理分配到第 ${anchor.nextChapterIndex}~${endChapterIndex} ${anchor.chapterUnit}中层层递进` : '并自然展开'}，不得擅自改写作者指定的结果）】：\n${brief}`
-            : (isFreshOriginal
-                ? `【作者未填写具体分章过程】：请严格依据下方《L1 全书总纲与 L2 分卷路线图》、核心人物档案与世界书设定，自主构思一版极具张力与节奏感的开篇第 1~${endChapterIndex} ${anchor.chapterUnit}分镜大纲！`
-                : `【作者未填写具体过程】：请基于下方最新结尾、卷纲路线、近期编年史与待填伏笔，自主构思一版最贴合本作走向与节奏的${isMulti ? `连续 ${targetChapters} ${anchor.chapterUnit}` : '下一章'}分镜大纲！`),
+            : (isRecastMode
+                ? '【作者未额外补充剧情改动】：请严格对照下方原著章节范本与角色替换映射表，忠实保留原著分镜节奏与看点，同时让新角色 100% 按自身真实性格与能力演绎每一场对手戏！'
+                : (isFreshOriginal
+                    ? `【作者未填写具体分章过程】：请严格依据下方《L1 全书总纲与 L2 分卷路线图》、核心人物档案与世界书设定，自主构思一版极具张力与节奏感的开篇第 1~${endChapterIndex} ${anchor.chapterUnit}分镜大纲！`
+                    : `【作者未填写具体过程】：请基于下方最新结尾、卷纲路线、近期编年史与待填伏笔，自主构思一版最贴合本作走向与节奏的${isMulti ? `连续 ${targetChapters} ${anchor.chapterUnit}` : '下一章'}分镜大纲！`)),
     ];
+
+    if (recastBlock?.text) {
+        parts.push('', recastBlock.text);
+    }
 
     if (blueprintBlock) {
         parts.push('', blueprintBlock);
@@ -413,6 +464,7 @@ export async function generateDirectorOutline({
     chapterCount = 1,
     paceMode = 'slow',
     worldInfoContext = '',
+    loreItems = [],
     callModel,
     signal = null,
 }) {
@@ -431,6 +483,7 @@ export async function generateDirectorOutline({
         chapterCount,
         paceMode,
         worldInfoContext,
+        loreItems,
     });
 
     const raw = await callModel({

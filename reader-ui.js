@@ -5,10 +5,14 @@ import { DEFAULT_CLICHE_TERMS } from './cliche-guard.js';
 import { hasStoryBlueprintData, isContinuedNovelFloor, resolveActiveVolume } from './context-assembler.js';
 import { stripNonStoryBlocks } from './parser.js';
 import {
+    listGlobalLorePacks,
+    loadActiveLoreBundle,
     loadCanonDb,
     loadLedger,
     loadNovelData,
     normalizeNarrativeConfig,
+    normalizeRecastConfig,
+    normalizeRecastMapping,
     normalizeStoryBlueprint,
     normalizeStoryVolume,
     saveCanonDb,
@@ -60,7 +64,7 @@ function statusDot(tone = 'idle') {
    ========================================================================== */
 let workbenchOpen = false;
 let activeTab = 'create';      // 'create' | 'memory' | 'craft' | 'toc' | 'settings'
-let createSubTab = 'scene';    // 'scene' | 'blueprint'
+let createSubTab = 'scene';    // 'scene' | 'recast' | 'blueprint'
 let memoryFilter = 'chars';    // 'chars' | 'chronicle' | 'hooks' | 'world' | 'canon'
 let craftSubTab = 'style';     // 'style' | 'rewrite'
 let settingsFocusSection = ''; // '' | 'model' | 'narrative' | 'files' | 'bridge'
@@ -80,8 +84,13 @@ let tocBulkRangeText = '';
 let cachedNovelData = null;
 let cachedLedger = null;
 let cachedCanonDb = null;
+let cachedGlobalLorePacks = [];
+let cachedActiveLoreBundle = { items: [], worldCores: [], activePacks: [] };
 let cachedAnchorInfo = null;
 let handlers = {};
+
+let recastDraftUi = null; // In-progress local copy of recast mappings so typing/adding rows stays responsive
+let recastDraftScope = null;
 
 const outlineDraftUiState = {
     userBrief: '',
@@ -110,6 +119,7 @@ let lastBridgeUi = { state: 'disconnected', detail: '未连接外部 Agent' };
 function resolveTabRoute(tabName) {
     if (!tabName) return null;
     if (tabName === 'outline') return { tab: 'create', sub: 'scene' };
+    if (tabName === 'recast') return { tab: 'create', sub: 'recast' };
     if (tabName === 'blueprint') return { tab: 'create', sub: 'blueprint' };
     if (tabName === 'create') return { tab: 'create', sub: null };
     if (tabName === 'memory') return { tab: 'memory', sub: null };
@@ -337,18 +347,26 @@ export function updateBridgeStatusUi({ state, detail }) {
  * Refreshes cached book/ledger/canon data, updates the mini bar badge, and re-renders Workbench if open.
  */
 export async function refreshReaderWidgets() {
-    const [novelData, ledger, canonDb, anchorInfo] = await Promise.all([
+    const [novelData, ledger, canonDb, globalPacks, anchorInfo] = await Promise.all([
         loadNovelData(),
         loadLedger(),
         loadCanonDb(),
+        listGlobalLorePacks(),
         handlers.getLatestChapterAnchorInfo?.() ?? null,
     ]);
+    const loreBundle = await loadActiveLoreBundle(ledger, canonDb);
     cachedNovelData = novelData;
     cachedLedger = ledger;
     cachedCanonDb = canonDb;
+    cachedGlobalLorePacks = Array.isArray(globalPacks) ? globalPacks : [];
+    cachedActiveLoreBundle = loreBundle || { items: [], worldCores: [], activePacks: [] };
     cachedAnchorInfo = anchorInfo;
 
     const currentChatKey = String(getContext()?.chatId || novelData?.title || '');
+    if (recastDraftScope !== currentChatKey) {
+        recastDraftScope = currentChatKey;
+        recastDraftUi = null;
+    }
     if (outlineDraftUiState.initializedForScope !== currentChatKey) {
         outlineDraftUiState.initializedForScope = currentChatKey;
         const saved = ledger?.draftOutline;
@@ -477,17 +495,21 @@ function renderTaskProgressBanner(taskKey, task) {
 }
 
 /* ==========================================================================
-   TAB 1: 创作 (Segmented: 本章分镜 | 全书总纲)
+   TAB 1: 创作 (Segmented: 本章分镜 | 换角仿写 | 全书总纲)
    ========================================================================== */
 function renderCreateTab(bodyEl) {
     const ledger = cachedLedger || { chronicle: [], characters: [], hooks: [], styleProfile: null, draftOutline: null, storyBlueprint: null };
     const bp = normalizeStoryBlueprint(ledger.storyBlueprint);
+    const nCfg = normalizeNarrativeConfig(ledger.narrativeConfig);
+    const recastCfg = nCfg.recast;
     const task = liveTaskState.outline;
     const volCountBadge = bp.volumes.length > 0 ? ` (${bp.volumes.length}卷)` : '';
+    const recastBadge = recastCfg.enabled ? ` (#${recastCfg.sourceCursorChapter})` : '';
 
     const segHtml = `
-        <div class="tt-novel-seg" role="tablist">
+        <div class="tt-novel-seg is-3" role="tablist">
             <button type="button" class="tt-novel-seg-btn ${createSubTab === 'scene' ? 'active' : ''}" data-create-sub="scene">本章分镜</button>
+            <button type="button" class="tt-novel-seg-btn ${createSubTab === 'recast' ? 'active' : ''}" data-create-sub="recast">换角仿写${recastBadge}</button>
             <button type="button" class="tt-novel-seg-btn ${createSubTab === 'blueprint' ? 'active' : ''}" data-create-sub="blueprint">全书总纲${volCountBadge}</button>
         </div>
     `;
@@ -496,6 +518,8 @@ function renderCreateTab(bodyEl) {
 
     if (createSubTab === 'blueprint') {
         renderBlueprintSubView(bodyEl, segHtml, progressHtml, ledger, bp, task);
+    } else if (createSubTab === 'recast') {
+        renderRecastSubView(bodyEl, segHtml, progressHtml, ledger, nCfg, task);
     } else {
         renderSceneOutlineSubView(bodyEl, segHtml, progressHtml, ledger, bp, task);
     }
@@ -505,6 +529,264 @@ function renderCreateTab(bodyEl) {
             createSubTab = btn.getAttribute('data-create-sub') || 'scene';
             renderWorkbench();
         });
+    });
+}
+
+function renderRecastSubView(bodyEl, segHtml, progressHtml, ledger, nCfg, task) {
+    const hasNovel = Boolean(cachedNovelData?.chapters?.length);
+    const totalCh = Number(cachedNovelData?.chapters?.length || 0);
+    if (!recastDraftUi) {
+        const saved = normalizeRecastConfig(nCfg.recast);
+        recastDraftUi = {
+            ...saved,
+            mappings: saved.mappings.length > 0
+                ? saved.mappings.map(m => ({ ...m }))
+                : [normalizeRecastMapping({ fromName: '', toName: '', toProfile: '', note: '' }, 0)],
+        };
+    }
+
+    const curCursor = hasNovel
+        ? Math.max(1, Math.min(totalCh, Number(recastDraftUi.sourceCursorChapter) || 1))
+        : Math.max(1, Number(recastDraftUi.sourceCursorChapter) || 1);
+    recastDraftUi.sourceCursorChapter = curCursor;
+    const srcChapter = hasNovel
+        ? (cachedNovelData.chapters.find(c => Number(c.index) === curCursor) || cachedNovelData.chapters[curCursor - 1])
+        : null;
+    const activePackNames = (cachedActiveLoreBundle?.activePacks || []).map(p => p.name).filter(Boolean);
+
+    const chapterOptionsHtml = hasNovel
+        ? cachedNovelData.chapters.map(c => (
+            `<option value="${c.index}" ${Number(c.index) === curCursor ? 'selected' : ''}>#${c.index} ${escapeHtml(String(c.title || `第 ${c.index} 章`).slice(0, 32))}</option>`
+        )).join('')
+        : '<option value="1">尚未导入原著</option>';
+
+    const mappingsHtml = recastDraftUi.mappings.map((m, idx) => `
+        <div class="tt-novel-recast-row" data-recast-row="${escapeHtml(m.id)}">
+            <div class="tt-novel-recast-pair">
+                <input type="text" class="text_pole" data-rc-field="fromName" value="${escapeHtml(m.fromName || '')}" placeholder="原著角色名（如原女主）" />
+                <span class="tt-novel-recast-arrow">替换为</span>
+                <input type="text" class="text_pole" data-rc-field="toName" value="${escapeHtml(m.toName || '')}" placeholder="新角色名（如白金 / 塑心 / 椿）" />
+                <button type="button" class="menu_button tt-novel-btn-sm" data-rc-action="lookup" data-id="${escapeHtml(m.id)}" title="从已导入资料库查人并自动填入底骨">${uiIcon('book', 12)} 查资料库</button>
+                <button type="button" class="tt-novel-mini-icon-btn" data-rc-action="del" data-id="${escapeHtml(m.id)}" title="删除此映射" ${recastDraftUi.mappings.length <= 1 ? 'disabled' : ''}>${uiIcon('trash', 13)}</button>
+            </div>
+            <textarea class="text_pole" rows="3" data-rc-field="toProfile" placeholder="新角色外貌着装、性格底色、能力与说话语气（点右侧「查资料库」可自动填入；留空在开写时也会自动从已启用资料库精准召回）">${escapeHtml(m.toProfile || '')}</textarea>
+            <input type="text" class="text_pole" data-rc-field="note" value="${escapeHtml(m.note || '')}" placeholder="因果与关系适配说明（可选，例如：保留主线相遇场景，但以她的性格初期保持疏离吐槽）" />
+        </div>
+    `).join('');
+
+    const srcPreviewText = srcChapter?.content
+        ? stripNonStoryBlocks(srcChapter.content).slice(0, 600)
+        : '';
+
+    bodyEl.innerHTML = `
+        ${segHtml}
+        <div class="tt-novel-context-strip">
+            <span class="tt-novel-context-main">
+                ${hasNovel
+                    ? (recastDraftUi.enabled
+                        ? `换角仿写已开启 · 下一章对照原著 #${curCursor}/${totalCh}《${escapeHtml(srcChapter?.title || `第 ${curCursor} 章`)}》`
+                        : `原著已导入（${totalCh} 章）· 开启下方开关即可逐章替换角色仿写`)
+                    : '请先在「设置 → 作品导入」导入想模仿的原著小说 TXT / MD'}
+            </span>
+            <div class="tt-novel-context-links">
+                <button type="button" class="tt-novel-link-pill" data-jump-lore="1">
+                    ${activePackNames.length > 0 ? `资料库：${escapeHtml(activePackNames.join(' / '))}` : '去挂载同人资料库'}
+                </button>
+            </div>
+        </div>
+        ${progressHtml}
+
+        <section class="tt-novel-card">
+            <div class="tt-novel-edit-grid">
+                <label class="tt-novel-toggle-row">
+                    <input type="checkbox" id="tt-novel-rc-enabled" ${recastDraftUi.enabled ? 'checked' : ''} />
+                    <div>
+                        <div class="tt-novel-toggle-title">启用逐章换角仿写模式</div>
+                        <div class="tt-novel-toggle-desc">自动把原著第 N 章作为文风与剧情骨架范本，强制剥离被替换原名，并按新角色资料库底骨防换皮 OOC</div>
+                    </div>
+                </label>
+
+                <div class="tt-novel-row-2">
+                    <label>当前对照原著章节
+                        <div class="tt-novel-bridge-row">
+                            <button type="button" id="tt-novel-rc-prev" class="menu_button tt-novel-btn-sm" ${!hasNovel || curCursor <= 1 ? 'disabled' : ''}>${uiIcon('chevronLeft', 12)}</button>
+                            <select id="tt-novel-rc-cursor" class="text_pole" ${!hasNovel ? 'disabled' : ''}>${chapterOptionsHtml}</select>
+                            <button type="button" id="tt-novel-rc-next" class="menu_button tt-novel-btn-sm" ${!hasNovel || curCursor >= totalCh ? 'disabled' : ''}>${uiIcon('chevronRight', 12)}</button>
+                        </div>
+                    </label>
+                    <label>改编保真度
+                        <select id="tt-novel-rc-fidelity" class="text_pole">
+                            <option value="strict" ${recastDraftUi.fidelity === 'strict' ? 'selected' : ''}>紧贴原著分镜（只换人设与反应）</option>
+                            <option value="balanced" ${recastDraftUi.fidelity === 'balanced' ? 'selected' : ''}>保主线顺因果（推荐，允许自然涟漪）</option>
+                            <option value="free" ${recastDraftUi.fidelity === 'free' ? 'selected' : ''}>借骨架自由重塑（只借开场与文风）</option>
+                        </select>
+                    </label>
+                </div>
+
+                <label class="tt-novel-check-row">
+                    <input type="checkbox" id="tt-novel-rc-auto-adv" ${recastDraftUi.autoAdvanceCursor !== false ? 'checked' : ''} />
+                    <span>每写完一章自动推进对照原著指针到下一章（Swipe 或删除章节时自动回退同步）</span>
+                </label>
+
+                ${srcPreviewText ? `
+                    <details class="tt-novel-subtle-fold">
+                        <summary>预览原著第 ${curCursor} 章《${escapeHtml(srcChapter?.title || '')}》片段（共 ${Number(srcChapter?.wordCount || srcChapter?.content?.length || 0)} 字）</summary>
+                        <div class="tt-novel-pre-wrap" style="margin-top: 6px;">${escapeHtml(srcPreviewText)}${srcChapter.content.length > 600 ? '……' : ''}</div>
+                    </details>
+                ` : ''}
+            </div>
+        </section>
+
+        <section class="tt-novel-section">
+            <div class="tt-novel-card-head">
+                <div class="tt-novel-section-title">角色替换映射表（支持单女主或多人替换）</div>
+                <button type="button" id="tt-novel-rc-add-row" class="menu_button tt-novel-btn-sm">${uiIcon('plus', 12)} 添加替换角色</button>
+            </div>
+            <div class="tt-novel-card-stack" id="tt-novel-rc-rows">${mappingsHtml}</div>
+        </section>
+
+        <section class="tt-novel-card">
+            <div class="tt-novel-edit-grid">
+                <label>额外世界观 / 背景微调要求（可选）
+                    <textarea id="tt-novel-rc-extra" class="text_pole" rows="2" placeholder="例如：把原著的现代都市校园微调到罗德岛休假日常，其余叙事节奏与对话密度严格保留原著风格">${escapeHtml(recastDraftUi.extraRules || '')}</textarea>
+                </label>
+                <div class="tt-novel-action-bar">
+                    <button type="button" id="tt-novel-rc-save" class="menu_button tt-novel-btn-sm tt-novel-btn-primary">保存换角配置</button>
+                    <button type="button" id="tt-novel-rc-gen-outline" class="menu_button tt-novel-btn-sm" ${!hasNovel || task.running ? 'disabled' : ''}>生成第 ${curCursor} 章换角大纲</button>
+                    <button type="button" id="tt-novel-rc-fill-write" class="menu_button tt-novel-btn-sm" ${!hasNovel ? 'disabled' : ''}>${uiIcon('send', 12)} 填入开写指令</button>
+                </div>
+            </div>
+        </section>
+    `;
+
+    const syncRecastDraftFromDom = () => {
+        const rows = [...bodyEl.querySelectorAll('#tt-novel-rc-rows [data-recast-row]')];
+        const mappings = rows.map((row, idx) => {
+            const id = row.getAttribute('data-recast-row') || `recast_${idx + 1}`;
+            const read = (f) => String(row.querySelector(`[data-rc-field="${f}"]`)?.value || '').trim();
+            return normalizeRecastMapping({
+                id,
+                fromName: read('fromName'),
+                toName: read('toName'),
+                toProfile: read('toProfile'),
+                note: read('note'),
+            }, idx);
+        });
+        recastDraftUi = {
+            enabled: Boolean(bodyEl.querySelector('#tt-novel-rc-enabled')?.checked),
+            sourceCursorChapter: Math.max(1, Number(bodyEl.querySelector('#tt-novel-rc-cursor')?.value || curCursor)),
+            autoAdvanceCursor: Boolean(bodyEl.querySelector('#tt-novel-rc-auto-adv')?.checked),
+            fidelity: String(bodyEl.querySelector('#tt-novel-rc-fidelity')?.value || 'balanced'),
+            mappings: mappings.length > 0 ? mappings : [normalizeRecastMapping({}, 0)],
+            extraRules: String(bodyEl.querySelector('#tt-novel-rc-extra')?.value || '').trim(),
+        };
+        return recastDraftUi;
+    };
+
+    const persistRecastConfig = async (showToast = true) => {
+        const draft = syncRecastDraftFromDom();
+        await handlers.onUpdateNarrativeConfig?.({ recast: normalizeRecastConfig(draft) });
+        recastDraftUi = null;
+        if (showToast) {
+            globalThis.toastr?.success?.(
+                draft.enabled
+                    ? `已保存换角仿写配置（当前对照原著第 ${draft.sourceCursorChapter} 章）`
+                    : '已保存换角仿写配置（当前未启用）',
+                '小说工作台',
+            );
+        }
+        return draft;
+    };
+
+    bodyEl.querySelector('[data-jump-lore]')?.addEventListener('click', () => {
+        activeTab = 'memory';
+        memoryFilter = 'canon';
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rc-prev')?.addEventListener('click', () => {
+        syncRecastDraftFromDom();
+        recastDraftUi.sourceCursorChapter = Math.max(1, recastDraftUi.sourceCursorChapter - 1);
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rc-next')?.addEventListener('click', () => {
+        syncRecastDraftFromDom();
+        recastDraftUi.sourceCursorChapter = Math.min(Math.max(1, totalCh), recastDraftUi.sourceCursorChapter + 1);
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rc-cursor')?.addEventListener('change', () => {
+        syncRecastDraftFromDom();
+        renderWorkbench();
+    });
+    bodyEl.querySelector('#tt-novel-rc-add-row')?.addEventListener('click', () => {
+        syncRecastDraftFromDom();
+        recastDraftUi.mappings.push(normalizeRecastMapping({}, recastDraftUi.mappings.length));
+        renderWorkbench();
+    });
+    bodyEl.querySelectorAll('[data-rc-action="del"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            syncRecastDraftFromDom();
+            const id = btn.getAttribute('data-id');
+            recastDraftUi.mappings = recastDraftUi.mappings.filter(m => m.id !== id);
+            if (recastDraftUi.mappings.length === 0) {
+                recastDraftUi.mappings.push(normalizeRecastMapping({}, 0));
+            }
+            renderWorkbench();
+        });
+    });
+    bodyEl.querySelectorAll('[data-rc-action="lookup"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            syncRecastDraftFromDom();
+            const id = btn.getAttribute('data-id');
+            const target = recastDraftUi.mappings.find(m => m.id === id);
+            const targetName = String(target?.toName || '').trim();
+            if (!targetName) {
+                globalThis.toastr?.warning?.('请先在右侧输入框填写要替换的新角色名（如 白金 / 塑心 / 椿）', '小说工作台');
+                return;
+            }
+            const res = await handlers.onLookupLoreCharacter?.(targetName);
+            if (!res?.summary) {
+                globalThis.toastr?.warning?.(`未在已导入资料库中找到「${targetName}」，请先在「设定 → 设定库」导入并勾选对应同人资料库包`, '小说工作台');
+                return;
+            }
+            target.toProfile = res.summary;
+            renderWorkbench();
+            globalThis.toastr?.success?.(`已从【${res.source}】自动填入「${res.title}」核心底骨档案`, '小说工作台');
+        });
+    });
+    bodyEl.querySelector('#tt-novel-rc-save')?.addEventListener('click', async () => {
+        await persistRecastConfig(true);
+    });
+    bodyEl.querySelector('#tt-novel-rc-gen-outline')?.addEventListener('click', async () => {
+        const draft = syncRecastDraftFromDom();
+        if (!draft.enabled) {
+            draft.enabled = true;
+        }
+        await handlers.onUpdateNarrativeConfig?.({ recast: normalizeRecastConfig(draft) });
+        recastDraftUi = null;
+        createSubTab = 'scene';
+        outlineDraftUiState.chapterCount = 1;
+        renderWorkbench();
+        handlers.onGenerateDirectorOutline?.({
+            userBrief: outlineDraftUiState.userBrief || '',
+            selectedHookIds: outlineDraftUiState.selectedHookIds || [],
+            sceneCount: outlineDraftUiState.sceneCount,
+            chapterCount: 1,
+            paceMode: outlineDraftUiState.paceMode,
+        });
+    });
+    bodyEl.querySelector('#tt-novel-rc-fill-write')?.addEventListener('click', async () => {
+        const draft = syncRecastDraftFromDom();
+        if (!draft.enabled) {
+            draft.enabled = true;
+        }
+        await handlers.onUpdateNarrativeConfig?.({ recast: normalizeRecastConfig(draft) });
+        recastDraftUi = null;
+        const pairs = draft.mappings
+            .filter(m => m.fromName || m.toName)
+            .map(m => (m.fromName && m.toName ? `${m.fromName}→${m.toName}` : (m.toName || m.fromName)))
+            .join('、');
+        const promptText = `【逐章换角仿写 · 对照原著第 ${draft.sourceCursorChapter} 章${srcChapter?.title ? `《${srcChapter.title}》` : ''}】\n请严格按换角映射（${pairs || '已配置角色替换表'}）重塑本章正文：保留原著段长节奏、文风笔触与剧情骨架，但让新角色 100% 按其资料库真实性格、外貌着装与语感演出，严禁机械改名换皮或残留被替换原名。`;
+        handlers.onApplyOutlineToChat?.(promptText, { autoSend: false });
     });
 }
 
@@ -520,11 +802,13 @@ function renderSceneOutlineSubView(bodyEl, segHtml, progressHtml, ledger, bp, ta
     }
     const selectedHookSet = new Set(outlineDraftUiState.selectedHookIds);
 
-    const anchorLabel = cachedAnchorInfo?.isFreshStart
-        ? `新书开篇 · 策划第 1 章`
-        : (cachedAnchorInfo?.anchorTitle
-            ? `承接「${cachedAnchorInfo.anchorTitle}」→ 第 ${cachedAnchorInfo.nextChapterIndex} ${cachedAnchorInfo.chapterUnit}`
-            : '请先在「全书总纲」立项或导入原著');
+    const anchorLabel = cachedAnchorInfo?.isRecastMode
+        ? `换角仿写 · 对照原著 #${cachedAnchorInfo.recastSourceChapter?.index || nCfg.recast.sourceCursorChapter} → 写第 ${cachedAnchorInfo.nextChapterIndex} ${cachedAnchorInfo.chapterUnit}`
+        : (cachedAnchorInfo?.isFreshStart
+            ? `新书开篇 · 策划第 1 章`
+            : (cachedAnchorInfo?.anchorTitle
+                ? `承接「${cachedAnchorInfo.anchorTitle}」→ 第 ${cachedAnchorInfo.nextChapterIndex} ${cachedAnchorInfo.chapterUnit}`
+                : '请先在「全书总纲」立项或导入原著'));
 
     const povTag = nCfg.povMode === 'strict_limited' && nCfg.povCharacter
         ? `单视角：${nCfg.povCharacter}`
@@ -1419,18 +1703,63 @@ function renderMemoryTab(bodyEl) {
             </section>
         `;
     } else if (memoryFilter === 'canon') {
+        const nCfg = normalizeNarrativeConfig(ledger.narrativeConfig);
+        const activePackSet = new Set(nCfg.activeLorePackIds || []);
+        const tavernWorlds = handlers.listAvailableTavernWorldbooks?.() || [];
+        const packs = Array.isArray(cachedGlobalLorePacks) ? cachedGlobalLorePacks : [];
+        const activeGlobalItems = Array.isArray(cachedActiveLoreBundle?.items)
+            ? cachedActiveLoreBundle.items.filter(it => !canonItems.includes(it))
+            : [];
+
+        const worldSelectOptions = tavernWorlds.length > 0
+            ? tavernWorlds.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')
+            : '<option value="">未检测到酒馆世界书</option>';
+
+        const packsHtml = packs.length === 0
+            ? '<div class="tt-novel-empty">还没有全局同人资料库包。点上方从酒馆世界书一键清洗导入（或上传本地 JSON/MD），一次导入即可跨所有小说与角色卡复用。</div>'
+            : packs.map(p => {
+                const isOn = activePackSet.has(p.id);
+                const statChips = [
+                    `<span class="tt-novel-chip is-gold">核心 ${Number(p.keptEntries || p.itemCount || 0)} 条</span>`,
+                    `<span class="tt-novel-chip">索引 ${Number(p.itemCount || 0)} 块</span>`,
+                    ...(Number(p.skippedDisabled || 0) > 0 ? [`<span class="tt-novel-chip">跳过 ${p.skippedDisabled} 禁用</span>`] : []),
+                    ...(Number(p.skippedNoise || 0) > 0 ? [`<span class="tt-novel-chip">滤除 ${p.skippedNoise} 跑团杂项</span>`] : []),
+                    ...(Number(p.sanitizedEjsCount || 0) > 0 ? [`<span class="tt-novel-chip">清洗 ${p.sanitizedEjsCount} EJS</span>`] : []),
+                    ...(Number(p.regexKeyCount || 0) > 0 ? [`<span class="tt-novel-chip">兼容 ${p.regexKeyCount} 正则</span>`] : []),
+                ].join('');
+                return `
+                    <div class="tt-novel-pack-card ${isOn ? 'is-active' : ''}" data-pack-id="${escapeHtml(p.id)}">
+                        <div class="tt-novel-pack-head">
+                            <label class="tt-novel-pack-check">
+                                <input type="checkbox" data-action="toggle-lore-pack" data-pack-id="${escapeHtml(p.id)}" ${isOn ? 'checked' : ''} />
+                                <span>${escapeHtml(p.name || '未命名资料库')}</span>
+                            </label>
+                            <button type="button" class="tt-novel-mini-icon-btn" data-action="del-lore-pack" data-pack-id="${escapeHtml(p.id)}" title="删除此全局资料库包">${uiIcon('trash', 13)}</button>
+                        </div>
+                        <div class="tt-novel-pack-stats">${statChips}</div>
+                    </div>
+                `;
+            }).join('');
+
         const canonQ = canonSearchQuery.trim().toLowerCase();
+        const combinedSearchPool = [
+            ...canonItems.map(it => ({ ...it, _isPrivate: true })),
+            ...(canonQ ? activeGlobalItems.map(it => ({ ...it, _isPrivate: false })) : []),
+        ];
         const filteredCanon = canonQ
-            ? canonItems.filter(it =>
-                `${it.title || ''} ${it.category || ''} ${(it.keywords || []).join(' ')} ${it.content || ''}`.toLowerCase().includes(canonQ),
+            ? combinedSearchPool.filter(it =>
+                `${it.title || ''} ${it.category || ''} ${it.source || ''} ${(it.keywords || []).join(' ')} ${it.content || ''}`.toLowerCase().includes(canonQ),
             )
-            : canonItems;
-        const canonHtml = canonItems.length === 0
-            ? '<div class="tt-novel-empty">补充设定库为空。可在「设置 → 导入管理」批量导入，或点右侧新增单条设定。</div>'
+            : combinedSearchPool;
+
+        const canonHtml = combinedSearchPool.length === 0 && !canonQ
+            ? (activeGlobalItems.length > 0
+                ? `<div class="tt-novel-empty">已启用全局资料库（共 ${activeGlobalItems.length} 条可检索分块）。在上方搜索框输入角色名（如 白金 / 塑心 / 椿）即可实时查验清洗后的词条，或点右侧新增本书私有设定。</div>`
+                : '<div class="tt-novel-empty">当前对话私有设定为空。可先在上方导入全局同人资料库包，或点右侧新增单条私有设定。</div>')
             : (filteredCanon.length === 0
-                ? '<div class="tt-novel-empty">未找到匹配的设定条目。</div>'
-                : filteredCanon.slice(0, 60).map(it => {
-                    if (editingCanonId === it.id) {
+                ? '<div class="tt-novel-empty">未找到匹配的设定词条。</div>'
+                : filteredCanon.slice(0, 50).map(it => {
+                    if (it._isPrivate && editingCanonId === it.id) {
                         return `
                             <div class="tt-novel-card is-editing" data-canon-id="${escapeHtml(it.id)}">
                                 <div class="tt-novel-edit-grid">
@@ -1453,26 +1782,53 @@ function renderMemoryTab(bodyEl) {
                             <div class="tt-novel-card-head">
                                 <div class="tt-novel-timeline-meta">
                                     <span class="tt-novel-chip">${escapeHtml(it.category || '世界设定')}</span>
+                                    ${it._isPrivate ? '' : `<span class="tt-novel-chip is-gold">${escapeHtml(it.source || '全局库')}</span>`}
                                     <strong>${escapeHtml(it.title || '未命名设定')}</strong>
                                 </div>
-                                <div class="tt-novel-card-actions">
-                                    <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-canon" data-id="${escapeHtml(it.id)}" title="编辑">${uiIcon('edit', 13)}</button>
-                                    <button type="button" class="tt-novel-mini-icon-btn" data-action="del-canon" data-id="${escapeHtml(it.id)}" title="删除">${uiIcon('trash', 13)}</button>
-                                </div>
+                                ${it._isPrivate ? `
+                                    <div class="tt-novel-card-actions">
+                                        <button type="button" class="tt-novel-mini-icon-btn" data-action="edit-canon" data-id="${escapeHtml(it.id)}" title="编辑">${uiIcon('edit', 13)}</button>
+                                        <button type="button" class="tt-novel-mini-icon-btn" data-action="del-canon" data-id="${escapeHtml(it.id)}" title="删除">${uiIcon('trash', 13)}</button>
+                                    </div>
+                                ` : ''}
                             </div>
                             ${(it.keywords || []).length > 0 ? `<div class="tt-novel-chip-row">${it.keywords.slice(0, 8).map(k => `<span class="tt-novel-chip is-gold">${escapeHtml(k)}</span>`).join('')}</div>` : ''}
-                            <div class="tt-novel-card-text">${escapeHtml(String(it.content || '').slice(0, 320))}${String(it.content || '').length > 320 ? '……' : ''}</div>
+                            <div class="tt-novel-card-text">${escapeHtml(String(it.content || '').slice(0, 420))}${String(it.content || '').length > 420 ? '……' : ''}</div>
                         </div>
                     `;
                 }).join(''));
 
         activeSectionHtml = `
+            <section class="tt-novel-card">
+                <div class="tt-novel-card-head">
+                    <div class="tt-novel-section-title">全局同人资料库包（跨书复用 · 已启用 ${cachedActiveLoreBundle?.activePacks?.length || 0}/${packs.length}）</div>
+                    <label class="menu_button tt-novel-btn-sm tt-novel-file-label">
+                        ${uiIcon('upload', 12)} 导入本地文件
+                        <input type="file" id="tt-novel-import-global-lore" accept=".json,.jsonl,.md,.txt,application/json,text/plain,*/*" multiple hidden />
+                    </label>
+                </div>
+                <div class="tt-novel-edit-grid" style="margin-top: 8px;">
+                    <div class="tt-novel-bridge-row">
+                        <select id="tt-novel-tavern-world-select" class="text_pole" ${tavernWorlds.length === 0 ? 'disabled' : ''}>${worldSelectOptions}</select>
+                        <button type="button" id="tt-novel-import-tavern-world" class="menu_button tt-novel-btn-sm tt-novel-btn-primary" ${tavernWorlds.length === 0 ? 'disabled' : ''}>清洗并导入</button>
+                    </div>
+                    <label class="tt-novel-check-row">
+                        <input type="checkbox" id="tt-novel-lore-include-core" ${nCfg.includeLorePackWorldCore !== false ? 'checked' : ''} />
+                        <span>自动附带已启用资料库的精简世界观总纲（每包限 1,800 字，拒绝爆上下文）</span>
+                    </label>
+                    ${(cachedActiveLoreBundle?.activePacks?.length || 0) > 0
+                        ? '<div class="tt-novel-muted">已启用纯净资料库：建议关闭酒馆原生同名大世界书，让插件按章精准召回完整角色档案（单条上限 1,400 字）。</div>'
+                        : ''}
+                    <div class="tt-novel-card-stack">${packsHtml}</div>
+                </div>
+            </section>
+
             <section class="tt-novel-section">
                 <div class="tt-novel-card-head">
-                    <div class="tt-novel-section-title">补充设定库（${canonItems.length}）</div>
-                    <button type="button" id="tt-novel-add-canon-inline" class="menu_button tt-novel-btn-sm">${uiIcon('plus', 12)} 新增设定</button>
+                    <div class="tt-novel-section-title">词条检索与私有设定（私有 ${canonItems.length} · 已启全局 ${activeGlobalItems.length}）</div>
+                    <button type="button" id="tt-novel-add-canon-inline" class="menu_button tt-novel-btn-sm">${uiIcon('plus', 12)} 新增私有设定</button>
                 </div>
-                <input type="search" id="tt-novel-canon-search" class="text_pole" value="${escapeHtml(canonSearchQuery)}" placeholder="搜索标题、分类或关键词..." />
+                <input type="search" id="tt-novel-canon-search" class="text_pole" value="${escapeHtml(canonSearchQuery)}" placeholder="搜角色名、势力或关键词（可跨已启用的全局资料库与私有设定实时查验）..." />
                 <div class="tt-novel-card-stack">${canonHtml}</div>
             </section>
         `;
@@ -1501,7 +1857,7 @@ function renderMemoryTab(bodyEl) {
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'chronicle' ? 'active' : ''}" data-filter="chronicle">编年史 (${chronicle.length})</button>
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'hooks' ? 'active' : ''}" data-filter="hooks">伏笔 (${openHooks.length})</button>
             <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'world' ? 'active' : ''}" data-filter="world">状态 (${worldStates.length + summaries.length})</button>
-            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'canon' ? 'active' : ''}" data-filter="canon">设定库 (${canonItems.length})</button>
+            <button type="button" class="tt-novel-filter-pill ${memoryFilter === 'canon' ? 'active' : ''}" data-filter="canon">设定库 (${(cachedActiveLoreBundle?.activePacks?.length || 0) > 0 ? `${cachedActiveLoreBundle.activePacks.length}包/` : ''}${canonItems.length})</button>
         </div>
 
         ${progressHtml}
@@ -1927,6 +2283,38 @@ function renderMemoryTab(bodyEl) {
             cur.summaries = cur.summaries.filter(x => Number(x.chapterIndex) !== chNum);
             await saveLedger(cur);
             await refreshReaderWidgets();
+        });
+    });
+
+    // Global Reusable Lore Packs bindings
+    bodyEl.querySelector('#tt-novel-import-global-lore')?.addEventListener('change', async (e) => {
+        const files = [...(e.target.files || [])];
+        if (files.length > 0) await handlers.onImportGlobalLoreFiles?.(files);
+        e.target.value = '';
+    });
+    bodyEl.querySelector('#tt-novel-import-tavern-world')?.addEventListener('click', async () => {
+        const bookName = String(bodyEl.querySelector('#tt-novel-tavern-world-select')?.value || '').trim();
+        if (!bookName) {
+            globalThis.toastr?.warning?.('请先选择一本酒馆世界书', '小说工作台');
+            return;
+        }
+        await handlers.onImportTavernWorldbookAsLorePack?.(bookName);
+    });
+    bodyEl.querySelector('#tt-novel-lore-include-core')?.addEventListener('change', async (e) => {
+        await handlers.onUpdateNarrativeConfig?.({ includeLorePackWorldCore: Boolean(e.target.checked) });
+    });
+    bodyEl.querySelectorAll('[data-action="toggle-lore-pack"]').forEach(chk => {
+        chk.addEventListener('change', async (e) => {
+            const packId = chk.getAttribute('data-pack-id');
+            if (packId) await handlers.onToggleGlobalLorePack?.(packId, Boolean(e.target.checked));
+        });
+    });
+    bodyEl.querySelectorAll('[data-action="del-lore-pack"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const packId = btn.getAttribute('data-pack-id');
+            if (!packId) return;
+            if (!window.confirm('确定删除这个全局同人资料库包吗？（不会影响酒馆原始世界书文件）')) return;
+            await handlers.onDeleteGlobalLorePack?.(packId);
         });
     });
 
@@ -2793,7 +3181,7 @@ function renderSettingsTab(bodyEl) {
     const isCustomApi = settings.bgApiMode === 'custom';
     const cachedModels = Array.isArray(settings.bgCustomApiModelsCache) ? settings.bgCustomApiModelsCache : [];
     const customModelVal = String(settings.bgCustomApiModel || '');
-    const purePresetName = String(meta.bundledPurePresetName || 'TT小说续写专用-猫神融合版');
+    const purePresetName = String(meta.bundledPurePresetName || 'TT小说续写专用-纯净版');
     const isPurePresetActive = Boolean(meta.activePresetName && meta.activePresetName === purePresetName);
     const isPurePresetInstalled = presetNames.includes(purePresetName);
 
@@ -2987,8 +3375,8 @@ function renderSettingsTab(bodyEl) {
                     </label>
                     <div class="tt-novel-muted">
                         ${isPurePresetActive
-                            ? `当前已启用融合预设 <code>${escapeHtml(purePresetName)}</code>（保留破限与大思考，适配纯小说创作、后台直通与 &lt;novel_state&gt;）。`
-                            : `推荐导入融合预设 <code>${escapeHtml(purePresetName)}</code>${isPurePresetInstalled ? '（已在列表中）' : ''}，支持后台直通与自动总结，不会改动你的 API 与模型。`}
+                            ? `当前已启用本插件专用预设 <code>${escapeHtml(purePresetName)}</code>（无 RP 干扰、保留 &lt;novel_state&gt;、服从文风卡与单视角）。`
+                            : `推荐导入插件专用预设 <code>${escapeHtml(purePresetName)}</code>${isPurePresetInstalled ? '（已在列表中）' : ''}，不会改动你的 API 连接与模型。`}
                     </div>
                     <div class="tt-novel-action-bar">
                         <button type="button" id="tt-novel-wb-install-pure-preset" class="menu_button tt-novel-btn-sm ${isPurePresetActive ? '' : 'tt-novel-btn-primary'}">

@@ -22,9 +22,12 @@ import {
 } from './context-assembler.js';
 import {
     extractNovelStateBlock,
+    lookupLoreEntriesByName,
     parseChapterRangeSpec,
     parseNovelTxt,
     parseSupplementaryDatabase,
+    parseSupplementaryDatabaseDetailed,
+    searchCanonDatabaseCjk,
     stripNonStoryBlocks,
 } from './parser.js';
 import {
@@ -49,10 +52,15 @@ import {
     clearNovelData,
     createEmptyCanonDb,
     createEmptyLedger,
+    deleteGlobalLorePack,
     hasStoryBlueprint,
+    listAvailableTavernWorldbooks,
+    listGlobalLorePacks,
+    loadActiveLoreBundle,
     loadCanonDb,
     loadLedger,
     loadNovelData,
+    loadTavernWorldbookRawJson,
     mergeArchivedDataIntoLedger,
     normalizeNarrativeConfig,
     normalizeStoryBlueprint,
@@ -61,6 +69,7 @@ import {
     reindexNovelChapters,
     resolveBookTitle,
     saveCanonDb,
+    saveGlobalLorePack,
     saveLedger,
     saveNovelData,
     syncWorldUpdatesToTavernLorebook,
@@ -154,11 +163,15 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
     }
 
     try {
-        // Keep the latest `mountAnchorChapters` (default 3, up to 20) original chapters in `coreChat`
-        // AND merge consecutive original chapter floors into ONE continuous assistant message so
-        // preset processors (e.g. Meowssiah/SPreset) never truncate earlier chapters as foreign archives.
+        const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
+        const loreBundle = await loadActiveLoreBundle(ledger, canonDb);
+        const isRecastMode = Boolean(ledger?.narrativeConfig?.recast?.enabled && novelData?.chapters?.length);
+
+        // In Recast Mode, strip original cutoff floors from the outgoing prompt so the LLM never
+        // confuses the original novel's ending with the current Chapter-N recast sequence.
+        // In standard continuation mode, keep the latest `mountAnchorChapters` (default 3, up to 20)
+        // merged into ONE continuous assistant message so preset processors never truncate earlier anchors.
         if (Array.isArray(chat)) {
-            const anchorLimit = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 3));
             const origPositions = [];
             chat.forEach((m, idx) => {
                 if (m?.extra?.novelContinuationOrigin === 'original') {
@@ -166,33 +179,39 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
                 }
             });
             if (origPositions.length > 0) {
-                const keptPositions = origPositions.slice(-anchorLimit);
-                const firstKeptPos = keptPositions[0];
-                const mergedText = keptPositions
-                    .map(pos => String(chat[pos]?.mes || '').trim())
-                    .filter(Boolean)
-                    .join('\n\n---\n\n');
-                const lastKeptMsg = chat[keptPositions[keptPositions.length - 1]];
-                const mergedOrigMsg = {
-                    ...lastKeptMsg,
-                    mes: mergedText,
-                    extra: {
-                        ...(lastKeptMsg?.extra || {}),
-                        novelContinuationOrigin: 'original',
-                        novelMergedChapterCount: keptPositions.length,
-                    },
-                };
-                const removeSet = new Set(origPositions.filter(pos => pos !== firstKeptPos));
-                chat[firstKeptPos] = mergedOrigMsg;
-                for (let i = chat.length - 1; i >= 0; i -= 1) {
-                    if (removeSet.has(i)) {
-                        chat.splice(i, 1);
+                if (isRecastMode) {
+                    for (let i = origPositions.length - 1; i >= 0; i -= 1) {
+                        chat.splice(origPositions[i], 1);
+                    }
+                } else {
+                    const anchorLimit = Math.max(1, Math.min(20, Number(settings.mountAnchorChapters) || 3));
+                    const keptPositions = origPositions.slice(-anchorLimit);
+                    const firstKeptPos = keptPositions[0];
+                    const mergedText = keptPositions
+                        .map(pos => String(chat[pos]?.mes || '').trim())
+                        .filter(Boolean)
+                        .join('\n\n---\n\n');
+                    const lastKeptMsg = chat[keptPositions[keptPositions.length - 1]];
+                    const mergedOrigMsg = {
+                        ...lastKeptMsg,
+                        mes: mergedText,
+                        extra: {
+                            ...(lastKeptMsg?.extra || {}),
+                            novelContinuationOrigin: 'original',
+                            novelMergedChapterCount: keptPositions.length,
+                        },
+                    };
+                    const removeSet = new Set(origPositions.filter(pos => pos !== firstKeptPos));
+                    chat[firstKeptPos] = mergedOrigMsg;
+                    for (let i = chat.length - 1; i >= 0; i -= 1) {
+                        if (removeSet.has(i)) {
+                            chat.splice(i, 1);
+                        }
                     }
                 }
             }
         }
 
-        const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
         const hasExternalLwbSummary = Boolean(
             context?.extensionPrompts?.LittleWhiteBox_StorySummary?.value
             && String(context.extensionPrompts.LittleWhiteBox_StorySummary.value).trim(),
@@ -202,6 +221,7 @@ globalThis.novelContinuation_interceptGeneration = async function (chat, _contex
             novelData,
             ledger,
             canonDb,
+            loreBundle,
             settings,
             generationType: type || 'normal',
             hasExternalLwbSummary,
@@ -333,6 +353,7 @@ async function persistExtractedChapterState({
         appearanceUpdates: extracted.appearanceUpdates || [],
         hooks: extracted.hooks || [],
         refCursor: extracted.refCursor ?? null,
+        recastCursor: extracted.recastCursor ?? null,
     };
     msg.extra = msg.extra || {};
     msg.extra.novelContinuationState = stateRecord;
@@ -430,13 +451,14 @@ async function onMessageReceived(messageId, type) {
 
     const [novelData, ledgerForIndex] = await Promise.all([loadNovelData(), loadLedger()]);
     const excludeFlashback = ledgerForIndex?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
+    const recastCfg = ledgerForIndex?.narrativeConfig?.recast || null;
     msg.extra = msg.extra || {};
     if (!msg.extra.novelContinuationOrigin) {
         msg.extra.novelContinuationOrigin = 'continued';
     }
 
     const chapterIndex = Number(msg.extra.novelChapterIndex)
-        || Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData, true, excludeFlashback));
+        || Math.max(1, resolveCurrentTargetChapterIndex(chat, novelData, true, excludeFlashback, recastCfg));
     msg.extra.novelChapterIndex = chapterIndex;
 
     const projectActive = isNovelProjectActive(novelData, ledgerForIndex);
@@ -1014,48 +1036,80 @@ function stopBackgroundTask(taskKey) {
 
 async function collectActivatedTavernWorldInfo({ novelData = null, ledger = null, extraTexts = [] } = {}) {
     const cfg = normalizeNarrativeConfig(ledger?.narrativeConfig);
-    if (cfg.worldInfoMode === 'off') return '';
-    if (typeof getWorldInfoPrompt !== 'function') return '';
-    try {
-        const context = getContext();
-        const chat = Array.isArray(context?.chat) ? context.chat : [];
-        const scanTexts = [];
-        for (const extra of extraTexts || []) {
-            const clean = stripNonStoryBlocks(String(extra || '')).trim();
-            if (clean) scanTexts.push(clean.slice(-2000));
-        }
-        for (let i = chat.length - 1; i >= 0 && scanTexts.length < 6; i -= 1) {
-            const clean = stripNonStoryBlocks(String(chat[i]?.mes || '')).trim();
-            if (clean) scanTexts.push(clean.slice(-1500));
-        }
-        const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
-        const anchor = cutoff > 0
-            ? resolveActiveAnchorChapter(novelData, cfg.excludeFlashbackFromAnchor !== false)
-            : null;
-        if (anchor?.content) {
-            scanTexts.push(stripNonStoryBlocks(anchor.content).slice(-1200));
-        }
-        const charNames = (ledger?.characters || []).map(c => c?.name).filter(Boolean);
-        if (charNames.length > 0) {
-            scanTexts.push(charNames.join(' '));
-        }
-        if (scanTexts.length === 0) return '';
-
-        const maxCtx = Math.max(8192, Number(oai_settings?.openai_max_context) || 65536);
-        const wiRes = await getWorldInfoPrompt(scanTexts, maxCtx, true);
-        const combined = [
-            String(wiRes?.worldInfoBefore || '').trim(),
-            String(wiRes?.worldInfoAfter || '').trim(),
-        ].filter(Boolean).join('\n\n').trim();
-        if (!combined) return '';
-
-        const budget = cfg.worldInfoBudgetChars || 12000;
-        if (combined.length <= budget) return combined;
-        return `${combined.slice(0, budget)}\n……（世界书条目较长，已按 ${budget} 字预算截断）`;
-    } catch (err) {
-        console.warn('[小说续写阅读器] 读取酒馆世界书失败（已安全忽略）：', err);
-        return '';
+    const context = getContext();
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    const scanTexts = [];
+    for (const extra of extraTexts || []) {
+        const clean = stripNonStoryBlocks(String(extra || '')).trim();
+        if (clean) scanTexts.push(clean.slice(-2000));
     }
+    for (let i = chat.length - 1; i >= 0 && scanTexts.length < 6; i -= 1) {
+        const clean = stripNonStoryBlocks(String(chat[i]?.mes || '')).trim();
+        if (clean) scanTexts.push(clean.slice(-1500));
+    }
+    const cutoff = Number(novelData?.cutoffChapterIndex || novelData?.chapters?.length || 0);
+    const anchor = cutoff > 0
+        ? resolveActiveAnchorChapter(novelData, cfg.excludeFlashbackFromAnchor !== false)
+        : null;
+    if (anchor?.content) {
+        scanTexts.push(stripNonStoryBlocks(anchor.content).slice(-1200));
+    }
+    const charNames = (ledger?.characters || []).map(c => c?.name).filter(Boolean);
+    const recastTargetNames = (cfg.recast?.mappings || []).map(m => m?.toName).filter(Boolean);
+    const combinedNames = [...new Set([...charNames, ...recastTargetNames])];
+    if (combinedNames.length > 0) {
+        scanTexts.push(combinedNames.join(' '));
+    }
+
+    const blocks = [];
+
+    // 1. Clean Global Reusable Lore Packs + per-chat Canon DB (works even when native Tavern WorldInfo is OFF!)
+    try {
+        const canonDb = await loadCanonDb();
+        const loreBundle = await loadActiveLoreBundle(ledger, canonDb);
+        if (loreBundle.worldCores.length > 0) {
+            for (const wc of loreBundle.worldCores.slice(0, 2)) {
+                blocks.push(`【纯净资料库核心世界观 · ${wc.packName}】\n${wc.digest.slice(0, 1500)}`);
+            }
+        }
+        if (loreBundle.items.length > 0 && scanTexts.length > 0) {
+            const hits = searchCanonDatabaseCjk(scanTexts.join('\n'), loreBundle.items, {
+                topK: 5,
+                maxItemChars: 1300,
+                pinnedNames: recastTargetNames,
+            });
+            if (hits.length > 0) {
+                blocks.push(
+                    '【纯净资料库精准检索词条】\n'
+                    + hits.map(h => `- [${h.category}] ${h.title}：\n${h.content}`).join('\n\n'),
+                );
+            }
+        }
+    } catch (err) {
+        console.warn('[小说续写阅读器] 读取全局资料库失败（已安全忽略）：', err);
+    }
+
+    // 2. Native Tavern WorldInfo bridge (when enabled)
+    if (cfg.worldInfoMode !== 'off' && typeof getWorldInfoPrompt === 'function' && scanTexts.length > 0) {
+        try {
+            const maxCtx = Math.max(8192, Number(oai_settings?.openai_max_context) || 65536);
+            const wiRes = await getWorldInfoPrompt(scanTexts, maxCtx, true);
+            const wiText = [
+                String(wiRes?.worldInfoBefore || '').trim(),
+                String(wiRes?.worldInfoAfter || '').trim(),
+            ].filter(Boolean).join('\n\n').trim();
+            if (wiText) blocks.push(wiText);
+        } catch (err) {
+            console.warn('[小说续写阅读器] 读取酒馆世界书失败（已安全忽略）：', err);
+        }
+    }
+
+    const combined = blocks.join('\n\n').trim();
+    if (!combined) return '';
+
+    const budget = cfg.worldInfoBudgetChars || 12000;
+    if (combined.length <= budget) return combined;
+    return `${combined.slice(0, budget)}\n……（设定与世界书内容较长，已按 ${budget} 字预算截断）`;
 }
 
 async function callCustomOpenAiViaHost({ baseUrl, apiKey, model, temperature, messages, signal = null }) {
@@ -2321,15 +2375,19 @@ async function runGenerateDirectorOutlineTask({
     }
 
     const count = Math.max(1, Math.min(8, Number(chapterCount) || 1));
-    const worldInfoContext = await collectActivatedTavernWorldInfo({
-        novelData,
-        ledger,
-        extraTexts: [userBrief, ledger?.storyBlueprint?.premise || ''],
-    });
+    const [canonDb, worldInfoContext] = await Promise.all([
+        loadCanonDb(),
+        collectActivatedTavernWorldInfo({
+            novelData,
+            ledger,
+            extraTexts: [userBrief, ledger?.storyBlueprint?.premise || ''],
+        }),
+    ]);
+    const loreBundle = await loadActiveLoreBundle(ledger, canonDb);
     updateLiveProgress('outline', {
         isRunning: true,
         isError: false,
-        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡${worldInfoContext ? '与酒馆世界书' : ''}策划连续 ${count} 章原味分镜大纲...`,
+        text: `使用 [${caller.modelLabel}] · 预设 [${caller.presetLabel}] 结合最新结尾、人物灵魂卡${worldInfoContext ? '与纯净资料库/世界书' : ''}策划连续 ${count} 章原味分镜大纲...`,
     });
 
     try {
@@ -2343,6 +2401,7 @@ async function runGenerateDirectorOutlineTask({
             chapterCount: count,
             paceMode,
             worldInfoContext,
+            loreItems: loreBundle.items,
             signal: ctrl.signal,
             callModel: caller.callModel,
         });
@@ -2420,7 +2479,8 @@ async function getLatestChapterAnchorInfo() {
     const [novelData, ledger] = await Promise.all([loadNovelData(), loadLedger()]);
     const continuedChapters = collectContinuedChaptersFromChat(novelData);
     const excludeFlashback = ledger?.narrativeConfig?.excludeFlashbackFromAnchor !== false;
-    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback });
+    const recastConfig = ledger?.narrativeConfig?.recast || null;
+    const anchor = resolveLatestChapterAnchor(novelData, continuedChapters, { excludeFlashback, recastConfig });
     const summarySet = new Set(
         (ledger?.summaries || [])
             .filter(s => s && Number(s.chapterIndex) > 0 && String(s.summary || '').trim())
@@ -2969,18 +3029,183 @@ async function handleImportNovelFile(file) {
 async function handleImportCanonFiles(files) {
     const canonDb = await loadCanonDb();
     let addedCount = 0;
+    let skippedDisabled = 0;
+    let skippedNoise = 0;
+    let sanitizedEjs = 0;
     for (const file of files) {
-        const parsedItems = parseSupplementaryDatabase(await file.text(), file.name);
-        if (parsedItems.length > 0) {
+        const parsed = parseSupplementaryDatabaseDetailed(await file.text(), file.name);
+        if (parsed.items.length > 0) {
             canonDb.sources = [...new Set([...(canonDb.sources || []), file.name])];
-            canonDb.items.push(...parsedItems);
-            addedCount += parsedItems.length;
+            canonDb.items.push(...parsed.items);
+            addedCount += parsed.items.length;
         }
+        skippedDisabled += parsed.stats.skippedDisabled;
+        skippedNoise += parsed.stats.skippedNoise;
+        sanitizedEjs += parsed.stats.sanitizedEjsCount;
     }
     await saveCanonDb(canonDb);
     await refreshReaderWidgets();
     await refreshSettingsStatusCard();
-    globalThis.toastr?.success?.(`已挂载 ${addedCount} 条同人补充原作设定词条！`, '小说续写阅读器');
+    const cleanNote = (skippedDisabled || skippedNoise || sanitizedEjs)
+        ? `（已过滤 ${skippedDisabled} 禁用 / ${skippedNoise} 跑团杂项，清洗 ${sanitizedEjs} 条 EJS）`
+        : '';
+    globalThis.toastr?.success?.(`已挂载 ${addedCount} 条私有补充设定${cleanNote}`, '小说续写阅读器');
+}
+
+async function importRawTextAsGlobalLorePack(rawText, sourceName) {
+    const cleanName = String(sourceName || '同人资料库').replace(/\.(json|jsonl|md|txt)$/i, '').trim() || '同人资料库';
+    const parsed = parseSupplementaryDatabaseDetailed(rawText, cleanName);
+    if (parsed.items.length === 0) {
+        throw new Error(`《${cleanName}》清洗后没有可用设定词条（可能全部为禁用或跑团规则）`);
+    }
+    const existingPacks = await listGlobalLorePacks();
+    const matchedPrev = existingPacks.find(p => p && p.name === cleanName);
+    const packId = matchedPrev?.id || `pack_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const packMeta = {
+        id: packId,
+        name: cleanName,
+        sourceFile: String(sourceName || cleanName),
+        importedAt: Date.now(),
+        rawCount: parsed.stats.rawCount,
+        keptEntries: parsed.stats.keptEntries,
+        itemCount: parsed.stats.itemCount,
+        worldCoreCount: parsed.stats.worldCoreCount,
+        skippedDisabled: parsed.stats.skippedDisabled,
+        skippedNoise: parsed.stats.skippedNoise,
+        sanitizedEjsCount: parsed.stats.sanitizedEjsCount,
+        splitLongCount: parsed.stats.splitLongCount,
+        regexKeyCount: parsed.stats.regexKeyCount,
+        totalChars: parsed.stats.totalChars,
+    };
+    await saveGlobalLorePack(packMeta, {
+        id: packId,
+        name: cleanName,
+        worldCoreDigest: parsed.worldCoreDigest,
+        items: parsed.items,
+    });
+
+    // Auto-enable this pack for the current novel chat
+    const ledger = await loadLedger();
+    const curIds = Array.isArray(ledger.narrativeConfig?.activeLorePackIds)
+        ? ledger.narrativeConfig.activeLorePackIds
+        : [];
+    if (!curIds.includes(packId)) {
+        ledger.narrativeConfig = normalizeNarrativeConfig({
+            ...(ledger.narrativeConfig || {}),
+            activeLorePackIds: [...curIds, packId],
+        });
+        await saveLedger(ledger);
+    }
+    return packMeta;
+}
+
+async function handleImportGlobalLoreFiles(files) {
+    const imported = [];
+    try {
+        for (const file of files) {
+            const meta = await importRawTextAsGlobalLorePack(await file.text(), file.name);
+            imported.push(meta);
+        }
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        const summary = imported
+            .map(m => `《${m.name}》保留 ${m.keptEntries} 条核心（${m.itemCount} 块，跳过 ${m.skippedDisabled} 禁用/${m.skippedNoise} 杂项，清洗 ${m.sanitizedEjsCount} EJS）`)
+            .join('；');
+        globalThis.toastr?.success?.(`全局资料库已就绪并在当前对话启用：${summary}`, '小说续写阅读器');
+    } catch (err) {
+        globalThis.toastr?.error?.(`导入全局资料库失败：${err?.message || err}`, '小说续写阅读器');
+    }
+}
+
+async function handleImportTavernWorldbookAsLorePack(bookName) {
+    try {
+        const rawJson = await loadTavernWorldbookRawJson(bookName);
+        const meta = await importRawTextAsGlobalLorePack(rawJson, bookName);
+        await refreshReaderWidgets();
+        await refreshSettingsStatusCard();
+        globalThis.toastr?.success?.(
+            `已将酒馆世界书《${meta.name}》清洗为全局资料库：保留 ${meta.keptEntries} 条核心（${meta.itemCount} 块，跳过 ${meta.skippedDisabled} 禁用 / ${meta.skippedNoise} 跑团规则，清洗 ${meta.sanitizedEjsCount} 条 EJS）`,
+            '小说续写阅读器',
+        );
+    } catch (err) {
+        globalThis.toastr?.error?.(`导入世界书失败：${err?.message || err}`, '小说续写阅读器');
+    }
+}
+
+async function handleToggleGlobalLorePack(packId, enabled) {
+    const ledger = await loadLedger();
+    const curIds = Array.isArray(ledger.narrativeConfig?.activeLorePackIds)
+        ? [...ledger.narrativeConfig.activeLorePackIds]
+        : [];
+    const nextIds = enabled
+        ? [...new Set([...curIds, packId])]
+        : curIds.filter(id => id !== packId);
+    ledger.narrativeConfig = normalizeNarrativeConfig({
+        ...(ledger.narrativeConfig || {}),
+        activeLorePackIds: nextIds,
+    });
+    await saveLedger(ledger);
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+}
+
+async function handleDeleteGlobalLorePack(packId) {
+    await deleteGlobalLorePack(packId);
+    const ledger = await loadLedger();
+    const curIds = Array.isArray(ledger.narrativeConfig?.activeLorePackIds)
+        ? ledger.narrativeConfig.activeLorePackIds
+        : [];
+    if (curIds.includes(packId)) {
+        ledger.narrativeConfig = normalizeNarrativeConfig({
+            ...(ledger.narrativeConfig || {}),
+            activeLorePackIds: curIds.filter(id => id !== packId),
+        });
+        await saveLedger(ledger);
+    }
+    await refreshReaderWidgets();
+    await refreshSettingsStatusCard();
+    globalThis.toastr?.info?.('已删除该全局资料库包', '小说续写阅读器');
+}
+
+async function handleLookupLoreCharacter(name) {
+    const query = String(name || '').trim();
+    if (!query) return null;
+    const [ledger, canonDb] = await Promise.all([loadLedger(), loadCanonDb()]);
+    const loreBundle = await loadActiveLoreBundle(ledger, canonDb);
+    const hit = lookupLoreEntriesByName(query, loreBundle.items, { maxChars: 1400 });
+    if (hit?.summary) {
+        return {
+            title: hit.item.title,
+            source: hit.item.source || '资料库',
+            summary: hit.summary,
+        };
+    }
+    // Fallback: also scan all installed global packs even if not yet toggled on
+    const allPacks = await listGlobalLorePacks();
+    for (const meta of allPacks) {
+        const bundle = await loadActiveLoreBundle({ narrativeConfig: { activeLorePackIds: [meta.id] } }, null);
+        const fallbackHit = lookupLoreEntriesByName(query, bundle.items, { maxChars: 1400 });
+        if (fallbackHit?.summary) {
+            return {
+                title: fallbackHit.item.title,
+                source: `${meta.name}（未勾选启用，建议前往设定库勾选）`,
+                summary: fallbackHit.summary,
+            };
+        }
+    }
+    const charMatch = (ledger.characters || []).find(
+        c => c?.name && String(c.name).trim().toLowerCase() === query.toLowerCase(),
+    );
+    if (charMatch) {
+        return {
+            title: charMatch.name,
+            source: '人物灵魂档案',
+            summary: [charMatch.canonFoundation, charMatch.currentAppearance, charMatch.voiceAndQuotes]
+                .filter(Boolean)
+                .join('\n'),
+        };
+    }
+    return null;
 }
 
 function handleUpdateSetting(key, value) {
@@ -3015,7 +3240,7 @@ function mountSettingsPanel() {
     wrapper.className = 'inline-drawer';
     wrapper.innerHTML = `
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>小说创作与续写工作台 (v1.8)</b>
+            <b>小说创作与续写工作台 (v1.9)</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content tt-novel-settings-body">
@@ -3063,13 +3288,23 @@ async function refreshSettingsStatusCard() {
     const card = document.getElementById('tt-novel-status-card');
     if (!card) return;
 
-    const [novelData, ledger, canonDb] = await Promise.all([loadNovelData(), loadLedger(), loadCanonDb()]);
+    const [novelData, ledger, canonDb, globalPacks] = await Promise.all([
+        loadNovelData(),
+        loadLedger(),
+        loadCanonDb(),
+        listGlobalLorePacks(),
+    ]);
     const meta = getRuntimeMeta();
     const openHooksCount = (ledger?.hooks || []).filter(h => h.status !== 'resolved').length;
     const sp = ledger?.styleProfile;
     const bp = ledger?.storyBlueprint;
+    const nCfg = normalizeNarrativeConfig(ledger?.narrativeConfig);
+    const activePackCount = (nCfg.activeLorePackIds || []).filter(id => globalPacks.some(p => p.id === id)).length;
+    const recastTag = nCfg.recast?.enabled
+        ? ` · 换角仿写 #${nCfg.recast.sourceCursorChapter}`
+        : '';
     const novelLine = novelData
-        ? `<b>原著</b>：《${escapeHtml(novelData.title)}》（${novelData.totalChapters}章 · 锚点 #${novelData.cutoffChapterIndex}）`
+        ? `<b>原著</b>：《${escapeHtml(novelData.title)}》（${novelData.totalChapters}章 · 锚点 #${novelData.cutoffChapterIndex}${escapeHtml(recastTag)}）`
         : (hasStoryBlueprint(bp)
             ? `<b>作品</b>：《${escapeHtml(bp.title || '新书立项')}》（${bp.creationMode === 'fanfic_new' ? '同人新开坑' : '原创世界观'} · ${bp.volumes?.length || 0}卷蓝图）`
             : '<b>作品</b>：尚未导入原著或立项新书');
@@ -3079,7 +3314,7 @@ async function refreshSettingsStatusCard() {
     const styleLine = sp?.styleCard
         ? `<b>文风</b>：${String(sp.styleCard).length}字${escapeHtml(scoreChain)}`
         : '<b>文风</b>：未生成';
-    const memLine = `<b>设定</b>：${ledger.characters.length} 人物 · ${ledger.chronicle.length} 编年史 · ${openHooksCount} 伏笔 · ${canonDb.items.length} 补充设定`;
+    const memLine = `<b>设定</b>：${ledger.characters.length} 人物 · ${ledger.chronicle.length} 编年史 · ${openHooksCount} 伏笔 · ${activePackCount} 全局资料包 / ${canonDb.items.length} 私有设定`;
     const presetLine = `<b>通道</b>：<code>${escapeHtml(meta.activeModel)}</code> · <code>${escapeHtml(meta.presetLabel)}</code>`;
 
     card.innerHTML = `<div>${novelLine}</div><div>${styleLine}</div><div>${memLine}</div><div>${presetLine}</div>`;
@@ -3110,6 +3345,12 @@ export async function init() {
         onViewChapter: handleViewOriginalChapter,
         onImportNovelFile: handleImportNovelFile,
         onImportCanonFiles: handleImportCanonFiles,
+        onImportGlobalLoreFiles: handleImportGlobalLoreFiles,
+        onImportTavernWorldbookAsLorePack: handleImportTavernWorldbookAsLorePack,
+        onToggleGlobalLorePack: handleToggleGlobalLorePack,
+        onDeleteGlobalLorePack: handleDeleteGlobalLorePack,
+        onLookupLoreCharacter: handleLookupLoreCharacter,
+        listAvailableTavernWorldbooks,
         onClearCanon: async () => {
             await saveCanonDb(createEmptyCanonDb());
             await refreshReaderWidgets();

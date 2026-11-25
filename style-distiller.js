@@ -341,7 +341,37 @@ export function cleanDistillProse(rawText) {
 }
 
 /**
+ * Sanitizes a Style DNA card by removing any leaked `<diff_notes>` / `<style_dna>` wrapper debris
+ * (for example when a model quotes `<style_dna>` in backticks inside `<diff_notes>` before emitting
+ * the real block). Safe to call on already-clean text.
+ *
+ * @param {string} rawText
+ * @returns {string}
+ */
+export function sanitizeStyleCardText(rawText) {
+    let text = String(rawText ?? '').trim();
+    if (!text) return '';
+    // If stray `</diff_notes>` + `<style_dna>` leaked into the card, keep everything after the last `<style_dna>`
+    if (/<\/diff_notes>/i.test(text)) {
+        const afterDiff = text.split(/<\/diff_notes>/i).pop() || '';
+        if (afterDiff.trim()) text = afterDiff.trim();
+    }
+    const openTagMatches = [...text.matchAll(/(?<!`)<style_dna\b[^>]*>(?!`)/gi)];
+    if (openTagMatches.length > 0) {
+        const lastOpen = openTagMatches[openTagMatches.length - 1];
+        const afterOpen = text.slice(lastOpen.index + lastOpen[0].length);
+        const strippedClose = afterOpen.replace(/<\/style_dna>\s*$/i, '').trim();
+        if (strippedClose) text = strippedClose;
+    }
+    return text
+        .replace(/<\/?(?:style_dna|diff_notes|excerpts)\b[^>]*>/gi, '')
+        .trim();
+}
+
+/**
  * Extracts text inside `<tag>...</tag>` after stripping thinking/CoT blocks and preset shells.
+ * Ignores backtick-quoted tag mentions (e.g. `` `<style_dna>` ``) and strips sibling `<diff_notes>`
+ * when extracting non-diff sections so quoted tag names inside critique notes never hijack parsing.
  * Falls back to the full cleaned text when tags are absent.
  *
  * @param {string} rawText
@@ -349,13 +379,23 @@ export function cleanDistillProse(rawText) {
  * @returns {string}
  */
 export function extractTaggedSection(rawText, tagName) {
-    const cleaned = cleanDistillProse(rawText);
-    const regex = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, 'i');
-    const match = cleaned.match(regex);
-    if (match && match[1].trim()) {
-        return match[1].trim();
+    let cleaned = cleanDistillProse(rawText);
+    if (String(tagName || '').toLowerCase() !== 'diff_notes') {
+        cleaned = cleaned.replace(/<diff_notes\b[^>]*>[\s\S]*?<\/diff_notes>/gi, '').trim();
     }
-    return cleaned.trim();
+    const regex = new RegExp(`(?<!\`)<${tagName}\\b[^>]*>(?!\`)([\\s\\S]*?)<\\/${tagName}>(?!\`)`, 'gi');
+    const matches = [...cleaned.matchAll(regex)];
+    for (let i = matches.length - 1; i >= 0; i -= 1) {
+        const body = String(matches[i][1] || '').trim();
+        if (body) {
+            return String(tagName || '').toLowerCase() === 'style_dna'
+                ? sanitizeStyleCardText(body)
+                : body;
+        }
+    }
+    return String(tagName || '').toLowerCase() === 'style_dna'
+        ? sanitizeStyleCardText(cleaned)
+        : cleaned.trim();
 }
 
 /**

@@ -4,6 +4,7 @@ import {
     stripNonStoryBlocks,
 } from './parser.js';
 import { buildAntiClichePromptGuidance } from './cliche-guard.js';
+import { sanitizeStyleCardText } from './style-distiller.js';
 
 /**
  * Determines whether a chat floor is an AI-continued novel chapter floor
@@ -291,7 +292,7 @@ export function buildStoryBlueprintContextBlock(storyBlueprint, targetChapterInd
     if (storyBlueprint.genreAndTone) lines.push(`- 题材与基调：${storyBlueprint.genreAndTone}`);
     if (storyBlueprint.premise) lines.push(`- 核心主线与人物弧线：${storyBlueprint.premise}`);
     if (storyBlueprint.worldRules) lines.push(`- 世界观硬规则与红线：${storyBlueprint.worldRules}`);
-    if (storyBlueprint.endingDirection) lines.push(`- 终局方向与核心命题：${storyBlueprint.endingDirection}`);
+    if (storyBlueprint.endingDirection) lines.push(`- 远期终局方向（供宏观防跑偏参考，严禁在早期章节提前透支或让人物一步到位提前黑化/崩坏，必须严格按当前卷阶段循序渐进）：${storyBlueprint.endingDirection}`);
     if (!storyBlueprint.premise && storyBlueprint.seedNotes) {
         lines.push(`- 作者立项设定与创意底稿：${String(storyBlueprint.seedNotes).slice(0, 1400)}`);
     }
@@ -476,16 +477,22 @@ export function buildSingleCallContinuationContext({
         if (bpBlock) sections.push(bpBlock);
     }
 
-    // 1.5 Distilled Original Author Style DNA Card + Anti-Cliché Positive Replacement Rules
+    // 1.5 Distilled Original Author Style DNA Card + Live Samples + Anti-Cliché Positive Replacement Rules
     if (hasStyleProfile) {
         const sp = ledger.styleProfile;
-        const styleLines = ['【原著文风骨相 DNA 执行卡（经多轮盲测对抗蒸馏，最高文风权威——严格按此骨相、段长、节奏与尺度执笔）】'];
+        const cleanStyleCard = sanitizeStyleCardText(sp.styleCard || '');
+        const styleLines = ['【原著文风骨相 DNA 执行卡（最高文风权威——严格按此骨相、段长、节奏与尺度执笔）】'];
+        if (sp.goldenExcerpts && String(sp.goldenExcerpts).trim()) {
+            styleLines.push(
+                '▸ 原著灵魂语感活样本（最高语感直觉标尺：优先模仿以下原文的断句节奏、对话口吻与动作穿插感，勿照抄情节）：',
+                String(sp.goldenExcerpts).trim(),
+            );
+        }
         if (sp.fingerprintText) {
             styleLines.push('▸ 原著客观统计锚点（硬指标）：', sp.fingerprintText);
         }
-        styleLines.push('▸ 终版文风骨相铁律：', String(sp.styleCard).trim());
-        if (sp.goldenExcerpts && String(sp.goldenExcerpts).trim()) {
-            styleLines.push('▸ 原著灵魂语感活样本（模仿其行文节奏、断句与对话口癖，勿照抄情节）：', String(sp.goldenExcerpts).trim());
+        if (cleanStyleCard) {
+            styleLines.push('▸ 终版文风骨相铁律：', cleanStyleCard);
         }
         styleLines.push(buildAntiClichePromptGuidance(settings.clicheBlacklist));
         sections.push(styleLines.join('\n'));
@@ -500,7 +507,7 @@ export function buildSingleCallContinuationContext({
             .slice(0, 12);
         if (activeChars.length > 0) {
             const charLines = [
-                '【核心人物 4 维灵魂与防 OOC 档案（最高人物权威——保留原作/游戏硬设定底骨，同时 100% 锁死本小说真实性格与言行禁区）】',
+                '【核心人物 4 维灵魂与防 OOC 档案（最高人物权威——100% 锁死本场人物真实性格、着装与当前阶段状态；若上文世界书包含无关百科或未出场角色词条，严禁被其串戏带偏；人物情绪与态度必须按当前章节进度循序渐进，严禁无铺垫光速崩坏或脸谱化叫骂）】',
             ];
             for (const ch of activeChars) {
                 const roleSuffix = ch.role ? `（${ch.role}）` : '';
@@ -742,6 +749,10 @@ export function buildNovelStateTrailerPrompt({
     const curRefCursor = Number(nCfg.referenceCursorChapter || 0);
 
     const lines = [
+        '【落笔前最后自检（紧贴正文生效，防长上下文稀释）】',
+        '1. 人物严格遵循前文《核心人物防 OOC 档案》当前阶段的气质、说话长度与着装，严禁被无关世界书词条串戏，严禁未铺垫就光速黑化或脸谱化；',
+        '2. 笔触严格对齐《灵魂语感活样本》与《文风骨相执行卡》，杜绝“如遭雷击/冻结成冰/狰狞邪异/裂开一道弧度/声音沙哑/喉结滚动/空气仿佛凝固”等高频 AI 网文腔。',
+        '',
         '【单次调用自动归档指令（强制末段附带 · 前端自动隐藏入库）】',
         '写完本章正文后，必须附带完整闭合的 `<novel_state>...</novel_state>` XML 块（直接输出尖括号标签，不要加反引号，切勿省略）：若外部预设要求用 `<game>...</game>` 包裹整条回复，请将 `<novel_state>...</novel_state>` 紧贴写在 `</game>` 闭合标签**紧前面**（或紧后面），前端会自动解析并隐藏，绝不影响正文排版！',
         '请以 `<novel_state>` 开头、`</novel_state>` 结尾，内部按顺序包含以下子标签：',

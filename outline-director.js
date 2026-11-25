@@ -14,7 +14,7 @@ import {
 } from './context-assembler.js';
 import { stripNonStoryBlocks } from './parser.js';
 import { isModelRefusalText, parseCharacterProfiles } from './story-archiver.js';
-import { cleanDistillProse, throwIfAborted } from './style-distiller.js';
+import { cleanDistillProse, sanitizeStyleCardText, throwIfAborted } from './style-distiller.js';
 
 const PACE_LABELS = Object.freeze({
     slow: '温水煮青蛙（稳步铺垫、日常推进与暗线反差，放大信息差，暂不彻底摊牌）',
@@ -364,7 +364,10 @@ export function buildDirectorOutlinePrompt({
     if (sp?.fingerprintText || sp?.styleCard || sp?.goldenExcerpts) {
         parts.push('', '【原著文风与节奏骨相参考（确保分镜节奏与原作者习惯一致）】：');
         if (sp.fingerprintText) parts.push(sp.fingerprintText);
-        if (sp.styleCard) parts.push(String(sp.styleCard).slice(0, 1200));
+        if (sp.styleCard) {
+            const cleanCard = sanitizeStyleCardText(sp.styleCard);
+            if (cleanCard) parts.push(cleanCard.slice(0, 1200));
+        }
         if (sp.goldenExcerpts) {
             parts.push('', '【原著活样本范例（大纲对话焦点与微动作切入点须严格对齐此种质感与口吻）】：', String(sp.goldenExcerpts).slice(0, 1200));
         }

@@ -399,7 +399,7 @@ export function extractNovelStateBlock(rawMessageText) {
             cleanText = raw.replace(ESCAPED_NOVEL_STATE_REGEX, '').trimEnd();
         } else {
             const unclosedMatch = raw.match(UNCLOSED_NOVEL_STATE_REGEX);
-            if (unclosedMatch && /<(?:summary|worldbook|hooks)\b/i.test(unclosedMatch[1])) {
+            if (unclosedMatch && /<(?:chapter_summary|summary|worldbook|hooks)\b/i.test(unclosedMatch[1])) {
                 innerBlocks = [unclosedMatch[1]];
                 cleanText = raw.replace(UNCLOSED_NOVEL_STATE_REGEX, '').trimEnd();
             }
@@ -456,7 +456,12 @@ export function extractNovelStateBlock(rawMessageText) {
 
         const worldMatch = inner.match(/<worldbook>([\s\S]*?)(?:<\/worldbook>|<appearance>|<hooks>|$)/i);
         if (worldMatch && worldMatch[1].trim()) {
-            const lines = worldMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
+            const rawLines = worldMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
+            // Split semicolon-packed multi-entries like `人物|甲：…；人物|乙：…` into separate rows
+            const lines = rawLines.flatMap(l => l
+                .split(/[；;]\s*(?=[^：:；;\n|｜]{1,12}[|｜][^：:；;\n|｜]{1,28}[：:])/)
+                .map(stripListPrefix)
+                .filter(Boolean));
             for (const line of lines) {
                 if (isEmptyPlaceholder(line)) continue;
                 const parsed = parseWorldUpdateLine(line);
@@ -471,7 +476,11 @@ export function extractNovelStateBlock(rawMessageText) {
 
         const appearMatch = inner.match(/<appearance>([\s\S]*?)(?:<\/appearance>|<hooks>|$)/i);
         if (appearMatch && appearMatch[1].trim()) {
-            const lines = appearMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
+            const rawLines = appearMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
+            const lines = rawLines.flatMap(l => l
+                .split(/[；;]\s*(?=[^：:；;\n|｜]{1,12}[|｜][^：:；;\n|｜]{1,28}[：:])/)
+                .map(stripListPrefix)
+                .filter(Boolean));
             for (const line of lines) {
                 if (isEmptyPlaceholder(line)) continue;
                 const parsed = parseWorldUpdateLine(line);
@@ -484,7 +493,12 @@ export function extractNovelStateBlock(rawMessageText) {
 
         const hooksMatch = inner.match(/<hooks>([\s\S]*?)(?:<\/hooks>|$)/i);
         if (hooksMatch && hooksMatch[1].trim()) {
-            const lines = hooksMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
+            const rawLines = hooksMatch[1].split('\n').map(stripListPrefix).filter(Boolean);
+            // Split semicolon-packed hooks like `[新伏笔] A；[已填坑] B` so resolved hooks aren't merged into open ones
+            const lines = rawLines.flatMap(l => l
+                .split(/[；;]\s*(?=[\[【](?:已填坑|已回收|回收伏笔|回收|新伏笔|新增伏笔|新增|新线索|待填|伏笔|resolved|open|add)[\]】])/i)
+                .map(stripListPrefix)
+                .filter(Boolean));
             for (const line of lines) {
                 if (isEmptyPlaceholder(line)) continue;
                 if (/^[\[【]?(?:已填坑|已回收|回收伏笔|回收|完成|解决|resolved)[\]】]?/i.test(line)) {

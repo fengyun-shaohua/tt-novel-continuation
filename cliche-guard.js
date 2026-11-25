@@ -6,7 +6,7 @@
 
 import { extractNovelStateBlock, stripNonStoryBlocks } from './parser.js';
 import { isModelRefusalText } from './story-archiver.js';
-import { cleanDistillProse, computeLocalStyleFingerprint } from './style-distiller.js';
+import { cleanDistillProse, computeLocalStyleFingerprint, sanitizeStyleCardText } from './style-distiller.js';
 
 export const DEFAULT_CLICHE_TERMS = Object.freeze([
     '声音沙哑',
@@ -19,9 +19,13 @@ export const DEFAULT_CLICHE_TERMS = Object.freeze([
     '一丝不易察觉',
     '不易察觉的',
     '微微眯起眼',
+    '眼眸微眯',
     '眼底闪过一丝',
     '眸色一暗',
+    '深不见底',
     '嘴角勾起',
+    '裂开一道',
+    '狰狞邪异',
     '笑意愈发恶劣',
     '唇角微扬',
     '古井无波',
@@ -30,6 +34,10 @@ export const DEFAULT_CLICHE_TERMS = Object.freeze([
     '空气却早已',
     '倒抽了一口凉气',
     '倒吸一口凉气',
+    '如遭雷击',
+    '冻结成冰',
+    '血液仿佛凝固',
+    '血脉偾张',
     '白桃般的',
     '两枚红宝石',
     '指节泛白',
@@ -455,11 +463,14 @@ export function buildDeepRewritePrompt({
         parts.push('', '【📌 近期尚未并入编年史的已写章节实录（重写时严禁与刚写完的前几章矛盾或重复）】：', ...recentChaptersBridgeLines);
     }
 
-    if (ledger?.styleProfile?.styleCard) {
-        parts.push('', '【原著文风骨相 DNA 圣经（重写笔触与段长标尺）】：', String(ledger.styleProfile.styleCard).slice(0, 2200));
-    }
     if (ledger?.styleProfile?.goldenExcerpts) {
-        parts.push('', '【原著灵魂原文范例】：', String(ledger.styleProfile.goldenExcerpts).slice(0, 1000));
+        parts.push('', '【原著灵魂原文范例（重写语感与对话节奏的最高活标尺）】：', String(ledger.styleProfile.goldenExcerpts).slice(0, 1200));
+    }
+    if (ledger?.styleProfile?.styleCard) {
+        const cleanCard = sanitizeStyleCardText(ledger.styleProfile.styleCard);
+        if (cleanCard) {
+            parts.push('', '【原著文风骨相 DNA 圣经（重写笔触与段长标尺）】：', cleanCard.slice(0, 2200));
+        }
     }
 
     const refAutoOn = Boolean(activeCfg.referenceTimelineMode && activeCfg.autoAdvanceRefCursor !== false);

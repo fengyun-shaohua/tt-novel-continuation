@@ -25,7 +25,7 @@ let currentBridgeUrl = '';
 let statusCallback = null;
 
 const HOT_STYLE_ID = 'tt-novel-remote-hot-css';
-const CLIENT_VERSION = '1.9.1';
+const CLIENT_VERSION = '1.9.2';
 const CLIENT_SESSION_ID = `tt_sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
 /* ==========================================================================

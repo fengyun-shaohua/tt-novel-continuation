@@ -10,9 +10,10 @@ const FALLBACK_CHUNK_SIZE = 4200;
 const MEGA_CHAPTER_THRESHOLD = 8000;
 const MEGA_CHAPTER_TARGET = 4500;
 const NOVEL_STATE_BLOCK_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]*?)<\/novel_state>(?:\s*\n?```)?/gi;
-const UNCLOSED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]+?)(?=<\/game>|$)/i;
+const UNCLOSED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?<novel_state>([\s\S]+?)(?=<\/(?:game|story_reply|soliumbra_reply)>|$)/i;
 const ESCAPED_NOVEL_STATE_REGEX = /(?:```(?:xml|html|txt)?\s*\n?)?&lt;novel_state&gt;([\s\S]*?)&lt;\/novel_state&gt;(?:\s*\n?```)?/gi;
-const NOISE_BLOCKS_REGEX = /<(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)\b[^>]*>[\s\S]*?<\/(?:think(?:ing|_[a-z0-9]+)?|cot|details|UpdateVariable|options|novel_state)>/gi;
+const NOISE_BLOCKS_REGEX = /<(?:think(?:ing|_[a-z0-9]+)?~?|report_[a-z0-9]+~?|cot|details|UpdateVariable|options|novel_state)\b[^>]*>[\s\S]*?<\/(?:think(?:ing|_[a-z0-9]+)?~?|report_[a-z0-9]+~?|cot|details|UpdateVariable|options|novel_state)>/gi;
+const OUTER_WRAPPER_TAGS_REGEX = /<\/?(?:story_reply|soliumbra_reply)\b[^>]*>/gi;
 
 const CJK_STOPWORDS = new Set([
     '一个', '一下', '一些', '一切', '一样', '一直', '一定', '已经', '以及', '以后',
@@ -36,14 +37,16 @@ export function normalizeNovelText(rawText) {
 }
 
 /**
- * Strips thinking/CoT blocks (`<think>`, `<think_nya>`, `<cot>`, `<details>`), MVU variable blocks,
- * and `<novel_state>` blocks from message text so retrieval queries only use pure story text.
+ * Strips thinking/CoT blocks (`<think>`, `<think_nya>`, `<report_nya>`, `<cot>`, `<details>`),
+ * MVU variable blocks, `<novel_state>` blocks, and outer reply wrapper tags (`<story_reply>`, `<soliumbra_reply>`)
+ * from message text so retrieval, TOC, and quality checks only use pure story text.
  * @param {string} text
  * @returns {string}
  */
 export function stripNonStoryBlocks(text) {
     return String(text ?? '')
         .replace(NOISE_BLOCKS_REGEX, '')
+        .replace(OUTER_WRAPPER_TAGS_REGEX, '')
         .trim();
 }
 

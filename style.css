@@ -54,6 +54,7 @@ body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text details,
 body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text think,
 body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text thinking,
 body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text think_nya,
+body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text report_nya,
 body.tt-novel-hide-cot #chat .mes[is_user="false"] .mes_text cot {
     display: none !important;
 }

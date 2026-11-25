@@ -336,7 +336,7 @@ export function cleanDistillProse(rawText) {
         .replace(/<!--[\s\S]*?-->/g, '')
         .replace(/^```(?:xml|html|markdown|md|txt)?\s*\n?/i, '')
         .replace(/\n?```\s*$/i, '')
-        .replace(/<\/?(?:soliumbra_reply|game|reply|output|think|think_nya|thinking|thought|cot|reasoning)\b[^>]*>/gi, '')
+        .replace(/<\/?(?:story_reply|soliumbra_reply|game|reply|output|think|think_nya~?|report_nya~?|thinking|thought|cot|reasoning)\b[^>]*>/gi, '')
         .trim();
 }
 

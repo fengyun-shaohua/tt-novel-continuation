@@ -18,13 +18,18 @@ const STYLE_CARD_TARGET_MIN = 1500;
 const STYLE_CARD_TARGET_MAX = 2200;
 const STYLE_CARD_HARD_MAX = 2600;
 
+// Generic Chinese AI-overwritten literary modifiers & high-frequency stiff adverbs (compared RELATIVELY against truth)
+const AI_LITERARY_MODIFIER_REGEX = /(?:毫不保留|难以言喻|源源不断|大开大合|不由自主|情不自禁|鬼使神差|魂牵梦萦|惊心动魄|若无其事|不动声色|不着痕迹|声嘶力竭|彻彻底底|浑然不觉|恍若隔世|刹那间|顷刻间|高冷矜持|浓郁扑鼻|泥泞不堪|空洞失神|倏然|骤然|猛然|旋即|随即|径直|顺势|宛如|仿佛|不禁|狠狠|剧烈|猛烈|彻底|硬生生|死死|肆意|冰冷|滚烫|晶莹|浓郁|粘稠|泥泞|空洞|失神|回荡|弥漫|高亢|不堪|涎水|荡起|沉沉|微微|缓缓|深深|轻轻|淡淡|一丝|一抹)/g;
+// Generic everyday spoken Chinese narrative glue (measures plain colloquial looseness vs stiff written prose)
+const COLLOQUIAL_GLUE_REGEX = /(?:只不过|不过|其实|大概|好像|一点点|来着|好啦|嘛|刚才|上次|这么|那样|一下|两下|起来|进去|出来|里面|时候|有点|本来|结果|挺|倒是|反正|还是|然后|怎么|那么|有些|不太|差不多|干脆|索性|压根|顺手|随口|直勾勾)/g;
+
 const STYLE_CARD_BUDGET_SPEC = [
     '【硬字数配额与结构铁律（总字数目标 1,600 ~ 2,200 字，绝对上限 ≤ 2,500 字！）】：',
     '- 一、段落骨相、句长与标点硬指标（≤ 350 字，直接列出本地统计数值上限与分段纪律；明确禁止用“眼看着/只见/随着一声”这类网文镜头引导词起手，直接以主语+具体动作切入）',
     '- 二、叙事视角、心理限制与分场景语态切换（≤ 350 字；每条语态规则必须同时写明【适用场景】与【禁用场景】，第三人称严禁把“自己”当独立主语，回忆/旁观段若原著平实直白则严禁写网文抒情腔）',
     '- 三、对话节奏、角色声线反差与克制微动作法则（≤ 350 字；必须写明特殊符号如 ❤/～/—— 与高潮叠词【仅在正面高潮段使用】，日常/旁观/隔墙/回忆段严禁乱插特殊符号或强行给场外配角加直接台词）',
-    '- 四、感官/静物白描方法论与内容尺度边界（≤ 350 字，只写抽象技法，抑制通用黄文/网文套话，严禁抄大段原文）',
-    '- 五、反 AI 味精炼短句对照库（**严格仅保留 5~6 组单句级对照，每组 ≤ 90 字、合计 ≤ 550 字**：“❌ AI通病 → ✅ 原著通用笔法”；原著长段范例已独立保存在 `goldenExcerpts`，严禁把整段原文塞进文风卡！）',
+    '- 四、语体朴素度、感官白描与反 AI 书面润色红线（≤ 350 字；明确原著究竟是平实口语白话还是书面凝练风，若原著偏平实口语，必须严禁 AI 擅自把日常词润色成四字成语、强副词“大开大合/源源不断/彻底/骤然/猛烈/狠狠/硬生生/径直/随即”或“晶莹/冰冷/滚烫/高亢/回荡/弥漫”等书面修饰堆砌！）',
+    '- 五、反 AI 味精炼短句对照库（**严格仅保留 5~6 组单句级对照，每组 ≤ 90 字、合计 ≤ 550 字**：“❌ AI书面/八股通病 → ✅ 原著朴素通用笔法”；原著长段范例已独立保存在 `goldenExcerpts`，严禁把整段原文塞进文风卡！）',
     '【强制去人名/去单章过拟合铁律】：',
     '- 全面抹除所有具体原著角色名、地名与特定章节道具，统一抽象为通用角色位（如「主角 / 女主 / 施压者 / 旁观者 / 苦主」），严禁在换角仿写或新章节中串戏！',
     '【后台纯分析/压缩任务覆盖指令】：',
@@ -174,6 +179,17 @@ export function computeLocalStyleFingerprint(chapters, cutoffChapterIndex) {
         heart: per1k(/[❤♡♥]/g),
     };
 
+    const literaryModifierMatches = fullText.match(AI_LITERARY_MODIFIER_REGEX) || [];
+    const colloquialMatches = fullText.match(COLLOQUIAL_GLUE_REGEX) || [];
+    const literaryModifierPer1k = Number(((literaryModifierMatches.length / totalChars) * 1000).toFixed(1));
+    const colloquialPer1k = Number(((colloquialMatches.length / totalChars) * 1000).toFixed(1));
+    let registerHint = '口语与书面均衡';
+    if (literaryModifierPer1k <= 6 && colloquialPer1k >= 14) {
+        registerHint = '偏平实口语白描（严禁 AI 擅自润色成四字成语与书面修饰腔）';
+    } else if (literaryModifierPer1k >= 16 && colloquialPer1k <= 10) {
+        registerHint = '偏书面凝练/抒情修饰语体';
+    }
+
     return {
         totalChars,
         paragraphCount: paragraphs.length,
@@ -186,6 +202,10 @@ export function computeLocalStyleFingerprint(chapters, cutoffChapterIndex) {
         avgDialogueChars,
         povHint,
         punctuationPer1k,
+        literaryModifierPer1k,
+        colloquialPer1k,
+        registerHint,
+        topLiteraryModifiers: [...new Set(literaryModifierMatches)].slice(0, 10),
     };
 }
 
@@ -208,13 +228,19 @@ export function formatFingerprintText(fp) {
     const paraTail = fp.p90ParagraphChars
         ? `（≤60字短段占 ${fp.shortParagraphRatio ?? 0}%，90%段落不超过 ${fp.p90ParagraphChars} 字）`
         : '';
-    return [
+    const lines = [
         `- 叙事人称倾向：${fp.povHint}`,
         `- 段落骨相：平均每段 ${fp.avgParagraphChars} 字${paraTail}`,
         `- 句长节奏：平均每句 ${fp.avgSentenceChars} 字（≤15字短句占比 ${fp.shortSentenceRatio}%）`,
         `- 对话密度：对话占比约 ${fp.dialogueRatio}%，平均单句台词 ${fp.avgDialogueChars} 字`,
         `- 标点语气频次：${marks.join('、')}`,
-    ].join('\n');
+    ];
+    if (Number.isFinite(fp.literaryModifierPer1k) && Number.isFinite(fp.colloquialPer1k)) {
+        lines.push(
+            `- 语体朴素度：书面修饰/强副词 ${fp.literaryModifierPer1k}/千字，口语白话连接词 ${fp.colloquialPer1k}/千字（${fp.registerHint || '自然语体'}）`,
+        );
+    }
+    return lines.join('\n');
 }
 
 /**
@@ -416,17 +442,49 @@ export function extractTaggedSection(rawText, tagName) {
 }
 
 /**
- * Computes an objective 0-API statistical drift comparison between Ground-Truth Holdout prose
- * and AI Blind Rewrite prose so both Judge and next-round Ghostwriter receive exact physical targets.
+ * Detects verbatim 10+ Chinese-character overlaps between `styleCard` and an unseen `holdoutTruth`
+ * so memorized single-chapter quotes cannot inflate blind-test fidelity scores.
+ *
+ * @param {string} styleCard
+ * @param {string} holdoutTruth
+ * @returns {string[]}
+ */
+export function detectMemorizationLeaks(styleCard, holdoutTruth) {
+    const cleanCard = String(styleCard || '').replace(/[^\u4e00-\u9fa5]/g, '');
+    const cleanTruth = String(holdoutTruth || '').replace(/[^\u4e00-\u9fa5]/g, '');
+    if (cleanCard.length < 10 || cleanTruth.length < 10) return [];
+    const windowSize = 10;
+    const truthSubstrings = new Set();
+    for (let i = 0; i <= cleanTruth.length - windowSize; i += 2) {
+        truthSubstrings.add(cleanTruth.slice(i, i + windowSize));
+    }
+    const leaks = [];
+    for (let i = 0; i <= cleanCard.length - windowSize; i += 1) {
+        const sub = cleanCard.slice(i, i + windowSize);
+        if (truthSubstrings.has(sub)) {
+            leaks.push(sub);
+            i += windowSize - 1; // Skip forward past matched window
+            if (leaks.length >= 6) break;
+        }
+    }
+    return leaks;
+}
+
+/**
+ * Computes an objective 0-API statistical & register drift comparison between Ground-Truth Holdout prose
+ * and AI Blind Rewrite prose (including relative AI literary-modifier bloat, colloquial register drop,
+ * and verbatim styleCard memorization leaks) so both Judge and next-round Ghostwriter receive exact targets.
  *
  * @param {string} truthText
  * @param {string} rewriteText
+ * @param {{ styleCard?: string }} [options]
  */
-export function computeStyleDriftReport(truthText, rewriteText) {
+export function computeStyleDriftReport(truthText, rewriteText, { styleCard = '' } = {}) {
     const truthFp = computeLocalStyleFingerprint([{ index: 1, title: '', content: String(truthText || '') }], 1);
     const rewriteFp = computeLocalStyleFingerprint([{ index: 1, title: '', content: String(rewriteText || '') }], 1);
 
     const warnings = [];
+    const severeReasons = [];
     if (truthFp.avgParagraphChars > 0) {
         const ratio = (rewriteFp.avgParagraphChars - truthFp.avgParagraphChars) / truthFp.avgParagraphChars;
         if (ratio >= 0.35) {
@@ -449,22 +507,68 @@ export function computeStyleDriftReport(truthText, rewriteText) {
         warnings.push(`省略号频次偏离（${rEllipsis}/千字 vs 真迹${tEllipsis}/千字）。`);
     }
 
+    // Relative register drift: AI literary modifier / strong adverb bloat vs original author's lexical simplicity
+    // Require minimum sample length (>= 160 chars) & hit count (>= 4) to avoid tiny-sample ratio noise.
+    const tMod = truthFp.literaryModifierPer1k ?? 0;
+    const rMod = rewriteFp.literaryModifierPer1k ?? 0;
+    const rModCount = Math.round((rMod * (rewriteFp.totalChars || 0)) / 1000);
+    const hasReliableSample = (truthFp.totalChars || 0) >= 160 && (rewriteFp.totalChars || 0) >= 160;
+    const modMult = Number((rMod / Math.max(1, tMod)).toFixed(1));
+    if (hasReliableSample && rModCount >= 4 && rMod >= Math.max(11, tMod * 2.5)) {
+        const hitPreview = (rewriteFp.topLiteraryModifiers || []).slice(0, 8).join('、');
+        warnings.push(
+            `AI书面修饰/强副词严重超标（仿写 ${rMod}/千字 vs 真迹 ${tMod}/千字，高出 ${modMult} 倍${hitPreview ? `；高频命中：${hitPreview}` : ''}）—— 严禁擅自把原著平实白描润色成四字成语与强修饰书面腔！`,
+        );
+        if (rModCount >= 6 && rMod >= Math.max(16, tMod * 3)) {
+            severeReasons.push(`AI书面修饰腔达真迹 ${modMult} 倍（${rMod} vs ${tMod}/千字）`);
+        }
+    }
+
+    // Colloquial narrative looseness drop
+    const tCas = truthFp.colloquialPer1k ?? 0;
+    const rCas = rewriteFp.colloquialPer1k ?? 0;
+    if (hasReliableSample && tCas >= 14 && rCas <= tCas * 0.58) {
+        warnings.push(
+            `口语白话度明显偏低（仿写 ${rCas}/千字 vs 真迹 ${tCas}/千字），AI把原著松弛白话写成了工整书面翻译腔！`,
+        );
+        if (tCas >= 18 && rCas <= tCas * 0.45) {
+            severeReasons.push(`口语白话度腰斩（${rCas} vs ${tCas}/千字）`);
+        }
+    }
+
+    // Memorization / Holdout-Leak detection inside styleCard
+    const memorizationLeaks = styleCard ? detectMemorizationLeaks(styleCard, truthText) : [];
+    if (memorizationLeaks.length >= 2) {
+        warnings.push(
+            `检测到文风卡残留 ${memorizationLeaks.length} 处与本盲测真迹重合的记忆原句（如「${memorizationLeaks.slice(0, 3).join('」「')}」），属背答案过拟合！评委严禁因猜中具体词句给高分，必须彻底删去单章原句！`,
+        );
+        severeReasons.push(`文风卡残留 ${memorizationLeaks.length} 处真迹原句（背答案过拟合）`);
+    }
+
     const lines = [
         `• 平均段长：真迹 ${truthFp.avgParagraphChars} 字（≤60字短段 ${truthFp.shortParagraphRatio}%） vs 仿写 ${rewriteFp.avgParagraphChars} 字（≤60字短段 ${rewriteFp.shortParagraphRatio}%）`,
         `• 句长节奏：真迹均句 ${truthFp.avgSentenceChars} 字（短句 ${truthFp.shortSentenceRatio}%） vs 仿写均句 ${rewriteFp.avgSentenceChars} 字（短句 ${rewriteFp.shortSentenceRatio}%）`,
         `• 对话密度：真迹 ${truthFp.dialogueRatio}%（均长 ${truthFp.avgDialogueChars} 字） vs 仿写 ${rewriteFp.dialogueRatio}%（均长 ${rewriteFp.avgDialogueChars} 字）`,
         `• 标点频次：省略号 ${tEllipsis} vs ${rEllipsis}/千字 | 感叹号 ${truthFp.punctuationPer1k?.exclamation ?? 0} vs ${rewriteFp.punctuationPer1k?.exclamation ?? 0}/千字`,
+        `• 语体朴素度（去AI书面腔核心指标）：书面修饰/强副词 真迹 ${tMod} vs 仿写 ${rMod}/千字 | 口语白话词 真迹 ${tCas} vs 仿写 ${rCas}/千字`,
     ];
     if (warnings.length > 0) {
         lines.push(`• 客观硬偏差提醒：${warnings.join('；')}`);
     } else {
-        lines.push('• 各项本地物理统计指标已高度贴合原著真迹！');
+        lines.push('• 各项本地物理统计与语体朴素度指标已高度贴合原著真迹！');
     }
+
+    const severeRegisterDrift = severeReasons.length > 0;
+    const honestScoreCap = severeRegisterDrift ? 84 : null;
 
     return {
         truthFp,
         rewriteFp,
         warnings,
+        memorizationLeaks,
+        severeRegisterDrift,
+        severeReasons,
+        honestScoreCap,
         summary: lines.join('\n'),
     };
 }
@@ -748,7 +852,7 @@ export async function runStyleDistillationPipeline({
 
     const analystSystem = '你是一位顶尖文学编辑与法医级文风分析师。你严禁输出“文笔细腻、描写生动、节奏紧凑”这类空泛形容词，必须输出详尽、具体、可量化、附带原著实句对照的深度写作圣经，重点抓住原著的【段落骨相、零抒情克制感、视角呼吸与去网文八股替换动作】。';
     const outlineSystem = '你是剧情梗概提炼员。你的任务是把一段小说原文剥光一切文风、修辞、心理修饰和原句措辞，只还原成 4~6 句极度干瘪、客观、白开水般的“场景与节拍清单”，用于后续盲测仿写。';
-    const ghostwriterSystem = '你是一位小说代笔作者。请严格遵照给定的《原著文风 DNA 圣经》和《原著灵魂活样本》的骨相、段长上限、节奏、标点和尺度，将干瘪事件大纲扩写成 750~950 字的小说正文。严格遵守每条规则的【场景适用边界】：非高潮/旁观/回忆段严禁乱插高潮专属符号（如❤）或强行给场外配角加直接台词；严禁用“眼看着/只见/随着一声”起手，第三人称严禁把“自己”当独立主语，严禁原地水字数或堆砌网文八股形容词。直接输出正文，切勿解释。';
+    const ghostwriterSystem = '你是一位小说代笔作者。请严格遵照给定的《原著文风 DNA 圣经》和《原著灵魂活样本》的骨相、段长上限、节奏、标点和尺度，将干瘪事件大纲扩写成 750~950 字的小说正文。严格遵守每条规则的【场景适用边界】：非高潮/旁观/回忆段严禁乱插高潮专属符号（如❤）或强行给场外配角加直接台词；严禁用“眼看着/只见/随着一声”起手，第三人称严禁把“自己”当独立主语。极其重要：严格对齐原著的【词汇朴素度与口语松弛感】——若原著是平实口语白描，严禁擅自把日常词润色成四字成语、强副词（大开大合/源源不断/彻底/骤然/猛烈/狠狠/硬生生/径直/随即）或书面修饰堆砌（晶莹/冰冷/滚烫/高亢/回荡/弥漫）！直接输出正文，切勿解释。';
 
     let currentStyleCard = existingProfile?.styleCard || '';
     let goldenExcerpts = existingProfile?.goldenExcerpts || '';
@@ -798,6 +902,7 @@ export async function runStyleDistillationPipeline({
                     '3. 句法骨架与动词/修辞偏好：长短句交替规律、主语省略习惯、高频动词质感、比喻密度（直白通俗还是书面文艺？）。',
                     '4. 分场景运镜与尺度边界：日常铺垫、人物对峙、高张力/亲密/感官桥段分别如何推进？',
                     '5. 初步发现的“原著绝不会使用的网文/AI八股”及对应的【原著真实替代写法】（用“想表达X时，原著直接写Y，而非套话Z”的格式）。',
+                    '6. 语体朴素度与反 AI 润色降维（决定真像人写还是像 AI 改写！）：原著叙述究竟偏“口语松弛大白话”还是“书面凝练文艺风”？直接列出 5~8 组「原著朴素日常用词 vs AI 最爱擅自升格的书面修饰词」（如原著写日常大白话，必须点明严禁 AI 乱加四字成语与强副词）。',
                     '',
                     '【本地客观统计指纹】：',
                     fingerprintText,
@@ -1003,8 +1108,8 @@ export async function runStyleDistillationPipeline({
             preStrippedOutlines.set(nextHoldoutIdx, cleanDistillProse(prefetchedOutlineRaw));
         }
 
-        // Compute objective 0-API statistical drift between Holdout Truth and Blind Rewrite
-        const driftReport = computeStyleDriftReport(holdout.text, blindRewrite);
+        // Compute objective 0-API statistical & register drift between Holdout Truth and Blind Rewrite
+        const driftReport = computeStyleDriftReport(holdout.text, blindRewrite, { styleCard: cardUsedThisRound });
         prevDriftWarnings = driftReport.warnings;
 
         // Step B of Round: Forensic Diff, Pure-Style Fidelity Scoring (0~100), & Optional Style Bible Refinement
@@ -1030,10 +1135,10 @@ export async function runStyleDistillationPipeline({
             '【本地 0-API 客观物理指标比对（真迹 vs 本轮仿写）】：',
             driftReport.summary,
             '',
-            '【重要评分纪律（严禁伪扣分）】：',
-            '1. 因为 AI 盲写时只看过干瘪事件大纲、从未看过本段原文，**严禁因为 AI 没猜中原文里特有的道具细节、具体比喻意象（例如某种具体颜色烤漆/怀表比喻/特定台词字眼）而扣分！** 只要 AI 写出了同等级别、符合原作者思维方式的细节白描，该项即为高分。',
-            '2. 请结合上方客观物理指标表，严格只针对 **5 个可泛化的纯文风维度** 客观打分（满分 100）：句式段长节奏(20) + 叙事视角与心理克制度(20) + 对话口癖与标点质感(20) + 氛围推进与原著尺度贴合度(20) + 反AI味纯度(20)。',
-            '3. 若仿写不仅物理指标贴合、且抓住了原作者的神韵与去AI味纯度，应公正给出 90~96 分；若存在跨场景机械拼贴（Overfitting）、长段注水或 AI 八股则如实扣分。',
+            '【重要评分纪律（严禁伪扣分，更严禁虚高放水！）】：',
+            '1. 因为 AI 盲写时只看过干瘪事件大纲、从未看过本段原文，**严禁因为 AI 没猜中原文里特有的道具细节或特定台词字眼而扣分**；但反过来，如果仿写只是因为文风卡里残留了原句（背答案）才猜中词句，**严禁因此给高分**！',
+            '2. 请结合上方客观物理与语体指标表，严格只针对 **5 个可泛化的纯文风维度** 客观打分（满分 100）：句式段长节奏(20) + 叙事视角与心理克制度(20) + 对话口癖与标点质感(20) + 氛围推进与原著尺度贴合度(20) + 去AI书面修饰腔与语体朴素度(20)。',
+            '3. **防虚高硬红线（必守！）**：对比真迹与仿写的**普通过渡句、动作句用词**！若真迹是松弛平实的口语白描，而仿写充斥 AI 书面修饰腔（四字成语堆砌、连环长定语、高频强副词如“大开大合/源源不断/狠狠/彻底/骤然/硬生生/径直/随即”、把口语词升格为“晶莹/滚烫/冰冷/高亢/回荡/涎水”等），或存在背答案泄露：**第 5 项最高不得超过 13/20，总分绝不得超过 84 分！** 只有当连非情节过渡句都几乎分不出真迹与仿写的语体质感时，才可给出 90 分以上。',
             '',
         ];
 
@@ -1072,7 +1177,13 @@ export async function runStyleDistillationPipeline({
             prompt: judgePromptLines.join('\n'),
         });
 
-        const roundScore = extractFidelityScore(calibrationRaw);
+        const rawRoundScore = extractFidelityScore(calibrationRaw);
+        let roundScore = rawRoundScore;
+        let registerCapNote = '';
+        if (roundScore !== null && driftReport.honestScoreCap !== null && roundScore > driftReport.honestScoreCap) {
+            roundScore = driftReport.honestScoreCap;
+            registerCapNote = `\n\n[客观语体校准] 模型评委原给 ${rawRoundScore} 分，但本地检测发现显著语体/过拟合偏差（${driftReport.severeReasons.join('；')}），已客观封顶为 ${roundScore} 分以避免虚高误判。`;
+        }
         const roundDiffNotes = extractTaggedSection(calibrationRaw, 'diff_notes');
         let regressedOnRetest = false;
 
@@ -1139,7 +1250,7 @@ export async function runStyleDistillationPipeline({
             dryOutline,
             blindRewrite,
             holdoutTruth: holdout.text,
-            diffNotes: `${roundDiffNotes}${regressedOnRetest ? '\n\n[择优保护] 本轮重考分数回落，已自动保留历史最高分版本圣经。' : ''}${autoTrimNote}`,
+            diffNotes: `${roundDiffNotes}${registerCapNote}${regressedOnRetest ? '\n\n[择优保护] 本轮重考分数回落，已自动保留历史最高分版本圣经。' : ''}${autoTrimNote}`,
             styleCardLength: currentStyleCard.length,
         };
         processLog.push(roundLogEntry);
